@@ -1,0 +1,11 @@
+# 编译产物
+cpp/SprayTrajCore/build/
+wpf/SprayTrajViewer/bin/
+wpf/SprayTrajViewer/obj/
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+.vs/

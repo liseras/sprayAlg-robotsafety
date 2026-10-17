@@ -1,0 +1,76 @@
+using System;
+using System.Runtime.InteropServices;
+
+namespace SprayTrajViewer
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SprayTrajParams
+    {
+        public double scanRowSpacing;   // 行距 mm
+        public double pointSpacing;     // 点距 mm
+        public double standoff;         // 离面距离 mm
+        public double speed;            // 速度 mm/s
+        public double turnRadiusFactor; // 折返半径系数
+        public double flatnessTol;      // 平面内点阈值 mm
+        public double curvatureTol;     // 曲面升级阈值 mm
+        public int    sorK;             // SOR 近邻数
+        public double sorZ;             // SOR Z 倍数
+        public int    normalFlip;       // 法向翻转：0=自动，1=强制翻转
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SprayTrajPoint
+    {
+        public double x, y, z;
+        public double i, j, k;
+        public double speed;
+        public int spray;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SprayTrajPlane
+    {
+        public double nx, ny, nz;
+        public double cx, cy, cz;
+        public int count;
+        public double ux, uy, uz;
+        public double vx, vy, vz;
+        public double minU, maxU;
+        public double minV, maxV;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SprayTrajResult
+    {
+        public IntPtr points;   // SprayTrajPoint*
+        public int count;
+        public double plane_rms;
+        public double normal_x, normal_y, normal_z;
+        public double plane_cx, plane_cy, plane_cz;
+        public double seg_len_mean;
+        public double seg_len_max;
+        public int rows;
+        public int input_points;
+        public int removed_points;
+        public int inlier_points;
+        public int plane_count;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public SprayTrajPlane[] planes;
+        public IntPtr error;    // const char*
+    }
+
+    public static class Native
+    {
+        const string Dll = "SprayTraj.dll";
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern SprayTrajParams spray_traj_default_params();
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern SprayTrajResult spray_traj_generate(
+            [In] double[] xyz, int n, ref SprayTrajParams p);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void spray_traj_free(ref SprayTrajResult res);
+    }
+}
