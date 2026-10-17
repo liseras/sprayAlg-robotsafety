@@ -188,35 +188,36 @@ bool fit_plane(const std::vector<Vec3>& P, double tol, Plane& pl, std::vector<in
 // 直到剩余点不足。返回多个平面（每个含法向/质心/内点索引），
 // 用于折型板（两面）、槽型盘（底盘+凸起侧边）这类多面工件分别重建。
 //
-// 关键设计（解决"底面被切成多块、范围重叠"）：
-//   顺序 RANSAC 若用很紧的 tol（flatnessTol，毫米级）去切一个本身有轻微
-//   起伏/弯曲、但应视为"单一可喷面"的底面，会把它沿弯曲方向切成 3~4 块，
-//   各块用整块 P0.5/P99.5 分位数包围盒渲染后视觉互相重叠。
-//   因此这里采用"先整体、后分割"两级判定。
-//   —— 判据必须用高分位残差（P99.5）而非 RMS：RMS 是平方平均，槽型盘的
-//      凸边、折型板的翻边只占少数点但高度差大（15~35mm），会被大面积平坦
-//      底面"平均"掉，导致整体 RMS 很小（<5mm）却漏掉真实台阶、喷不全/撞枪。
-//      P99.5 能稳定捕捉到这些"少数但高"的台阶点。
-//   两级：
-//     1) 整体平面拟合后，若残差 P99.5 <= curvatureTol，说明整片点云都在
-//        曲面容差内（无真实台阶/凸边）→ 单一可喷面，直接返回，不切分；
-//     2) 否则存在真实多面/台阶（折型板翻边、槽型盘凸边）→ 用紧 tol
-//        （flatnessTol）顺序 RANSAC 切分，各段用各自内点的紧凑包围盒。
+// 参数语义（重要，修正过）：
+//   tol (flatnessTol)  = 台阶抹平阈值：两共面片之间法向间距 < tol → 合并抹平；
+//                        ≥ tol → 保持独立分割。它 *不是* 平面拟合的内点容差！
+//                        若把大 tol 当拟合容差，凸边会被吸进底盘平面，
+//                        最小二乘把平面拉斜（法向明显偏斜），重建面斜穿工件。
+//   curvatureTol       = 曲面升级阈值：整片点云到主平面的残差 P99.5 <= 此值
+//                        → 单一可喷面（曲率浅当平面）。
+// 实现要点：
+//   1) 平面拟合一律用紧容差 tightTol = min(tol, 3mm)，保证每个面片拟合准确；
+//   2) 第一级：紧 tol 拟合主平面，全点到主平面残差 P99.5 <= curvatureTol
+//      → 单面直接返回（不切分、不重叠）；
+//   3) 第二级：顺序 RANSAC（紧 tol）切分出各面片；
+//   4) 合并：法向夹角 < 15° 且两平面沿法向间距 < tol → 合并，
+//      保留点数多的主段平面方程、吸收小段内点（"抹平到主平面"）。
+//      RMS/P99.5 判据被弃用：RMS 对小面积高台阶不敏感（被底盘稀释），
+//      曾导致凸边被错误合并、轨迹丢失。
 struct PlaneSeg { Plane pl; std::vector<int> inl; };
 std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, double curvatureTol, int minPts){
     std::vector<PlaneSeg> out;
+    const double tightTol = std::min(tol, 3.0);   // 拟合容差恒紧，与台阶阈值解耦
 
-    // ---- 第一级：整体是否可当作"单一可喷面"？用 P99.5 残差判定 ----
+    // ---- 第一级：整体是否可当作"单一可喷面"？ ----
     {
-        std::vector<int> all(P.size()); std::iota(all.begin(), all.end(), 0);
-        Vec3 nf, cf;
-        if(ls_plane(P, all, nf, cf)){
-            if(dot(nf, Vec3{0,0,1}) < 0) nf = nf*(-1.0);
-            double df = -dot(nf, cf);
-            std::vector<double> res; res.reserve(all.size());
-            double rss=0; for(int k:all){ double e=dot(P[k],nf)+df; res.push_back(std::fabs(e)); rss+=e*e; }
-            double rms = std::sqrt(rss/std::max(1,(int)all.size()));
-            // 高分位残差 P99.5：捕捉少数但高的台阶/凸边点
+        std::vector<Vec3> sub(P);   // 全点
+        Plane pl; std::vector<int> inl;
+        if(fit_plane(sub, tightTol, pl, inl)){
+            if(dot(pl.n, Vec3{0,0,1}) < 0){ pl.n = pl.n*(-1.0); pl.d = -pl.d; }
+            // 全点到主平面的残差 P99.5：捕捉少数但高的台阶/凸边点
+            std::vector<double> res; res.reserve(P.size());
+            for(size_t k=0;k<P.size();++k) res.push_back(std::fabs(dot(P[k],pl.n)+pl.d));
             double p995 = 0.0;
             {
                 size_t kk = (size_t)((res.size()-1)*0.995);
@@ -225,9 +226,9 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
             }
             // 整体在曲面容差内（无真实台阶）→ 单面，直接返回（不切分、不重叠）
             if(p995 <= curvatureTol){
-                PlaneSeg seg; seg.pl = {nf, df, cf}; seg.inl = all;
-                fprintf(stderr, "[split] 整体单面: 点数=%zu RMS=%.3f P99.5=%.3f (<=curvatureTol=%.3f)\n",
-                    all.size(), rms, p995, curvatureTol);
+                PlaneSeg seg; seg.pl = pl; seg.inl = inl;
+                fprintf(stderr, "[split] 整体单面: 内点=%zu/%zu P99.5=%.3f (<=curvatureTol=%.3f)\n",
+                    inl.size(), P.size(), p995, curvatureTol);
                 out.push_back(std::move(seg));
                 return out;
             }
@@ -236,7 +237,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         }
     }
 
-    // ---- 第二级：真实多面/台阶 → 顺序 RANSAC 切分 ----
+    // ---- 第二级：真实多面/台阶 → 顺序 RANSAC（紧容差）切分 ----
     std::vector<int> remain(P.size()); std::iota(remain.begin(), remain.end(), 0);
     // 最多 8 个平面，防止死循环
     for(int iter=0; iter<8 && (int)remain.size() >= minPts; ++iter){
@@ -244,7 +245,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         Plane pl; std::vector<int> inl;
         std::vector<Vec3> sub; sub.reserve(remain.size());
         for(int i:remain) sub.push_back(P[i]);
-        if(!fit_plane(sub, tol, pl, inl)) break;
+        if(!fit_plane(sub, tightTol, pl, inl)) break;
         if((int)inl.size() < minPts) break;
 
         // inl 是 sub 的下标，映射回 P 的下标
@@ -264,10 +265,10 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         remain.swap(nr);
     }
 
-    // 合并"法向一致且合并后仍是同一浅面"的相邻段：
-    // 判据用合并后残差的 P99.5（高分位）而非 RMS——RMS 是平方平均，凸边/台阶
-    // 只占少数点但高度差大，会被大面积底盘稀释，导致凸边被错误合并回底盘、
-    // 轨迹丢失（喷不全/撞枪）。P99.5 能稳定捕捉这些少数高台阶点。
+    // ---- 合并"台阶抹平"：法向一致 且 沿法向间距 < tol → 并入主段 ----
+    // 保留点数多的段的平面方程（主平面），吸收小段内点。
+    // 间距用两质心沿法向的投影差（平行平面间距），与 RMS 无关——
+    // 语义就是"高差在抹平阈值内的台阶被抹平到主平面"。
     const double cosThresh = std::cos(15.0*3.141592653589793/180.0);
     bool merged = true;
     while(merged){
@@ -275,31 +276,29 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         for(size_t i=0;i<out.size() && !merged;++i){
             for(size_t j=i+1;j<out.size() && !merged;++j){
                 double cd = std::fabs(dot(out[i].pl.n, out[j].pl.n));
-                if(cd < cosThresh) continue;       // 夹角大，不同朝向
+                if(cd < cosThresh) continue;       // 夹角大，不同朝向的面
+                // 统一法向符号后算平行间距
+                Vec3 nj = out[j].pl.n;
+                if(dot(nj, out[i].pl.n) < 0) nj = nj*(-1.0);
+                double dist = std::fabs(dot(out[j].pl.c - out[i].pl.c, out[i].pl.n));
+                // 合并间距阈值：取台阶抹平阈值与浅曲面容差的较大者。
+                // flatnessTol 覆盖"台阶高差在阈值内→抹平"；
+                // curvatureTol 覆盖"缓曲底面被紧tol切成碎块、块间距略大→并回"。
+                const double mergeDist = std::max(tol, curvatureTol*1.2);   // 20%余量：缓弯底面碎块间距常略超曲率容差
+                if(dist >= mergeDist) continue;    // 台阶高差 >= 抹平阈值 → 保持独立
 
-                std::vector<int> uni = out[i].inl;
-                uni.insert(uni.end(), out[j].inl.begin(), out[j].inl.end());
-                Vec3 nf, cf;
-                if(!ls_plane(P, uni, nf, cf)) continue;
-                if(dot(nf, out[i].pl.n) < 0) nf = nf*(-1.0);
-                double df = -dot(nf, cf);
-                std::vector<double> res; res.reserve(uni.size());
-                double rss=0; for(int k:uni){ double e=dot(P[k],nf)+df; res.push_back(std::fabs(e)); rss+=e*e; }
-                double rms = std::sqrt(rss/std::max(1,(int)uni.size()));
-                // 合并后残差 P99.5
-                double p995 = 0.0;
-                {
-                    size_t kk=(size_t)((res.size()-1)*0.995);
-                    std::nth_element(res.begin(), res.begin()+kk, res.end());
-                    p995 = res[kk];
+                // 小段并入大段（保留主段平面方程）
+                size_t big = i, small = j;
+                if(out[j].inl.size() > out[i].inl.size()){ big = j; small = i; }
+                Vec3 nB = out[big].pl.n;
+                if(dot(out[small].pl.n, nB) < 0){
+                    out[small].pl.n = out[small].pl.n*(-1.0);
+                    out[small].pl.d = -out[small].pl.d;
                 }
-                // 合并后仍是"同一浅面"（P99.5 在曲面容差内）才接受，否则保留台阶
-                if(p995 <= curvatureTol){
-                    out[i].pl.n=nf; out[i].pl.c=cf; out[i].pl.d=df;
-                    out[i].inl=uni;
-                    out.erase(out.begin()+j);
-                    merged = true;
-                }
+                out[big].inl.insert(out[big].inl.end(),
+                                    out[small].inl.begin(), out[small].inl.end());
+                out.erase(out.begin() + small);   // erase 后重开 while 循环，下标重新取
+                merged = true;
             }
         }
     }
@@ -478,7 +477,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     }
 
     // 3. 对每个分割出的平面段，分别生成 S 形轨迹并拼接
-    struct Row { double xs, xe, yc; };
+    struct Row { double xs, xe, yc; int segIdx; };  // segIdx: 该行是扫描线与面交集的第几段（环形面会产生多段）
     double L=params->scanRowSpacing, pstep=params->pointSpacing;
     double turnR = params->turnRadiusFactor * L;
 
@@ -507,14 +506,42 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         supMin = std::min(supMin, 20);
         // 首行从 mny+L*0.25 起、末行到 mxy+L*0.25，让轨迹两端外扩覆盖边缘，
         // 避免"首尾各损失半行距"导致窄侧面轨迹短一截。
+        // 行端按"该行带内点的 x 聚类分段"：实心面 → 一整行（全长走刀）；
+        // 环形/框形面（如槽型盘凸边环）→ 每行分成左右两段，中央空区不喷，
+        // 否则环形面会生成满铺矩形轨迹、与底盘轨迹上下重叠。
+        const double gapSeg = std::max(L*1.5, 20.0);   // x 间隙超过此值视为两段
+        std::vector<Row> raw;
         for(double yc=mny+L*0.25; yc <= mxy+L*0.25+1e-9; yc+=L){
-            // 行端固定为分位数包围盒全长（分割出的面是规则平面，全长行走刀）
+            // 收集该行带内的 x 值
+            std::vector<double> bx; bx.reserve(R.size()/4);
             int sup=0;
-            for(auto&p:R){ if(std::fabs(p.y-yc)<=L*0.5) sup++; }
+            for(auto&p:R){
+                if(std::fabs(p.y-yc)<=L*0.5){ sup++; bx.push_back(p.x); }
+            }
             if(sup<supMin) continue;          // 跳过完全空白的带
-            if(mxx-mnx < L*0.2) continue;     // 面整体过窄
-            rs.push_back({mnx,mxx,yc});
+            std::sort(bx.begin(), bx.end());
+            // 按间隙聚类成连续段
+            double segStart=bx[0], segPrev=bx[0];
+            int segCnt=1, segIdx=0;
+            auto flushSeg=[&](){
+                // 段长 < 行距 的碎段丢弃：喷涂价值小、且会形成梳齿状碎轨迹
+                if(segCnt>=supMin && (segPrev-segStart) >= L)
+                    raw.push_back({segStart, segPrev, yc, segIdx});
+                segIdx++;
+            };
+            for(size_t i=1;i<bx.size();++i){
+                if(bx[i]-segPrev > gapSeg){ flushSeg(); segStart=bx[i]; segCnt=0; }
+                segPrev=bx[i]; segCnt++;
+            }
+            flushSeg();
         }
+        // 按段分组排序：先喷完所有第0段行（子蛇形），再第1段……
+        // 避免左右段按行交替导致蛇形在环两端来回斜穿。
+        std::stable_sort(raw.begin(), raw.end(), [](const Row&a, const Row&b){
+            if(a.segIdx != b.segIdx) return a.segIdx < b.segIdx;
+            return a.yc < b.yc;
+        });
+        rs = std::move(raw);
         if(rs.empty()) return rs;
         return rs;
     };
@@ -562,12 +589,12 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         double ca=std::cos(theta), sa=std::sin(theta);
         auto rotInv=[&](Vec2 p)->Vec2{ return {ca*p.x - sa*p.y, sa*p.x + ca*p.y}; };
 
-        // 生成该平面的 2D 轨迹
-        std::vector<Vec2> traj2;
-        auto sampleLine=[&](Vec2 a, Vec2 b){
+        // 生成该平面的 2D 轨迹（每个点带 spray 标记：1=喷涂，0=空移）
+        std::vector<std::pair<Vec2,int>> traj2;
+        auto sampleLine=[&](Vec2 a, Vec2 b, int spray){
             double LL=len2(b-a);
             int np=std::max(2,(int)std::ceil(LL/pstep)+1);
-            for(int t=0;t<np;++t){ double f=(double)t/(np-1); traj2.push_back(a+(b-a)*f); }
+            for(int t=0;t<np;++t){ double f=(double)t/(np-1); traj2.push_back({a+(b-a)*f, spray}); }
         };
         auto sampleArc=[&](Vec2 a, Vec2 b, Vec2 apex){
             const int M=60; std::vector<Vec2> crv(M+1);
@@ -579,7 +606,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             for(int i=0;i<=np;++i){
                 double target=(double)i/np*arc;
                 int lo=0,hi=M; while(lo<hi){int mid=(lo+hi)/2; if(s[mid]>=target)hi=mid;else lo=mid+1;}
-                traj2.push_back(crv[lo]);
+                traj2.push_back({crv[lo], 1});
             }
         };
 
@@ -592,22 +619,29 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             segs2.push_back({a,b});
         }
         for(size_t i=0;i<segs2.size();++i){
-            sampleLine(segs2[i].a, segs2[i].b);
+            sampleLine(segs2[i].a, segs2[i].b, 1);
             if(i+1<segs2.size()){
-                Vec2 dir=norm2(segs2[i].b - segs2[i].a);
-                Vec2 cr{-dir.y, dir.x};
-                Vec2 apex=(segs2[i].b + segs2[i+1].a)*0.5 + cr*turnR;
-                sampleArc(segs2[i].b, segs2[i+1].a, apex);
+                double gap = len2(segs2[i+1].a - segs2[i].b);
+                if(gap > turnR*3){
+                    // 跨段大跳跃（如环形面的左右段切换、跨行大间隔）：
+                    // 直线空移过渡，spray=0（不喷涂）。WPF 按 spray=0 断开显示。
+                    sampleLine(segs2[i].b, segs2[i+1].a, 0);
+                } else {
+                    Vec2 dir=norm2(segs2[i].b - segs2[i].a);
+                    Vec2 cr{-dir.y, dir.x};
+                    Vec2 apex=(segs2[i].b + segs2[i+1].a)*0.5 + cr*turnR;
+                    sampleArc(segs2[i].b, segs2[i+1].a, apex);
+                }
             }
         }
 
         // 转 3D（用该平面自己的法向抬升，避免撞击凸起/侧壁）
         Vec3 gun = pl.n*(-1.0);
-        for(auto& p2 : traj2){
+        for(auto& [p2, sp] : traj2){
             Vec2 q = rotInv(p2);
             Vec3 X = pl.c + u*q.x + v*q.y;
             Vec3 pos = X + pl.n*params->standoff;
-            allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, 1});
+            allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, sp});
         }
     }
 

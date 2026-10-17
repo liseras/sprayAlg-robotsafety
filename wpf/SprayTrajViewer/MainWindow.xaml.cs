@@ -216,6 +216,13 @@ namespace SprayTrajViewer
             }
             foreach (var p in traj)
             {
+                // 空移点（spray=0）：断开当前管并跳过该点——空移段不显示、不画线
+                if (p.spray == 0)
+                {
+                    FlushTube();
+                    last = new Point3D(p.x, p.y, p.z);
+                    continue;
+                }
                 var cur = new Point3D(p.x, p.y, p.z);
                 if (path.Count > 0 && (cur - last).Length > breakDist)
                     FlushTube();          // 跨段：断开，另起一条管
