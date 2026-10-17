@@ -264,9 +264,10 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         remain.swap(nr);
     }
 
-    // 合并"法向一致且各自内点合并后 RMS 仍 <= curvatureTol"的相邻段：
-    // 仅当两块是同一朝向、且合并后整体仍是浅曲面时才并，避免把真实台阶抹平。
-    // 注意：不依赖质心距离（折型板两翻边质心可能相距很远但确是同一底面的延伸）。
+    // 合并"法向一致且合并后仍是同一浅面"的相邻段：
+    // 判据用合并后残差的 P99.5（高分位）而非 RMS——RMS 是平方平均，凸边/台阶
+    // 只占少数点但高度差大，会被大面积底盘稀释，导致凸边被错误合并回底盘、
+    // 轨迹丢失（喷不全/撞枪）。P99.5 能稳定捕捉这些少数高台阶点。
     const double cosThresh = std::cos(15.0*3.141592653589793/180.0);
     bool merged = true;
     while(merged){
@@ -282,9 +283,18 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
                 if(!ls_plane(P, uni, nf, cf)) continue;
                 if(dot(nf, out[i].pl.n) < 0) nf = nf*(-1.0);
                 double df = -dot(nf, cf);
-                double rss=0; for(int k:uni){ double e=dot(P[k],nf)+df; rss+=e*e; }
+                std::vector<double> res; res.reserve(uni.size());
+                double rss=0; for(int k:uni){ double e=dot(P[k],nf)+df; res.push_back(std::fabs(e)); rss+=e*e; }
                 double rms = std::sqrt(rss/std::max(1,(int)uni.size()));
-                if(rms <= curvatureTol){
+                // 合并后残差 P99.5
+                double p995 = 0.0;
+                {
+                    size_t kk=(size_t)((res.size()-1)*0.995);
+                    std::nth_element(res.begin(), res.begin()+kk, res.end());
+                    p995 = res[kk];
+                }
+                // 合并后仍是"同一浅面"（P99.5 在曲面容差内）才接受，否则保留台阶
+                if(p995 <= curvatureTol){
                     out[i].pl.n=nf; out[i].pl.c=cf; out[i].pl.d=df;
                     out[i].inl=uni;
                     out.erase(out.begin()+j);
@@ -540,8 +550,14 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             double cost = jag + rs.size()*L*0.02;
             if(cost<bestCost){ bestCost=cost; theta=ang; bestRows=rs; }
         }
-        if(bestRows.empty()) continue;
+        if(bestRows.empty()){
+            fprintf(stderr, "[traj] 段(点数=%zu, 法向=(%.2f,%.2f,%.2f)) 未生成有效行，跳过\n",
+                inl.size(), pl.n.x, pl.n.y, pl.n.z);
+            continue;
+        }
         totalRows += (int)bestRows.size();
+        fprintf(stderr, "[traj] 段(点数=%zu) 生成 %zu 行, theta=%.1f\n",
+            inl.size(), bestRows.size(), theta*180/3.141592653589793);
 
         double ca=std::cos(theta), sa=std::sin(theta);
         auto rotInv=[&](Vec2 p)->Vec2{ return {ca*p.x - sa*p.y, sa*p.x + ca*p.y}; };
