@@ -24,3 +24,9 @@ if(MSVC)
 endif()
 set_target_properties(spray_driver PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# SprayTrajResult 结构体本身约 145KB（8 个面片各含 384 顶点 + 768 三角的定长数组），
+# 驱动把结果放在栈上、DLL 内部也返回一份，默认 1MB 栈在某些机器上会撞到 0xC00000FD
+# （STATUS_STACK_OVERFLOW：进程无任何输出直接退出）。这里给测试驱动留 16MB。
+if(MSVC)
+    target_link_options(spray_driver PRIVATE /STACK:16777216)
+endif()

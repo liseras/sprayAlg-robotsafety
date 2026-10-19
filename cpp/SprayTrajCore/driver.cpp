@@ -46,6 +46,10 @@ static bool read_ply(const std::string& path, std::vector<double>& xyz){
 }
 
 int main(int argc, char** argv){
+    // 关掉 stdout 全缓冲：算法一旦异常退出，缓冲里的日志会全部丢失，
+    // 现场只剩"退出码非0、输出为空"，无法定位。无缓冲保证崩溃前日志已落盘。
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     const char* in = argc>1? argv[1] : "panel.ply";
     const char* outcsv = argc>2? argv[2] : "traj_out.csv";
     const char* outply = argc>3? argv[3] : "traj_out.ply";
@@ -54,11 +58,15 @@ int main(int argc, char** argv){
     int n = (int)(xyz.size()/3);
     SprayTrajParams p = spray_traj_default_params();
     // 可选参数：-flat <平面拟合阈值mm>  -curve <曲面升级阈值mm>
+    //           -fill <孔洞填补阈值mm>  -dir <0自动/1长边/2短边>
     for(int i=4;i+1<argc;++i){
         if(!strcmp(argv[i],"-flat"))  p.flatnessTol  = atof(argv[i+1]);
         if(!strcmp(argv[i],"-curve")) p.curvatureTol = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-fill"))  p.fillHoleSize = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-dir"))   p.scanDirMode  = atoi(argv[i+1]);
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f\n", p.flatnessTol, p.curvatureTol);
+    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d\n",
+        p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode);
     SprayTrajResult r = spray_traj_generate(xyz.data(), n, &p);
     if(r.error){ printf("失败: %s\n", r.error); spray_traj_free(&r); return 1; }
     printf("OK: rows=%d points=%d rms=%.3f seg_mean=%.3f seg_max=%.3f\n",
@@ -85,6 +93,22 @@ int main(int argc, char** argv){
     fprintf(fp,"property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n");
     for(int i=0;i<r.count;++i){ fprintf(fp,"%.3f %.3f %.3f 255 48 32\n",r.points[i].x,r.points[i].y,r.points[i].z); }
     fclose(fp);
+    // 重建面片网格导出（供离线检查：每个分割面一个 PLY，序号对应分面顺序）
+    for(int i=0;i<r.plane_count && i<8;++i){
+        int nv=r.planes[i].polyVertCount, nt=r.planes[i].polyTriCount;
+        if(nv<=0||nt<=0) continue;
+        char buf[512]; snprintf(buf,sizeof(buf),"%s.plane%d.ply",outply,i);
+        FILE* fm=fopen(buf,"w");
+        if(!fm) continue;
+        fprintf(fm,"ply\nformat ascii 1.0\ncomment reconstructed plane %d\n",i);
+        fprintf(fm,"element vertex %d\nproperty float x\nproperty float y\nproperty float z\n",nv);
+        fprintf(fm,"element face %d\nproperty list uchar int vertex_index\nend_header\n",nt);
+        for(int v=0;v<nv;++v)
+            fprintf(fm,"%.3f %.3f %.3f\n", r.planes[i].polyVerts[v*3], r.planes[i].polyVerts[v*3+1], r.planes[i].polyVerts[v*3+2]);
+        for(int t=0;t<nt;++t)
+            fprintf(fm,"3 %d %d %d\n", r.planes[i].polyTris[t*3], r.planes[i].polyTris[t*3+1], r.planes[i].polyTris[t*3+2]);
+        fclose(fm);
+    }
     printf("写出: %s / %s\n", outcsv, outply);
     spray_traj_free(&r);
     return 0;

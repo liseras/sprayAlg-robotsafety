@@ -16,6 +16,8 @@ namespace SprayTrajViewer
         public int    sorK;             // SOR 近邻数
         public double sorZ;             // SOR Z 倍数
         public int    normalFlip;       // 法向翻转：0=自动，1=强制翻转
+        public double fillHoleSize;     // 孔洞填补阈值 mm（间隙<此值覆盖重建，行连续跨越）
+        public int    scanDirMode;      // 轨迹方向：0=自动，1=沿长边喷，2=沿短边喷
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -37,6 +39,13 @@ namespace SprayTrajViewer
         public double vx, vy, vz;
         public double minU, maxU;
         public double minV, maxV;
+        // 规则化重建面片：轮廓矢量化 + 矩形吸附 + 三角化后的网格
+        public int polyVertCount;                       // 顶点数
+        public int polyTriCount;                        // 三角形数
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1152)]   // 384 顶点 × 3
+        public double[] polyVerts;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2304)]   // 768 三角形 × 3
+        public int[] polyTris;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -51,7 +51,7 @@
                     </DockPanel>
                     <DockPanel Margin="0,4">
                         <TextBlock Text="平面拟合阈值 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtFlatness" Text="3" Padding="4"/>
+                        <TextBox x:Name="TxtFlatness" Text="40" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
                         <TextBlock Text="曲面升级阈值 (mm)" Width="150" VerticalAlignment="Center"/>
@@ -71,6 +71,20 @@
                             <ComboBoxItem Content="自动判向"/>
                             <ComboBoxItem Content="强制翻转"/>
                         </ComboBox>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
+                        <TextBlock Text="喷涂方向" Width="150" VerticalAlignment="Center"
+                                   ToolTip="轨迹行沿工件长边还是短边走"/>
+                        <ComboBox x:Name="CmbScanDir" Padding="4" SelectedIndex="0">
+                            <ComboBoxItem Content="自动（最平滑）"/>
+                            <ComboBoxItem Content="沿长边喷（换行少）"/>
+                            <ComboBoxItem Content="沿短边喷（行短密）"/>
+                        </ComboBox>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
+                        <TextBlock Text="孔洞填补阈值 (mm)" Width="150" VerticalAlignment="Center"
+                                   ToolTip="点云间隙/小洞跨距小于此值时覆盖重建：轨迹连续跨越、重建面补洞；大于此值视为真实孔/槽保留"/>
+                        <TextBox x:Name="TxtFillHole" Text="300" Padding="4"/>
                     </DockPanel>
 
                     <Button x:Name="BtnGenerate" Content="生成轨迹" FontSize="15" FontWeight="Bold"

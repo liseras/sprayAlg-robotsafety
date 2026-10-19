@@ -12,4 +12,23 @@
     <PackageReference Include="HelixToolkit.Wpf" Version="3.1.2" />
   </ItemGroup>
 
+  <!--
+    核心算法库 SprayTraj.dll 由 cpp/SprayTrajCore 单独构建（CMake），不参与本工程编译。
+    以前靠手工拷贝到 bin 目录，漏拷时界面会一直跑旧算法：
+    截图看着"算法没改对"，其实是 exe 旁边躺着一个几天前的 DLL。
+    这里在每次构建后强制同步，并把时间戳打进日志，避免再出现"改了没生效"的假象。
+  -->
+  <PropertyGroup>
+    <SprayTrajCoreDll>$(MSBuildThisFileDirectory)..\..\cpp\SprayTrajCore\build\bin\Release\SprayTraj.dll</SprayTrajCoreDll>
+  </PropertyGroup>
+
+  <Target Name="SyncSprayTrajCore" AfterTargets="Build" Condition="Exists('$(SprayTrajCoreDll)')">
+    <Copy SourceFiles="$(SprayTrajCoreDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="已同步 SprayTraj.dll -> $(OutDir)" />
+  </Target>
+
+  <Target Name="WarnMissingSprayTrajCore" AfterTargets="Build" Condition="!Exists('$(SprayTrajCoreDll)')">
+    <Warning Text="找不到核心算法库：$(SprayTrajCoreDll)，请先构建 cpp/SprayTrajCore（cmake --build build --config Release）" />
+  </Target>
+
 </Project>

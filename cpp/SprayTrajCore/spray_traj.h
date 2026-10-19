@@ -28,6 +28,8 @@ typedef struct SprayTrajParams {
     int    sorK;             // 统计离群滤波近邻数
     double sorZ;             // 统计离群滤波 Z 倍数
     int    normalFlip;       // 法向翻转：0=自动判向，1=强制翻转（法向取反）
+    double fillHoleSize;     // 孔洞填补阈值 mm：点云间隙/孔洞跨距 < 此值 → 覆盖重建（行连续跨越、重建面补洞）；>= 此值 → 真实孔/槽保留
+    int    scanDirMode;      // 轨迹方向：0=自动(最平滑)，1=沿长边喷(行平行长边,换行少)，2=沿短边喷(行平行短边,换行多)
 } SprayTrajParams;
 
 // 默认参数
@@ -42,15 +44,24 @@ typedef struct SprayTrajPoint {
 } SprayTrajPoint;
 
 // 单个重建平面（供显示/调试）
+#define SPRAYTRAJ_PLANE_MAX_POLY_VERTS 384
+#define SPRAYTRAJ_PLANE_MAX_POLY_TRIS  768
 typedef struct SprayTrajPlane {
     double nx, ny, nz;   // 法向（定向后）
     double cx, cy, cz;   // 质心
     int    count;        // 该面内点数
-    // 该面在自身局部基(u,v)下的轴对齐包围盒（供 WPF 直接画矩形，不做 PCA 近似）
+    // 该面在自身局部基(u,v)下的轴对齐包围盒
     double ux, uy, uz;   // 局部基 u（主轴方向，单位向量）
     double vx, vy, vz;   // 局部基 v
     double minU, maxU;   // 内点在 u 方向的范围
     double minV, maxV;   // 内点在 v 方向的范围
+    // 规则化重建面片：轮廓提取 + 直线简化 + 矩形吸附 + 三角化后的网格。
+    // polyVerts 为世界坐标顶点（每 3 个一组 xyz），polyTris 为顶点索引三元组。
+    // 边界是直边（矩形面直接给 4 个角点），不再是逐格小方片拼出的锯齿。
+    int    polyVertCount;                             // 顶点数
+    int    polyTriCount;                              // 三角形数
+    double polyVerts[SPRAYTRAJ_PLANE_MAX_POLY_VERTS*3];  // 顶点坐标（x,y,z 连续存放）
+    int    polyTris[SPRAYTRAJ_PLANE_MAX_POLY_TRIS*3];    // 三角形索引
 } SprayTrajPlane;
 
 // 调用结果

@@ -9,3 +9,17 @@ wpf/SprayTrajViewer/obj/
 *.pdb
 *.ilk
 .vs/
+
+# 回归中间产物（保留 10 个基础样本，其余由脚本生成，不入库）
+cpp/_regress/*.csv
+cpp/_regress/*.map
+cpp/_regress/mask_*.pgm
+cpp/_regress/dbg/
+cpp/_regress/*.ply.plane*.ply
+cpp/_regress/ls*.ply
+cpp/_regress/tr.ply
+cpp/_regress/tray_v*.ply
+cpp/_regress/tray_f30.ply
+cpp/_regress/tray_def.ply
+cpp/_regress/uv_plane*.csv
+cpp/_regress/*.png
