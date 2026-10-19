@@ -1911,27 +1911,53 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         marchBoth(sp.P[seed], rp, rn);
         if(rp.size() < 2) continue;
         // ---- 行内法向平滑（枪姿连续性）----
-        // 逐点局部拟合的法向有 1~2° 级噪声（线扫条纹间隙里更大），加上空洞
-        // 边缘换墙时的几度级摆动，4mm 步进的枪位（X+100·n）会冒出 8~25mm 的
-        // "姿态跳跃"。枪头旋转本身有惯性/限速，这里对法向做行内 5 点低通
-        // （权重 1:2:3:2:1）。位置 rp 不动，覆盖率/贴合残差不受影响。
+        // 逐点局部拟合的法向有 1~2° 级噪声（线扫条纹间隙里更大），加上换墙/
+        // 卷边处的几度~几十度摆动，4mm 步进的枪位（X+100·n）会冒出 8~50mm 的
+        // "姿态跳跃"，渲染出来就是"轨迹乱七八糟"。枪头旋转本身有惯性/限速，
+        // 这里分两段处理（位置 rp 一律不动，覆盖率/贴合残差完全不受影响）：
+        //   1) 行内 [1,2,3,2,1] 低通 ×4 遍（等效高斯 σ≈6.5mm）：压逐点法向噪声；
+        //   2) 双向角速率限幅 6°/步（≈1.5°/mm）：换墙/卷边的折角摊成缓转。
+        //      折角处一两个点转几十度，枪位（100mm 外）横甩 ±50mm，
+        //      是"轨迹乱"的最大来源；限幅后枪头像真机一样匀速转过去。
         if(rn.size() >= 5){
-            std::vector<Vec3> sm = rn;
             static const double w[5] = {1.0, 2.0, 3.0, 2.0, 1.0};
-            for(int i=0;i<(int)rn.size();++i){
-                Vec3 acc{0,0,0};
-                for(int d=-2; d<=2; ++d){
-                    int j = i+d;
-                    if(j<0 || j>=(int)rn.size()) continue;
-                    acc = acc + rn[j]*w[d+2];
+            std::vector<Vec3> sm(rn.size());
+            for(int pass=0; pass<4; ++pass){
+                for(int i=0;i<(int)rn.size();++i){
+                    Vec3 acc{0,0,0};
+                    for(int d=-2; d<=2; ++d){
+                        int j = i+d;
+                        if(j<0 || j>=(int)rn.size()) continue;
+                        acc = acc + rn[j]*w[d+2];
+                    }
+                    acc = norm(acc);
+                    if(len(acc) > 0.5){
+                        if(dot(acc, rn[i]) < 0) acc = acc*(-1.0);   // 保持原朝向（防拟合符号随机）
+                        sm[i] = acc;
+                    } else sm[i] = rn[i];
                 }
-                acc = norm(acc);
-                if(len(acc) > 0.5){
-                    if(dot(acc, rn[i]) < 0) acc = acc*(-1.0);   // 保持原朝向（防拟合符号随机）
-                    sm[i] = acc;
+                rn.swap(sm);
+            }
+            const double slewDeg = 6.0;                       // 单步最大转角
+            const double slewRad = slewDeg*3.141592653589793/180.0;
+            const double cs = std::cos(slewRad);
+            for(int pass=0; pass<2; ++pass){                  // 0=正向 1=反向
+                const bool fwd = (pass==0);
+                const int stop = fwd ? (int)rn.size() : -1;
+                const int step = fwd ? 1 : -1;
+                for(int i = fwd ? 1 : (int)rn.size()-2; i!=stop; i+=step){
+                    const Vec3 a = rn[i-step], b = rn[i];
+                    const double c = dot(a,b);
+                    if(c >= cs) continue;                     // 没超限
+                    const double ang = std::acos(std::max(-1.0,std::min(1.0,c)));
+                    Vec3 perp = b - a*c;                      // b 在"垂直于 a"方向上的分量
+                    const double pl = len(perp);
+                    if(pl < 1e-9 || ang < 1e-6) continue;
+                    perp = perp*(1.0/pl);
+                    Vec3 nb = norm(a*std::cos(slewRad) + perp*std::sin(slewRad));
+                    if(len(nb) > 0.5 && dot(nb, b) > 0) rn[i] = nb;
                 }
             }
-            rn.swap(sm);
         }
         if((rowsMade & 1) != 0){                     // 蛇形：奇数行反向存放
             std::reverse(rp.begin(), rp.end());
@@ -1949,6 +1975,22 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     }
     sp.nRow = rowsMade;
     if(rowsMade < 1) return false;
+
+    // 调试：SPRAYTRAJ_DUMP=1 时导出行点（含横向坐标 s = p·eIdx）与行边界。
+    // 曲面件的 3D 截图分不清"行内抖动"和"端部卷边"，离线按 s 看最直观。
+    if(dbg){
+        fprintf(stderr, "[曲面dbg] eIdx=(%.4f,%.4f,%.4f) eRow=(%.4f,%.4f,%.4f) n0=(%.4f,%.4f,%.4f) gap=%.3f\n",
+                eIdx.x,eIdx.y,eIdx.z, eRow.x,eRow.y,eRow.z, sp.n0.x,sp.n0.y,sp.n0.z, gap);
+        if(FILE* fr = fopen("surf_rows.csv","w")){
+            fprintf(fr,"row,k,x,y,z,s,nx,ny,nz\n");
+            for(int r=0;r<sp.nRow;++r)
+                for(int k=sp.rowBeg[r]; k<sp.rowBeg[r+1]; ++k)
+                    fprintf(fr,"%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", r, k,
+                            sp.rowP[k].x, sp.rowP[k].y, sp.rowP[k].z, dot(sp.rowP[k], eIdx),
+                            sp.rowN[k].x, sp.rowN[k].y, sp.rowN[k].z);
+            fclose(fr);
+        }
+    }
 
     // ---- 覆盖率：每个曲面点到最近行点的距离 ----
     {

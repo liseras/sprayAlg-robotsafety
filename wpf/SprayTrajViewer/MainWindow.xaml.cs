@@ -66,6 +66,7 @@ namespace SprayTrajViewer
         // 一条命令即可复现指定样本 + 指定参数 + 指定显示项，再用截图取证。
         //   SprayTrajViewer.exe --ply <file> --flat 30 --fill 300 --auto
         //   --show-plane 1 --show-cloud 1 --show-traj 1 --log <file>
+        //   --view top|bottom|front|side|iso|face   （face=沿面0法向正视，曲面件验收用）
         // 无参数时行为与原来完全一致（纯交互模式）。
 
         static Dictionary<string, string> ParseArgs()
@@ -406,7 +407,7 @@ namespace SprayTrajViewer
                     Fill = spraying
                         ? new SolidColorBrush(Color.FromRgb(255, 48, 32))
                         : new SolidColorBrush(Color.FromRgb(150, 158, 170)),
-                    ThetaDiv = spraying ? 6 : 4
+                    ThetaDiv = spraying ? 12 : 8
                 });
             }
             foreach (var t in _trajVisuals) Viewport.Children.Add(t);
@@ -628,10 +629,59 @@ namespace SprayTrajViewer
         /// 透视相机下会被按距离放大（615/(615-100)≈1.19 倍），看起来像"轨迹溢出重建面"——
         /// 那是投影失真，不是算法外溢。正交投影没有这个问题，可用于测量/验收。
         /// iso 仍用透视，符合人眼观感。
+        /// face（第十轮新增）：沿**面0自身法向**正视。曲面件的工件坐标系里没有"正对"方向，
+        /// top/front/side 一律是斜视，验收"行是否铺满面、行距是否均匀"必须用 face。
         /// </summary>
         void ApplyViewPreset(string mode)
         {
             if (string.IsNullOrWhiteSpace(mode)) return;
+
+            // face：沿面0法向正视（正交），取景只按面0的顶点范围，避免被点云/安全高度拉远
+            if (string.Equals(mode, "face", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_planes.Count == 0) { App.Log("VIEW/WARN", null, "face: 没有面片，跳过"); return; }
+                var p0 = _planes[0];
+                var nf = new Vector3D(p0.nx, p0.ny, p0.nz);
+                if (nf.Length < 1e-9) { App.Log("VIEW/WARN", null, "face: 面0法向退化，跳过"); return; }
+                nf.Normalize();
+
+                Vector3D u3 = new Vector3D(p0.ux, p0.uy, p0.uz);
+                Vector3D v3 = new Vector3D(p0.vx, p0.vy, p0.vz);
+                if (u3.Length < 1e-6) u3 = Vector3D.CrossProduct(new Vector3D(0, 0, 1), nf);
+                if (u3.Length < 1e-6) u3 = new Vector3D(1, 0, 0);
+                u3.Normalize();
+                if (v3.Length < 1e-6) v3 = Vector3D.CrossProduct(nf, u3);
+                v3.Normalize();
+
+                int nv0 = Math.Min(p0.polyVertCount, p0.polyVerts?.Length / 3 ?? 0);
+                if (nv0 < 3) { App.Log("VIEW/WARN", null, "face: 面0顶点不足，跳过"); return; }
+                var c0 = new Point3D(p0.cx, p0.cy, p0.cz);
+                double minU = double.MaxValue, maxU = double.MinValue, minV = double.MaxValue, maxV = double.MinValue;
+                for (int k = 0; k < nv0; k++)
+                {
+                    var q = new Vector3D(p0.polyVerts![k * 3] - c0.X, p0.polyVerts[k * 3 + 1] - c0.Y, p0.polyVerts[k * 3 + 2] - c0.Z);
+                    double uu = Vector3D.DotProduct(q, u3), vv = Vector3D.DotProduct(q, v3);
+                    if (uu < minU) minU = uu; if (uu > maxU) maxU = uu;
+                    if (vv < minV) minV = vv; if (vv > maxV) maxV = vv;
+                }
+                double span0 = Math.Max(maxU - minU, maxV - minV);
+                if (span0 <= 1e-6) { App.Log("VIEW/WARN", null, "face: 面0跨度为 0，跳过"); return; }
+
+                // 相机站在面的 +n 一侧（枪位就在这一侧：轨迹 = 面点 + standoff·n）
+                double back0 = Math.Max(span0 * 3.0, 1000.0);
+                Viewport.Camera = new OrthographicCamera
+                {
+                    Position = c0 + nf * back0,
+                    LookDirection = -nf * back0,
+                    UpDirection = v3,
+                    Width = span0 * 1.15,
+                    NearPlaneDistance = 1.0,
+                    FarPlaneDistance = back0 * 4.0,
+                };
+                App.Log("VIEW", null,
+                    $"正交 face n=({nf.X:F3},{nf.Y:F3},{nf.Z:F3}) center=({c0.X:F1},{c0.Y:F1},{c0.Z:F1}) span={span0:F1} width={span0 * 1.15:F1}");
+                return;
+            }
 
             var b = ComputeSceneBounds();
             if (b is not Rect3D r || r.IsEmpty) { App.Log("VIEW/WARN", null, "场景为空，跳过视角预设"); return; }
