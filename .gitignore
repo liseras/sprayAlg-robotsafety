@@ -23,3 +23,8 @@ cpp/_regress/tray_f30.ply
 cpp/_regress/tray_def.ply
 cpp/_regress/uv_plane*.csv
 cpp/_regress/*.png
+
+# 验证过程的临时截图（正式验收图统一放 outputs/ 归档）
+cpp/*.png
+/recon_*.png
+/*_check*.png
