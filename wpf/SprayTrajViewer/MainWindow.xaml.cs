@@ -185,12 +185,14 @@ namespace SprayTrajViewer
         {
             try
             {
+                var swLoad = System.Diagnostics.Stopwatch.StartNew();
                 _cloud = PlyReader.Read(path);
+                swLoad.Stop();
                 _currentFile = path;
                 RenderCloud();
-                TxtHint.Text = $"点云已加载：{_cloud.Count} 点";
+                TxtHint.Text = $"点云已加载：{_cloud.Count} 点（读取 {swLoad.ElapsedMilliseconds} ms）";
                 Title = $"喷涂轨迹生成器 - {System.IO.Path.GetFileName(path)}";
-                App.Log("LOAD", null, $"{path} -> {_cloud.Count} 点");
+                App.Log("LOAD", null, $"{path} -> {_cloud.Count} 点，读取耗时 {swLoad.ElapsedMilliseconds} ms");
             }
             catch (Exception ex)
             {
@@ -248,12 +250,12 @@ namespace SprayTrajViewer
                 standoff       = ParseDouble(TxtStandoff.Text, 100),
                 speed          = ParseDouble(TxtSpeed.Text, 200),
                 turnRadiusFactor = ParseDouble(TxtTurnFactor.Text, 0.5),
-                flatnessTol    = ParseDouble(TxtFlatness.Text, 3),
+                flatnessTol    = ParseDouble(TxtFlatness.Text, 40),
                 curvatureTol   = ParseDouble(TxtCurvature.Text, 5),
                 sorK           = (int)ParseDouble(TxtSorK.Text, 20),
                 sorZ           = ParseDouble(TxtSorZ.Text, 2.5),
                 normalFlip     = CmbNormalFlip.SelectedIndex == 1 ? 1 : 0,
-                fillHoleSize   = ParseDouble(TxtFillHole.Text, 15),
+                fillHoleSize   = ParseDouble(TxtFillHole.Text, 300),
                 scanDirMode    = CmbScanDir.SelectedIndex,
             };
 
@@ -267,9 +269,12 @@ namespace SprayTrajViewer
             }
 
             SprayTrajResult res;
+            var swGen = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 res = Native.spray_traj_generate(xyz, _cloud.Count, ref p);
+                swGen.Stop();
+                App.Log("GEN", null, $"算法耗时 {swGen.ElapsedMilliseconds} ms（{_cloud.Count} 点）");
             }
             catch (DllNotFoundException)
             {

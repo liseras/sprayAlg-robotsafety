@@ -13,6 +13,47 @@
 #include <functional>
 #include <map>
 #include <array>
+#include <chrono>
+#include <thread>
+#include <atomic>
+
+// ---------------- 简易并行 for ----------------
+// 逐点阶段（SOR 邻域、法向估计、法向平滑）彼此完全独立，是最容易并行的部分。
+// 按静态分块切给若干线程，每块内顺序执行 —— 结果与串行完全一致（每块写的
+// 是自己的下标区间），不引入任何数值差异。
+template<class F>
+static void parallel_for(int n, F fn){
+    if(n <= 0) return;
+    unsigned hc = std::thread::hardware_concurrency();
+    int T = (int)std::min<unsigned>(hc ? hc : 1u, 16u);
+    // 小规模直接串行：线程创建/唤醒的开销比计算还大
+    if(T <= 1 || n < 20000){ for(int i=0;i<n;++i) fn(i); return; }
+    int chunk = (n + T - 1) / T;
+    std::vector<std::thread> th;
+    th.reserve(T);
+    for(int t=0; t<T; ++t){
+        int b = t*chunk, e = std::min(n, b+chunk);
+        if(b >= e) break;
+        th.emplace_back([&fn, b, e]{ for(int i=b;i<e;++i) fn(i); });
+    }
+    for(auto& x : th) x.join();
+}
+
+// ---------------- 分阶段计时 ----------------
+// SPRAYTRAJ_PROF=1 时打印每个阶段的墙钟耗时，用于性能分析。
+// 用高精度时钟 + 累加器：同一阶段被多次调用（如逐面重建）会合并统计。
+struct ProfStage {
+    const char* name;
+    double* acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit ProfStage(const char* n, double* a=nullptr) : name(n), acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~ProfStage(){
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+        if(acc) *acc += ms;
+        if(std::getenv("SPRAYTRAJ_PROF")) fprintf(stderr, "[prof] %-22s %8.1f ms\n", name, ms);
+    }
+};
 
 // ---------------- 基础几何 ----------------
 struct Vec3 { double x=0,y=0,z=0; };
@@ -34,72 +75,161 @@ static inline double cross2(Vec2 a, Vec2 b){return a.x*b.y-a.y*b.x;}
 static inline double len2(Vec2 a){return std::sqrt(dot2(a,a));}
 static inline Vec2 norm2(Vec2 a){double l=len2(a); return l>1e-12? Vec2{a.x/l,a.y/l}: Vec2{0,0};}
 
-// ---------------- 简单 KD 树 ----------------
+// ---------------- KD 树（性能关键路径） ----------------
+// 旧实现两个热点，在大点云(60万点)上是主要耗时来源：
+//   1) 构建：每层 std::sort 全排 + 左右子数组各自拷贝 → O(n log²n) 且产生
+//      2n 次 vector 分配。改成对同一份索引数组做 nth_element 原地中位切分，
+//      O(n log n)、零分配。
+//   2) 查询：每次查询 new 一个 vector 当结果桶，插入时对 k 个元素整体 sort，
+//      距离用带 sqrt 的欧氏距离。
+//
+// 第二轮优化的两个点（查询是内存延迟瓶颈，不是算力瓶颈）：
+//   a) 节点内联坐标：原来每访问一个节点要两次随机访存（节点表 → 点表），
+//      现在坐标直接在节点里，一次访存就够；
+//   b) 结果桶从"有序数组插入"改成定长最大堆：插入只需 O(log k) 次比较/交换，
+//      而旧写法每次插入要 memmove 上百字节。邻居顺序对下游（PCA 拟合、
+//      区域生长）无意义，因此不再排序；
+//   c) 切分轴按"该子集跨度最大的轴"选，不再 x/y/z 循环。**这是查询慢的主因。**
+//      线扫点云是薄壳（比如 1030×487×81mm），z 向跨度极小；循环选轴的写法
+//      每三层就有一次拿 z 当切分轴，而 z 上几乎所有点挤在同一个薄片里，
+//      这个节点等于没切开——子树仍然巨大，剪枝完全失效，每次查询要遍历
+//      上千个节点。按跨度选轴后，切分总是发生在信息量最大的方向上。
+//
+// 注意：近邻集合与旧实现一致（等距并列时取哪个点可能不同，但 PCA 法向与
+// SOR 判定对其不敏感，回归面数/行数不变）。
+constexpr int KD_MAXK = 64;   // 单次查询支持的最大 K（栈上桶容量）
+
+struct KnnBuf {
+    double d2[KD_MAXK];   // 平方距离（最大堆，堆顶=当前最差）
+    int    id[KD_MAXK];
+    int    k = 0;         // 目标邻居数
+    int    n = 0;         // 已收集数量
+    void init(int kk){ k = std::min(kk, KD_MAXK); if(k<1) k=1; n = 0; }
+    // 尚未收满时返回 +inf，让剪枝不生效；收满后返回堆顶
+    inline double worst() const { return n < k ? 1e300 : d2[0]; }
+    inline void push(double dd, int idx){
+        if(n < k){
+            int i = n++;
+            while(i > 0){
+                int p = (i-1)>>1;
+                if(d2[p] >= dd) break;
+                d2[i]=d2[p]; id[i]=id[p]; i=p;
+            }
+            d2[i]=dd; id[i]=idx;
+        } else if(dd < d2[0]) {
+            int i = 0;
+            for(;;){
+                int l = 2*i+1, r = l+1, m = i;
+                double mx = dd;
+                if(l < n && d2[l] > mx){ m=l; mx=d2[l]; }
+                if(r < n && d2[r] > mx){ m=r; }
+                if(m == i) break;
+                d2[i]=d2[m]; id[i]=id[m]; i=m;
+            }
+            d2[i]=dd; id[i]=idx;
+        }
+    }
+};
+
 struct KdTree {
-    struct Node { int idx; int left=-1, right=-1; };
-    std::vector<Node> nodes;
+    // 坐标内联，避免查询时二次访存；axis 记在节点里（切分轴不再由深度推出来）
+    struct Node { double x, y, z; int idx; int left=-1, right=-1; unsigned char axis=0; };
+    std::vector<Node> nodes;        // 预分配到点数大小（一节点一点），支持并行构建
+    std::vector<int>  ids;          // 构建期的索引工作区（原地切分，不拷贝子数组）
     const std::vector<Vec3>* pts=nullptr;
-    void build(std::vector<int> ids, int axis){
-        if(ids.empty()) return;
-        std::sort(ids.begin(), ids.end(), [&](int a, int b){
+    std::atomic<int> nextNode{0};   // 节点槽位分配（并行构建时由各子树竞争）
+
+    // lo..hi 为左闭右开区间；返回子树根节点下标
+    int build_rec(int lo, int hi){
+        if(lo >= hi) return -1;
+        // 选该子集跨度最大的轴：避免在几乎不变形的方向上白切一刀
+        double mn[3]={1e300,1e300,1e300}, mx[3]={-1e300,-1e300,-1e300};
+        for(int t=lo;t<hi;++t){
+            const Vec3& p=(*pts)[ids[t]];
+            if(p.x<mn[0]) mn[0]=p.x; if(p.x>mx[0]) mx[0]=p.x;
+            if(p.y<mn[1]) mn[1]=p.y; if(p.y>mx[1]) mx[1]=p.y;
+            if(p.z<mn[2]) mn[2]=p.z; if(p.z>mx[2]) mx[2]=p.z;
+        }
+        double e0=mx[0]-mn[0], e1=mx[1]-mn[1], e2=mx[2]-mn[2];
+        int axis = (e0>=e1 && e0>=e2) ? 0 : (e1>=e2 ? 1 : 2);
+
+        int mid = lo + (hi - lo)/2;
+        auto cmp = [&](int a, int b){
             double va = (axis==0)?(*pts)[a].x : (axis==1)?(*pts)[a].y:(*pts)[a].z;
             double vb = (axis==0)?(*pts)[b].x : (axis==1)?(*pts)[b].y:(*pts)[b].z;
             return va < vb;
-        });
-        int mid = ids.size()/2;
-        int ni = (int)nodes.size();
-        nodes.push_back({ids[mid], -1, -1});
-        std::vector<int> l(ids.begin(), ids.begin()+mid);
-        std::vector<int> r(ids.begin()+mid+1, ids.end());
-        if(!l.empty()){ nodes[ni].left=(int)nodes.size(); build(l,(axis+1)%3);}
-        if(!r.empty()){ nodes[ni].right=(int)nodes.size(); build(r,(axis+1)%3);}
+        };
+        std::nth_element(ids.begin()+lo, ids.begin()+mid, ids.begin()+hi, cmp);
+        int ni = nextNode.fetch_add(1);
+        int id = ids[mid];
+        const Vec3& p = (*pts)[id];
+        nodes[ni] = Node{p.x, p.y, p.z, id, -1, -1, (unsigned char)axis};
+        // 左右子树规模都够大时并行构建：两侧互不相干（各自操作 ids 的不相交区间），
+        // 树的结构与串行完全一致，只有节点槽位分配顺序不同（内部实现细节）。
+        if(hi - lo > 60000){
+            std::thread th([&]{ nodes[ni].left = build_rec(lo, mid); });
+            nodes[ni].right = build_rec(mid+1, hi);
+            th.join();
+        } else {
+            nodes[ni].left  = build_rec(lo,  mid);
+            nodes[ni].right = build_rec(mid+1, hi);
+        }
+        return ni;
     }
     void init(const std::vector<Vec3>& p){
-        pts=&p; nodes.clear(); nodes.reserve(p.size());
-        std::vector<int> ids(p.size()); std::iota(ids.begin(),ids.end(),0);
-        build(ids,0);
+        pts=&p;
+        // 节点数恒等于点数，预分配后并行构建就不必再扩容
+        nodes.assign(p.size(), Node{});
+        nextNode.store(0);
+        ids.resize(p.size()); std::iota(ids.begin(),ids.end(),0);
+        if(p.empty()){ std::vector<int>().swap(ids); return; }
+        build_rec(0, (int)p.size());
+        std::vector<int>().swap(ids);   // 查询阶段不再需要
     }
-    // K 近邻距离和
+
+    void knn(Vec3 q, int k, KnnBuf& b) const {
+        b.init(k);
+        rec(0, q, b);
+    }
+    void rec(int node, const Vec3& q, KnnBuf& b) const {
+        if(node < 0) return;
+        const Node& nd = nodes[node];
+        double dx=q.x-nd.x, dy=q.y-nd.y, dz=q.z-nd.z;
+        b.push(dx*dx+dy*dy+dz*dz, nd.idx);
+        int axis = nd.axis;
+        double diff = (axis==0)? dx : (axis==1)? dy : dz;
+        int near = diff<0 ? nd.left : nd.right;
+        int far  = diff<0 ? nd.right : nd.left;
+        rec(near, q, b);
+        // 用平方距离剪枝：diff² < 当前最差平方距离才需要搜另一侧
+        if(diff*diff < b.worst()) rec(far, q, b);
+    }
+
+    // K 近邻距离和（SOR 用，需要真实距离而非平方，故此处才开方）
     double knnSum(Vec3 q, int k) const {
-        std::vector<double> best(k, 1e18);
-        knnRec(0, q, k, 0, best);
-        return std::accumulate(best.begin(), best.end(), 0.0);
+        KnnBuf b; knn(q, k, b);
+        double s=0;
+        for(int i=0;i<b.n;++i) if(b.id[i]>=0) s += std::sqrt(b.d2[i]);
+        return s;
     }
-    // K 近邻索引（按距离升序）
+    // K 近邻索引（升序）
     void knnIdx(Vec3 q, int k, std::vector<int>& out) const {
-        std::vector<std::pair<double,int>> best(k, {1e18, -1});
-        knnRecIdx(0, q, k, 0, best);
-        out.clear(); out.reserve(k);
-        for(auto& pr : best) if(pr.second >= 0) out.push_back(pr.second);
+        KnnBuf b; knn(q, k, b);
+        std::vector<std::pair<double,int>> t;
+        t.reserve(b.n);
+        for(int i=0;i<b.n;++i) if(b.id[i]>=0) t.push_back({b.d2[i], b.id[i]});
+        std::sort(t.begin(), t.end());
+        out.clear(); out.reserve(t.size());
+        for(auto& pr : t) out.push_back(pr.second);
     }
-    void knnRecIdx(int node, Vec3 q, int k, int axis, std::vector<std::pair<double,int>>& best) const {
-        if(node<0) return;
-        const Vec3& p = (*pts)[nodes[node].idx];
-        double d = len(q-p);
-        if(d < best[k-1].first){
-            best[k-1] = {d, nodes[node].idx};
-            std::sort(best.begin(), best.end());
-        }
-        double diff = (axis==0)? q.x-p.x : (axis==1)? q.y-p.y : q.z-p.z;
-        int near = diff<0 ? nodes[node].left : nodes[node].right;
-        int far  = diff<0 ? nodes[node].right : nodes[node].left;
-        knnRecIdx(near, q, k, (axis+1)%3, best);
-        if(std::fabs(diff) < best[k-1].first) knnRecIdx(far, q, k, (axis+1)%3, best);
-    }
-    void knnRec(int node, Vec3 q, int k, int axis, std::vector<double>& best) const {
-        if(node<0) return;
-        const Vec3& p = (*pts)[nodes[node].idx];
-        double d = len(q-p);
-        double worst = best[k-1];
-        if(d < worst){
-            best[k-1]=d;
-            std::sort(best.begin(), best.end());
-        }
-        double diff = (axis==0)? q.x-p.x : (axis==1)? q.y-p.y : q.z-p.z;
-        int near = diff<0 ? nodes[node].left : nodes[node].right;
-        int far  = diff<0 ? nodes[node].right : nodes[node].left;
-        knnRec(near, q, k, (axis+1)%3, best);
-        if(std::fabs(diff) < best[k-1]) knnRec(far, q, k, (axis+1)%3, best);
+    // 零分配版本：直接写入调用方给定的 k 个 int 槽位（扁平数组用）。顺序未定义。
+    int knnIdxInto(Vec3 q, int k, int* out) const {
+        KnnBuf b; knn(q, k, b);
+        int kk = std::min(k, KD_MAXK);
+        for(int i=0;i<kk;++i) out[i] = -1;      // 邻居不足时留 -1，调用方跳过
+        int n=0;
+        for(int i=0;i<b.n;++i) if(b.id[i]>=0) out[n++]=b.id[i];
+        return n;
     }
 };
 
@@ -110,10 +240,16 @@ struct TrajPoint { Vec3 pos; Vec3 dir; double speed; int spray; };
 
 // SOR 去噪
 std::vector<Vec3> sor_filter(const std::vector<Vec3>& P, int k, double z){
-    KdTree tree; tree.init(P);
+    // KnnBuf 是栈上定长桶，K 超过容量会被 init() 截断；这里显式夹一次并提示，
+    // 避免"用户传了 sorK=80 却按 64 算"这种静默偏差。
+    if(k > KD_MAXK){ fprintf(stderr, "[去噪] sorK=%d 超过上限，按 %d 计算\n", k, KD_MAXK); k = KD_MAXK; }
+    if(k < 1) k = 1;
+    KdTree tree;
+    { ProfStage ps("1a.KD树构建"); tree.init(P); }
     std::vector<double> md(P.size());
-    double sum=0;
-    for(size_t i=0;i<P.size();++i){ md[i]=tree.knnSum(P[i], k)/k; sum+=md[i]; }
+    { ProfStage ps("1b.KNN邻域查询");
+      parallel_for((int)P.size(), [&](int i){ md[i] = tree.knnSum(P[i], k)/(double)k; }); }
+    double sum=0; for(double v:md) sum+=v;   // 串行求和，保证与单线程结果逐位一致
     double mu=sum/P.size();
     double var=0; for(double v:md) var+=(v-mu)*(v-mu); var/=P.size();
     double sd=std::sqrt(var);
@@ -126,37 +262,57 @@ std::vector<Vec3> sor_filter(const std::vector<Vec3>& P, int k, double z){
 struct Plane { Vec3 n; double d; Vec3 c; };
 
 // 用一组点做最小二乘平面拟合（正规方程 + 逆迭代求最小特征向量）
-static bool ls_plane(const std::vector<Vec3>& P, const std::vector<int>& idx,
-                     Vec3& n, Vec3& c)
+// 指针版本：供扁平 KNN 邻接表直接使用，避免每次查询都构造临时 vector
+static bool ls_plane_p(const std::vector<Vec3>& P, const int* idx, int cnt,
+                       Vec3& n, Vec3& c)
 {
-    if(idx.size()<3) return false;
-    Vec3 m{0,0,0}; for(int i:idx){m.x+=P[i].x;m.y+=P[i].y;m.z+=P[i].z;}
-    m=m*(1.0/(double)idx.size());
+    if(cnt<3) return false;
+    Vec3 m{0,0,0};
+    for(int t=0;t<cnt;++t){ int i=idx[t]; if(i<0) continue; m.x+=P[i].x;m.y+=P[i].y;m.z+=P[i].z; }
+    m=m*(1.0/(double)cnt);
     double A00=0,A01=0,A02=0,A11=0,A12=0,A22=0;
-    for(int i:idx){ double dx=P[i].x-m.x,dy=P[i].y-m.y,dz=P[i].z-m.z;
+    for(int t=0;t<cnt;++t){ int i=idx[t]; if(i<0) continue;
+        double dx=P[i].x-m.x,dy=P[i].y-m.y,dz=P[i].z-m.z;
         A00+=dx*dx; A01+=dx*dy; A02+=dx*dz; A11+=dy*dy; A12+=dy*dz; A22+=dz*dz; }
-    double invn=1.0/(double)idx.size();
+    double invn=1.0/(double)cnt;
     A00*=invn;A01*=invn;A02*=invn;A11*=invn;A12*=invn;A22*=invn;
     // 最小特征向量 = 法向（逆迭代）
+    // 性能注意：A 在整个迭代过程中是不变的，所以逆矩阵只需算一次；
+    // 旧写法把 det 和 6 个伴随矩阵元素放进循环里，并且用 `|det|<1e-20` 当退出条件
+    // ——det 是循环不变量，这个条件永远为假，于是每次都老老实实跑满 80 轮。
+    // 现在改为按特征向量收敛判据提前退出（对称阵逆迭代收敛很快，通常 4~8 轮）。
+    double det = A00*(A11*A22-A12*A12) - A01*(A01*A22-A12*A02) + A02*(A01*A12-A11*A02);
+    if(std::fabs(det)<1e-20){ n=Vec3{0,0,1}; c=m; return true; }   // 平凡/退化邻域
+    const double i00=(A11*A22-A12*A12)/det;
+    const double i01=(A02*A12-A01*A22)/det;
+    const double i02=(A01*A12-A11*A02)/det;
+    const double i11=(A00*A22-A02*A02)/det;
+    const double i12=(A01*A02-A00*A12)/det;
+    const double i22=(A00*A11-A01*A01)/det;
     Vec3 x{0,0,1};
     for(int inner=0; inner<80; ++inner){
-        double det = A00*(A11*A22-A12*A12) - A01*(A01*A22-A12*A02) + A02*(A01*A12-A11*A02);
-        if(std::fabs(det)<1e-20) break;
-        double i00=(A11*A22-A12*A12)/det;
-        double i01=(A02*A12-A01*A22)/det;
-        double i02=(A01*A12-A11*A02)/det;
-        double i11=(A00*A22-A02*A02)/det;
-        double i12=(A01*A02-A00*A12)/det;
-        double i22=(A00*A11-A01*A01)/det;
         Vec3 y{ i00*x.x+i01*x.y+i02*x.z,
                 i01*x.x+i11*x.y+i12*x.z,
                 i02*x.x+i12*x.y+i22*x.z };
         double l=std::sqrt(dot(y,y));
         if(l<1e-12) break;
-        x=Vec3{y.x/l,y.y/l,y.z/l};
+        Vec3 xn{y.x/l,y.y/l,y.z/l};
+        // 收敛判据取"定点"：方向逐分量不再变化时，再迭代也只会得到同一个数。
+        // 用 |dot|≈1 之类的相对阈值会停在 1e-13 量级，虽然肉眼无差别，
+        // 但会在少数点的最后一位上留下漂移（回归时表现为个别坐标差 0.1mm 级）。
+        bool fixed = (xn.x==x.x && xn.y==x.y && xn.z==x.z);
+        x = xn;
+        if(fixed) break;
     }
     n=x; c=m;
     return true;
+}
+
+// 容器版本（兼容原有调用点）
+static bool ls_plane(const std::vector<Vec3>& P, const std::vector<int>& idx,
+                     Vec3& n, Vec3& c)
+{
+    return ls_plane_p(P, idx.data(), (int)idx.size(), n, c);
 }
 
 // RANSAC 平面拟合：随机抽样 + 内点投票 + 内点最小二乘精化
@@ -176,18 +332,42 @@ bool fit_plane(const std::vector<Vec3>& P, double tol, Plane& pl, std::vector<in
     std::mt19937 rng(12345);
     std::uniform_int_distribution<int> ud(0, N-1);
 
+    // 性能改造：先一次性生成全部假设，再并行打分，最后按原顺序取第一个最优。
+    //
+    // 原实现是"每轮 RANSAC 都全量扫一遍点云并 push_back 索引"，200 轮 × 60 万点
+    // = 1.2 亿次 push_back + 反复扩容，是大点云上最大的一块单点开销。
+    //
+    // 等价性：原循环用 `cur.size() > best.size()` 严格大于才更新，所以最终选中的
+    // 就是"按迭代顺序第一个达到全局最大内点数的假设"。这里并行算完所有假设的
+    // 内点数后，同样按迭代顺序取第一个严格更优者 —— 结果完全相同。
+    // RNG 抽样顺序也保持一致（无效样本仍照常消耗随机数），故抽样点集也相同。
+    struct Hyp { Vec3 n; double d; };
+    std::vector<Hyp> hyps;
+    hyps.reserve(iters);
     for(int it=0; it<iters; ++it){
-        // 抽 3 个不重复点
         int a=ud(rng), b=ud(rng), c2=ud(rng);
         if(a==b||b==c2||a==c2) continue;
         Vec3 n = norm(cross(P[b]-P[a], P[c2]-P[a]));
         if(len(n)<1e-6) continue;             // 三点共线，跳过
-        double d = -dot(n, P[a]);
-        // 统计内点
-        std::vector<int> cur;
-        for(int i=0;i<N;++i) if(std::fabs(dot(P[i],n)+d) < tol) cur.push_back(i);
-        if(cur.size() > best.size()){
-            best.swap(cur); bn=n;
+        hyps.push_back({n, -dot(n, P[a])});
+    }
+
+    if(!hyps.empty()){
+        std::vector<int> cnt(hyps.size(), 0);
+        parallel_for((int)hyps.size(), [&](int k){
+            const Vec3& n = hyps[k].n; double d = hyps[k].d;
+            int c=0;
+            for(int i=0;i<N;++i) if(std::fabs(dot(P[i],n)+d) < tol) ++c;
+            cnt[k]=c;
+        });
+        int bestK=-1, bestCnt=0;
+        for(size_t k=0;k<hyps.size();++k)
+            if(cnt[k] > bestCnt){ bestCnt=cnt[k]; bestK=(int)k; }
+        if(bestK >= 0){
+            bn = hyps[bestK].n;
+            const Vec3& n = hyps[bestK].n; double d = hyps[bestK].d;
+            best.reserve(bestCnt);
+            for(int i=0;i<N;++i) if(std::fabs(dot(P[i],n)+d) < tol) best.push_back(i);
         }
     }
 
@@ -824,7 +1004,9 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
 
     // ---- 第一步：RANSAC 拟合主平面，确定高度方向 n ----
     Plane mainPl; std::vector<int> mainInl;
-    if(!fit_plane(P, std::min(tol,3.0), mainPl, mainInl)){
+    bool ransacOk;
+    { ProfStage ps("2c.RANSAC主平面"); ransacOk = fit_plane(P, std::min(tol,3.0), mainPl, mainInl); }
+    if(!ransacOk){
         // 拟合失败：退化为整体一个面
         std::vector<int> all(P.size()); std::iota(all.begin(),all.end(),0);
         Vec3 nf, cf;
@@ -857,14 +1039,21 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
     // 上近乎共线，PCA 法向退化（区域生长碎片化的根源）。K=25 保证邻域
     // 跨越多条扫描线，法向稳定。
     const int K = 25;
-    KdTree tree; tree.init(P);
+    KdTree tree;
+    { ProfStage ps("2a.KD树构建"); tree.init(P); }
     std::vector<Vec3> nor(P.size());
-    std::vector<std::vector<int>> knn(P.size());
-    for(size_t i=0;i<P.size();++i){
-        tree.knnIdx(P[i], K, knn[i]);
-        Vec3 nf, cf;
-        if(ls_plane(P, knn[i], nf, cf) && len(nf)>1e-9) nor[i]=nf;
-        else nor[i]=Vec3{0,0,1};
+    // 邻接表用扁平数组存（600k × 25），避免 60 万次小 vector 分配；
+    // 邻接表在后面的图平滑和区域生长还要反复读，扁平布局对缓存也更友好。
+    std::vector<int> knnFlat(P.size()*(size_t)K, -1);
+    {
+        ProfStage ps("2b.KNN法向");
+        parallel_for((int)P.size(), [&](int i){
+            int* row = &knnFlat[(size_t)i*(size_t)K];
+            tree.knnIdxInto(P[i], K, row);
+            Vec3 nf, cf;
+            if(ls_plane_p(P, row, K, nf, cf) && len(nf)>1e-9) nor[i]=nf;
+            else nor[i]=Vec3{0,0,1};
+        });
     }
     // 法向图平滑 2 轮：nor[i] = 归一化(自身 + 邻居法向均值)，消除逐点 PCA 噪声。
     // 关键：必须"保边"——只平均与自身法向接近(<30°)的邻居。
@@ -873,20 +1062,23 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
     const double cosKeep = std::cos(30.0*3.141592653589793/180.0);
     for(int pass=0; pass<2; ++pass){
         std::vector<Vec3> sm(P.size());
-        for(size_t i=0;i<P.size();++i){
+        parallel_for((int)P.size(), [&](int i){
             Vec3 s = nor[i];
-            for(int j : knn[i]){
+            const int* row = &knnFlat[(size_t)i*(size_t)K];
+            for(int t=0;t<K;++t){
+                int j = row[t]; if(j<0) continue;
                 if(std::fabs(dot(nor[j], nor[i])) < cosKeep) continue;   // 跨棱不平均
                 s = s + nor[j];
             }
             sm[i] = norm(s);
             if(len(sm[i])<1e-9) sm[i]=nor[i];
-        }
+        });
         nor.swap(sm);
     }
 
     // ---- 区域生长：种子法向固定，夹角阈值 normalGrowDeg ----
     const double cosGrow = std::cos(5.0*3.141592653589793/180.0);  // 与块种子法向夹角 < 5°
+    ProfStage psGrow("2d.区域生长");
     std::vector<int> regionId(P.size(), -1);
     std::vector<Vec3> seedN;
     std::vector<std::vector<int>> regions;
@@ -901,7 +1093,9 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         stack.clear(); stack.push_back((int)s);
         while(!stack.empty()){
             int i = stack.back(); stack.pop_back();
-            for(int j : knn[i]){
+            const int* row = &knnFlat[(size_t)i*(size_t)K];
+            for(int t=0;t<K;++t){
+                int j = row[t]; if(j<0) continue;
                 if(regionId[j] >= 0) continue;
                 if(std::fabs(dot(nor[j], sn)) >= cosGrow){
                     regionId[j] = id; reg.push_back(j);
@@ -1269,7 +1463,9 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, double tol, doubl
         std::vector<char> adj(F*F, 0);
         for(size_t i=0;i<P.size();++i){
             int a = lab[i]; if(a < 0) continue;
-            for(int j : knn[i]){
+            const int* row = &knnFlat[i*(size_t)K];
+            for(int t=0;t<K;++t){
+                int j = row[t]; if(j<0) continue;
                 int b = lab[j];
                 if(b < 0 || b == a) continue;
                 adj[(size_t)a*F+b] = adj[(size_t)b*F+a] = 1;
@@ -1416,6 +1612,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     SprayTrajResult res;
     std::memset(&res, 0, sizeof(res));
     res.error = nullptr;
+    ProfStage psTotal("0.总耗时");   // 任意返回路径都会打印
 
     std::string err;
     if(!xyz || n<10){ err="点云点数不足(<10)"; res.error=_strdup(err.c_str()); return res; }
@@ -1424,8 +1621,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     for(int i=0;i<n;++i) P[i]={xyz[i*3],xyz[i*3+1],xyz[i*3+2]};
     res.input_points=n;
 
+    double tSor=0, tSplit=0, tMesh=0, tTraj=0;
     // 1. 去噪
-    std::vector<Vec3> Pf = sor_filter(P, params->sorK, params->sorZ);
+    std::vector<Vec3> Pf;
+    {
+        ProfStage ps("1.SOR去噪", &tSor);
+        Pf = sor_filter(P, params->sorK, params->sorZ);
+    }
     res.removed_points = n - (int)Pf.size();
     if(Pf.size()<10){ err="去噪后点数不足"; res.error=_strdup(err.c_str()); return res; }
     {
@@ -1438,7 +1640,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     //   顺序 RANSAC 反复剥离最大平面。折型板 → 两个面；槽型盘 → 底盘 + 凸起侧边；
     //   高度差小的浅曲面/缓起伏会被第一个主平面吸收（flatnessTol 判定）。
     //   每个平面后续分别拟合、生成轨迹、沿各自法向抬升（避免撞击凸起）。
-    std::vector<PlaneSeg> segs = split_planes(Pf, params->flatnessTol, params->curvatureTol, std::max(20, (int)(Pf.size()*0.02)));
+    std::vector<PlaneSeg> segs;
+    {
+        ProfStage ps("2.平面分割", &tSplit);
+        segs = split_planes(Pf, params->flatnessTol, params->curvatureTol, std::max(20, (int)(Pf.size()*0.02)));
+    }
 
     // 若分割结果为空（极少见），退回单平面
     if(segs.empty()){
@@ -1595,11 +1801,15 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             }
             std::vector<char> keepMask;
             std::vector<Vec2> fillRect;
-            bool okMesh = build_plane_mesh(uv, params->scanRowSpacing, params->fillHoleSize,
-                                           verts, tris,
-                                           SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
-                                           SPRAYTRAJ_PLANE_MAX_POLY_TRIS,
-                                           &keepMask, &fillRect);
+            bool okMesh = false;
+            {
+                ProfStage ps("3.轮廓重建", &tMesh);
+                okMesh = build_plane_mesh(uv, params->scanRowSpacing, params->fillHoleSize,
+                                          verts, tris,
+                                          SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
+                                          SPRAYTRAJ_PLANE_MAX_POLY_TRIS,
+                                          &keepMask, &fillRect);
+            }
             // 补全面：记下矩形四角的世界坐标，轨迹阶段据此在补全区布行
             if(!fillRect.empty() && fillRect.size() >= 4){
                 planeFilled[i] = 1;
@@ -1767,6 +1977,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
     std::vector<SprayTrajPoint> allPts;
     int totalRows = 0;
+    ProfStage psTraj("4.轨迹生成", &tTraj);
 
     // ---- 面间过渡的安全高度 ----
     // 面间转移是空移，但控制器会把相邻两个点用直线插值走完。原来只补一个

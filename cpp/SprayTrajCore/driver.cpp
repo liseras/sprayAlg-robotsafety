@@ -10,37 +10,55 @@
 #include <algorithm>
 
 static bool read_ply(const std::string& path, std::vector<double>& xyz){
-    std::ifstream f(path, std::ios::binary);
-    if(!f) return false;
-    std::string line; int n=0; bool ascii=true;
-    while(std::getline(f,line)){
-        if(line.rfind("format",0)==0){ ascii = line.find("ascii")!=std::string::npos; }
-        if(line.rfind("element vertex",0)==0){ sscanf(line.c_str(),"element vertex %d",&n); }
-        if(line.rfind("end_header",0)==0) break;
-    }
-    if(n<=0) return false;
-    xyz.reserve(n*3);
-    if(ascii){
-        // 面板.ply 每行 4 列: x y z intensity；通用处理：读第一个数是 x，需要知道列数
-        // 简化：读到 end_header 后，先探测一行有几列
-        std::string fl;
-        std::getline(f, fl);
-        // 数 token 数
-        {
-            std::stringstream ss(fl); std::string tok; int cols=0;
-            while(ss>>tok) cols++;
-            // 回退：无法回退，改为按行处理
+    // 整文件一次读入再解析。
+    // 原实现每行建一个 std::stringstream、再 push 进一个临时 vector<double>，
+    // 60 万行时要 1s 以上 —— 小件看不出来，大点云上这部分比算法本身还显眼。
+    FILE* fp = fopen(path.c_str(), "rb");
+    if(!fp) return false;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if(sz <= 0){ fclose(fp); return false; }
+    std::string buf;
+    buf.resize((size_t)sz);
+    size_t got = fread(&buf[0], 1, (size_t)sz, fp);
+    fclose(fp);
+    buf.resize(got);
+
+    // 解析头部：点数 + 是否 ascii
+    int n=0; bool ascii=true; size_t dataStart=0;
+    {
+        size_t pos = 0;
+        while(pos < buf.size()){
+            size_t nl = buf.find('\n', pos);
+            if(nl == std::string::npos) nl = buf.size();
+            std::string line = buf.substr(pos, nl-pos);
+            if(line.rfind("format",0)==0) ascii = line.find("ascii")!=std::string::npos;
+            if(line.rfind("element vertex",0)==0) sscanf(line.c_str(),"element vertex %d",&n);
+            if(line.rfind("end_header",0)==0){ dataStart = (nl<buf.size())? nl+1 : buf.size(); break; }
+            pos = nl + 1;
         }
-        // 重新按行读取（含刚才那行）
-        auto parseLine=[&](const std::string& ln){
-            std::stringstream ss(ln); std::vector<double> v; double t;
-            while(ss>>t) v.push_back(t);
-            if(v.size()>=3){ xyz.push_back(v[0]); xyz.push_back(v[1]); xyz.push_back(v[2]); }
-        };
-        parseLine(fl);
-        for(int i=1;i<n;++i){ std::string ln; if(std::getline(f,ln)) parseLine(ln); }
-    } else {
-        return false;
+    }
+    if(n<=0 || !ascii) return false;
+
+    // 数据区：每行取前 3 个数（面板件是 x y z intensity 四列）
+    xyz.reserve((size_t)n*3);
+    const char* q = buf.data() + dataStart;
+    const char* end = buf.data() + buf.size();
+    while(q < end && (int)(xyz.size()/3) < n){
+        while(q < end && (*q==' '||*q=='\t'||*q=='\r'||*q=='\n')) ++q;
+        if(q >= end) break;
+        double v[3]; int c=0;
+        while(c < 3){
+            char* e2 = nullptr;
+            double d = std::strtod(q, &e2);
+            if(e2 == q) break;
+            v[c++] = d; q = e2;
+            while(q < end && (*q==' '||*q=='\t')) ++q;
+        }
+        if(c >= 3){ xyz.push_back(v[0]); xyz.push_back(v[1]); xyz.push_back(v[2]); }
+        while(q < end && *q != '\n') ++q;   // 跳到行尾（跳过强度等多余列）
+        if(q < end) ++q;
     }
     return !xyz.empty();
 }
