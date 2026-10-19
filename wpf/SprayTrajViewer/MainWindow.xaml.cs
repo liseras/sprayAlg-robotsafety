@@ -22,6 +22,8 @@ namespace SprayTrajViewer
         // 点云与轨迹的视觉元素引用（用于独立显隐）
         private PointsVisual3D? _cloudVisual;
         private readonly List<TubeVisual3D> _trajVisuals = new();
+        // 命令行 --keep-cloud：生成后不自动收起点云，用于"点云抽样是否正确"的验收截图
+        private bool _keepCloudOnGenerate;
 
         public MainWindow()
         {
@@ -85,6 +87,7 @@ namespace SprayTrajViewer
         {
             var o = ParseArgs();
             bool hadArgs = o.Count > 0;
+            _keepCloudOnGenerate = o.ContainsKey("keep-cloud");
 
             // 参数（只覆盖显式传入的项，其余保持界面默认值）
             if (o.TryGetValue("ply", out var ply)) TxtPath.Text = ply;
@@ -202,19 +205,32 @@ namespace SprayTrajViewer
             // 移除旧点云（保留轨迹、平面）
             if (_cloudVisual != null) { Viewport.Children.Remove(_cloudVisual); _cloudVisual = null; }
 
-            var pts = new Point3DCollection();
-            foreach (var p in _cloud.Take(200000))
+            // 大点云必须**等距抽样**，不能 Take(N)。
+            // 现场点云是逐扫描线存盘的，Take(200000) 取到的是文件开头那一段连续区域，
+            // 601k 点的工件只画前 200k，看起来就像"点云只盖住一条斜带"，
+            // 而且这团点是不透明地压在轨迹上面 → 用户以为"轨迹只喷了左半边"。
+            // 抽样密度上限按"视觉够用"定：20 万点已能把轮廓看清楚。
+            const int MaxDraw = 200000;
+            int step = Math.Max(1, (_cloud.Count + MaxDraw - 1) / MaxDraw);
+            var pts = new Point3DCollection(_cloud.Count / step + 8);
+            for (int i = 0; i < _cloud.Count; i += step)
+            {
+                var p = _cloud[i];
                 pts.Add(new Point3D(p.x, p.y, p.z));
+            }
 
             _cloudVisual = new PointsVisual3D
             {
                 Points = pts,
                 Color = Color.FromRgb(224, 64, 224),
-                Size = 2.5
+                // 点越密，点径越小，否则整片糊成色块把轨迹/面片全遮住
+                Size = pts.Count > 120000 ? 1.2 : (pts.Count > 40000 ? 1.8 : 2.5)
             };
             Viewport.Children.Add(_cloudVisual);
             Viewport.ZoomExtents(200);
             ApplyCloudVisibility();
+            App.Log("CLOUD", null,
+                $"绘制 {pts.Count}/{_cloud.Count} 点（等距抽样 step={step}，点径={_cloudVisual.Size}）");
         }
 
         void BtnGenerate_Click(object sender, RoutedEventArgs e)
@@ -321,6 +337,14 @@ namespace SprayTrajViewer
                 $"  红色=喷涂行，灰色=空移（面间抬枪绕行）";
 
             TxtHint.Text = $"轨迹已生成：{res.count} 点，{res.rows} 行";
+
+            // 生成完自动收起原始点云：几十万点的洋红点云是不透明的，会整片压在
+            // 轨迹和重建面上面，看上去像"轨迹只喷了一半"。点云随时可以再勾回来对比。
+            if (ChkShowCloud.IsChecked == true && !_keepCloudOnGenerate)
+            {
+                ChkShowCloud.IsChecked = false;
+                App.Log("CLOUD", null, "生成后自动隐藏原始点云（可在显示控制里重新勾选）");
+            }
 
             Native.spray_traj_free(ref res);
 
