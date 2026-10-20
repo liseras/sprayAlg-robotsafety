@@ -81,8 +81,8 @@ namespace SprayTrajViewer
         public double safety;           // 安全间隙 mm
         public double search;           // 判定带 mm（超过只报下界）
         public double toolLen;          // 法兰 → 喷嘴 mm
-        public double tiltNonUpDeg;     // 非朝上面基准倾角
-        public double upThresholdDeg;   // 偏竖直超过它 → 判为"非朝上"
+        public double tiltNonUpDeg;     // α=90°（竖直侧壁）时的倾角；实际 = 它 × α/90°（α 为法向与 +Z 夹角）
+        public double upThresholdDeg;   // 已不参与倾角决策（倾角按法向线性给），保留仅为 ABI 稳定
         public double tiltMaxDeg;       // 倾角上限
         public double tiltStepDeg;      // 倾角搜索步长
         public double tiltRateDeg;      // 每点倾角最大变化

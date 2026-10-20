@@ -50,8 +50,8 @@ class Params:
     # 报告里只剩一排"≥40"，等于什么都没测到。这是 DensoArmKine CloudCheck 的同一口径
     # （EffectiveSearchMm = max(120, safety*4)）。
     search: float = 120.0              # 判定带（mm）：超过它就报下界，不当实测值
-    tilt_nonup_deg: float = 20.0       # 非朝上面默认倾角
-    up_threshold_deg: float = 45.0     # 法向偏离竖直超过它 → 判为「非朝上」
+    tilt_nonup_deg: float = 20.0       # α=90°（竖直侧壁）时的倾角；实际 = 它 × α/90°
+    up_threshold_deg: float = 45.0     # 已不参与倾角决策（倾角改线性），保留以对齐 C++ ABI
     tilt_max_deg: float = 60.0         # 倾角上限
     tilt_step_deg: float = 5.0
     tilt_rate_deg_per_pt: float = 3.0  # 倾角沿轨迹每点最大变化（度）
@@ -264,7 +264,7 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
     """求第 i 点「至少需要多大倾角 / 要不要换方位」，返回 (tilt, az, PointResult|None)。
 
     决策顺序 = 最小修正：
-      ① 基准倾角（非朝上面 20°，朝上面 0°）
+      ① 线性基准倾角（α=法向与 +Z 夹角，tilt0 = tilt_nonup · α/90，α=0 → 0°）
       ② 逐步 +5° 到上限
       ③ 兜底：把「上翻方向」左右偏 30°/60° 再试（有些内壁往上扳会顶到对面的壁）
 
@@ -278,11 +278,17 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
     n = traj.normal[i]
     face = traj.pos[i] + traj.gun[i] * p.standoff
     up = np.array([0.0, 0.0, 1.0])
-    cos_thr = math.cos(math.radians(p.up_threshold_deg))
 
-    not_up = float(n[2]) < cos_thr
-    face_down = float(n[2]) < -0.7          # 朝下的悬垂面：往上扳会顶穿工件，不扳
-    tilt0 = 0.0 if (not not_up or face_down) else p.tilt_nonup_deg
+    # 倾角需求按法向**线性**给（不是"非朝上就一律 20°"的阶梯）：
+    #   α = 法向与 +Z 的夹角（0°=正朝上，90°=竖直侧壁，180°=完全倒挂）
+    #   tilt0 = tilt_nonup_deg · (α/90°)，封顶 tilt_max_deg
+    # 90° 作满量程锚点是物理界限（"面立起来了"），更倒挂的面继续线性增长。
+    # 阶梯在 45° 边界上会突跳 20°，落到轨迹上就是相邻点倾角跳变，实机过不了。
+    alpha_deg = math.degrees(math.acos(float(np.clip(n[2], -1.0, 1.0))))
+    tilt0 = min(p.tilt_nonup_deg * (alpha_deg / 90.0), p.tilt_max_deg)
+    face_down = float(n[2]) < -0.7          # 朝下的悬垂面：往上扳会顶穿工件，不做线性外推
+    if face_down:
+        tilt0 = 0.0
 
     axis, u_up, _ = geom.tilt_axis_and_dir(n, up)
     degenerate = geom.norm(u_up) < 1e-6      # 夹角 < 5° 时 geom 已直接返回零向量
@@ -291,20 +297,26 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
         u_up = np.zeros(3)
         tilt0 = 0.0
 
+    # 第一候选 = 线性基准原样（贴合需求，不无谓加大）；之后走**固定 5° 网格**。
+    # 不能写成 tilt0 + k·step：tilt0 随法向连续变化，候选相位会跟着漂移，
+    # 同一个物理点可能从"刚好过关的 40°"滑到"刚好撞上的 36.48°"，纯数值抖动。
+    # 实测 curved idx 2990：网格 40° 自碰撞间隙 +1.18mm，漂移 36.48° 为 −1.16mm。
     cand: list[tuple[float, float]] = [(tilt0, 0.0)]
     if not degenerate:
-        t = tilt0
-        while t + p.tilt_step_deg <= p.tilt_max_deg + 1e-9:
-            t += p.tilt_step_deg
-            cand.append((t, 0.0))
+        g = math.ceil(tilt0 / p.tilt_step_deg - 1e-9) * p.tilt_step_deg
+        while g <= tilt0 + 1e-9:
+            g += p.tilt_step_deg
+        while g <= p.tilt_max_deg + 1e-9:
+            cand.append((g, 0.0))
+            g += p.tilt_step_deg
 
     best_any: PointResult | None = None
     best_any_key = (-math.inf, -math.inf)
     flat_run = 0
-    prev_clr: float | None = None
+    prev: tuple[float, float, float] | None = None
 
     def _try(tilt_deg: float, az: float):
-        nonlocal best_any, best_any_key, flat_run, prev_clr
+        nonlocal best_any, best_any_key, flat_run, prev
         d = _dir_of(n, u_up, axis, tilt_deg, az)
         pr = ev.eval_pose(face, d, ref_x, seed, tilt_deg, az, check_links=check_links)
         if pr is None:
@@ -317,11 +329,15 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
         if key > best_any_key:
             best_any_key = key
             best_any = pr
-        if prev_clr is not None and abs(pr.clearance - prev_clr) < 0.5:
+        # 早停计数：三个指标都不动才算"倾角对这条方向毫无影响"。
+        # 只比 clearance 会误停——间隙常常早早饱和到 search 上限，而自碰撞/
+        # 关节余量仍在随倾角变化，停了就漏掉后面能过关的档位。
+        cur = (pr.clearance, pr.self_collision, pr.margin_min)
+        if prev is not None and all(abs(a - b) < 0.5 for a, b in zip(cur, prev)):
             flat_run += 1
         else:
             flat_run = 0
-        prev_clr = pr.clearance
+        prev = cur
         return None
 
     for tilt_deg, az in cand:
@@ -333,8 +349,9 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
 
     # ---- 兜底：换倾斜方位（只在"往上扳"整条路都无效时才展开）
     if p.az_fallback and not degenerate and flat_run < 4:
+        grid0 = math.ceil(tilt0 / p.tilt_step_deg - 1e-9) * p.tilt_step_deg
         for az in (30.0, -30.0, 60.0, -60.0):
-            for tt in (max(tilt0, 10.0), max(tilt0, 25.0), max(tilt0, 40.0), max(tilt0, 55.0)):
+            for tt in (max(grid0, 10.0), max(grid0, 25.0), max(grid0, 40.0), max(grid0, 55.0)):
                 if tt > p.tilt_max_deg + 1e-9:
                     continue
                 hit = _try(tt, az)

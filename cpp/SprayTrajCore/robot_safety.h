@@ -26,8 +26,8 @@ typedef struct RobotSafetyParams {
     double safety;           // 安全间隙 mm：表面距离小于它 → 告警（P1）
     double search;           // 判定带 mm：超过它只报下界，不当实测值。默认 120（≈ DensoArmKine 口径）
     double toolLen;          // 法兰面 → 喷嘴出口 mm（VS-087 默认 150）
-    double tiltNonUpDeg;     // 非朝上面的基准倾角（默认 20）
-    double upThresholdDeg;   // 法向偏离竖直超过它 → 判为「非朝上」（默认 45）
+    double tiltNonUpDeg;     // α=90°（竖直侧壁）时的倾角；实际倾角 = 它 × α/90°，α 为法向与 +Z 夹角（默认 20）
+    double upThresholdDeg;   // 已不参与倾角决策（倾角改为按法向线性给），保留字段仅为 ABI 稳定
     double tiltMaxDeg;       // 倾角上限（默认 60）
     double tiltStepDeg;      // 倾角搜索步长（默认 5）
     double tiltRateDeg;      // 倾角沿轨迹每点最大变化（默认 3）

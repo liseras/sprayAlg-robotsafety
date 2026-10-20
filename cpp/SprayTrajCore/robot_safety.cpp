@@ -860,8 +860,8 @@ struct Params {
     double safety = 20.0;
     double search = 120.0;
     double toolLen = kDefaultToolLen;
-    double tiltNonUpDeg = 20.0;
-    double upThresholdDeg = 45.0;
+    double tiltNonUpDeg = 20.0;      // α=90°（竖直侧壁）时的倾角，实际按 α/90 线性缩放
+    double upThresholdDeg = 45.0;    // 保留字段（倾角已改线性，不再依赖阈值判"非朝上"）
     double tiltMaxDeg = 60.0;
     double tiltStepDeg = 5.0;
     double tiltRateDeg = 3.0;
@@ -1050,10 +1050,18 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     V3 n = t.normal(i);
     V3 face = t.pos[i] + t.gun[i] * p.standoff;
 
-    double cosThr = std::cos(p.upThresholdDeg * kDeg);
-    bool notUp = n.z < cosThr;
-    bool faceDown = n.z < -0.7;      // 朝下的悬垂面：往上扳会顶穿工件，不扳
-    double tilt0 = (!notUp || faceDown) ? 0.0 : p.tiltNonUpDeg;
+    // 倾角需求按法向**线性**给，而不是"非朝上就一律 ±20°"的阶梯：
+    //   α = 法向与 +Z 的夹角（0° = 正朝上，90° = 竖直侧壁，180° = 完全倒挂）
+    //   tilt0 = tiltNonUpDeg · (α / 90°)，封顶 tiltMaxDeg
+    // 取 90° 作满量程锚点是因为它物理上就是"面立起来了"的界限：此时给满基准倾角，
+    // 比侧壁更倒挂的面（α>90°）继续线性增长，直到上限。
+    // 阶梯做法在 45° 边界上产生 20° 的阶跃，反映到轨迹上就是相邻点倾角突跳，
+    // 实机过不了；线性化之后法向连续 → α 连续 → 倾角需求连续。
+    double alphaDeg = std::acos(std::max(-1.0, std::min(1.0, n.z))) * kRad;
+    double tilt0 = p.tiltNonUpDeg * (alphaDeg / 90.0);
+    if (tilt0 > p.tiltMaxDeg) tilt0 = p.tiltMaxDeg;
+    // 朝下的悬垂面：往上扳会把枪顶进工件本体，这条路物理上不成立，不做线性外推
+    if (n.z < -0.7) tilt0 = 0.0;
 
     V3 axis, uUp;
     tiltAxisAndDir(n, axis, uUp);
@@ -1065,13 +1073,16 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     }
 
     std::vector<std::pair<double, double>> cand;
-    cand.push_back({tilt0, 0.0});
+    cand.push_back({tilt0, 0.0});          // 线性基准值原样先试（贴合需求，不无谓加大）
     if (!degenerate) {
-        double tt = tilt0;
-        while (tt + p.tiltStepDeg <= p.tiltMaxDeg + 1e-9) {
-            tt += p.tiltStepDeg;
+        // 之后的搜索走**固定 5° 网格**，不能锚在 tilt0 上等距偏移。
+        // tilt0 随法向连续变化，若候选 = tilt0 + k·step，候选值会随 α 一起漂移：
+        // 同一个物理点可能从"刚好过关的 40°"滑到"刚好撞上的 36.48°"，纯数值抖动。
+        // curved idx 2990 实测：网格版 40° 自碰撞间隙 +1.18mm，漂移版 36.48° 为 −1.16mm。
+        double g = std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg;
+        while (g <= tilt0 + 1e-9) g += p.tiltStepDeg;   // 网格首档必须严格大于 tilt0
+        for (double tt = g; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg)
             cand.push_back({tt, 0.0});
-        }
     }
 
     bool hasBest = false;
@@ -1079,7 +1090,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     double bestClrKey = -1e300, bestMarginKey = -1e300;
     int flatRun = 0;
     bool hasPrev = false;
-    double prevClr = 0.0;
+    double prevClr = 0.0, prevSelf = 0.0, prevMargin = 0.0;
 
     auto tryCand = [&](double tiltDeg, double az, PR& got) -> bool {
         V3 d = dirOf(n, uUp, axis, tiltDeg, az);
@@ -1097,9 +1108,17 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
             bestAny = pr;
             hasBest = true;
         }
-        if (hasPrev && std::fabs(pr.clearance - prevClr) < 0.5) ++flatRun;
+        // 早停计数：只有**三个指标都不动**才算"倾角对这条方向的碰撞毫无影响"。
+        // 只比 clearance 会误停：间隙常常早早饱和到 search 上限（120mm），
+        // 而自碰撞/关节余量仍在随倾角变化，此时停掉就漏掉了后面能过关的档位。
+        // curved idx 2990 实测：饱和区里 36.48° 自碰撞 −1.16mm、40° 反而 +1.18mm。
+        if (hasPrev && std::fabs(pr.clearance - prevClr) < 0.5
+                    && std::fabs(pr.selfGap - prevSelf) < 0.5
+                    && std::fabs(pr.margin - prevMargin) < 0.5) ++flatRun;
         else flatRun = 0;
         prevClr = pr.clearance;
+        prevSelf = pr.selfGap;
+        prevMargin = pr.margin;
         hasPrev = true;
         return false;
     };
@@ -1124,7 +1143,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
         const double ttBase[4] = {10.0, 25.0, 40.0, 55.0};
         for (int k = 0; k < 4; ++k) {
             for (int m = 0; m < 4; ++m) {
-                double tt = std::max(tilt0, ttBase[m]);
+                double tt = std::max(std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg, ttBase[m]);
                 if (tt > p.tiltMaxDeg + 1e-9) continue;
                 PR got;
                 if (tryCand(tt, azs[k], got)) {
