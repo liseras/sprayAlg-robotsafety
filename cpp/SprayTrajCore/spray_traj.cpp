@@ -649,6 +649,49 @@ static int count_occ_components(const std::vector<unsigned char>& occ, int nU, i
     return comp;
 }
 
+// 环形窄面判定（(u,v) 平面上）：绕成一整圈、环宽窄、中间是孔。
+// 两处要用同一个判据：
+//   ① 轮廓重建的格距 —— 格距 ≥ 环宽时，开运算会把整圈削成几段弧。实测垃圾桶
+//      顶环（r143~175、宽 32mm）在行距 30mm 下：格距 30 → 内点 6977 被剔除到
+//      3653（只剩 250° 的环），轨迹只能盖住大半个环。
+//   ② 轨迹布行 —— 平行扫描在环上要铺 11~12 条弦、3/4 是空走；同心圆 1~2 圈
+//      就够（实测同心圆 1046mm vs 平行 3568mm）。
+// 四条判据同时成立（缺一条都会误伤矩形面 / 实心圆盘 / 小垫片）：
+//   ① 方位覆盖 ≥34/36 格；② 环宽 w=p97-p2 ≤ 2.5×行距；
+//   ③ 内径 ≥ 0.45×外径（排除实心圆盘，底面内径≈0）；
+//   ④ 外径 ≥ 3×环宽。
+static bool detect_ring_uv(const std::vector<Vec2>& uv, double L,
+                           Vec2& cOut, double& rin, double& rout,
+                           double* wOut = nullptr, int* nsecOut = nullptr)
+{
+    if(uv.size() < 200) return false;
+    Vec2 c{0,0};
+    for(auto& q : uv){ c.x += q.x; c.y += q.y; }
+    c.x /= (double)uv.size(); c.y /= (double)uv.size();
+    std::vector<double> rr; rr.reserve(uv.size());
+    for(auto& q : uv) rr.push_back(len2(q-c));
+    std::sort(rr.begin(), rr.end());
+    const double r2  = rr[(size_t)(0.02*(double)(rr.size()-1))];
+    const double r97 = rr[(size_t)(0.97*(double)(rr.size()-1))];
+    const double w   = r97 - r2;
+    const int NS = 36; std::vector<unsigned char> sec(NS,0);
+    for(auto& q : uv){
+        Vec2 d{q.x-c.x, q.y-c.y};
+        if(len2(d) < 1e-9) continue;
+        double th = std::atan2(d.y, d.x);
+        int k = (int)((th + 3.14159265358979)/(2.0*3.14159265358979)*(double)NS);
+        if(k<0) k=0; if(k>=NS) k=NS-1;
+        sec[k]=1;
+    }
+    int nsec=0; for(int k=0;k<NS;++k) if(sec[k]) ++nsec;
+    if(wOut) *wOut = w;
+    if(nsecOut) *nsecOut = nsec;
+    cOut = c; rin = r2; rout = r97;          // 诊断用：判否时也给出实测值
+    const bool ringish = (nsec >= 34) && (w > 1e-6) && (w <= 2.5*L)
+                      && (r2 >= 0.45*r97) && (r97 >= 3.0*w);
+    return ringish;
+}
+
 // 由面内点集重建规则三角网格（局部 uv 坐标，mm）。
 //   rowGap   扫描线间距（跨线空隙要用闭运算桥接，否则每行独立成条）
 //   fillHole 孔洞填补阈值：连通孔洞的外接跨距 <= 此值 → 填实（覆盖重建）
@@ -1867,6 +1910,16 @@ static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, doub
     t = norm(t);
     if(dot(t, t0) < 0) t = t*(-1.0);
     outP.push_back(p); outN.push_back(n);
+    // ---- 闭合判据（仅等高线模式）----
+    // 等高线是**闭合圈**。没有闭合判据时，追踪走到起点附近不会停，会继续
+    // 绕第二圈、第三圈……直到 maxSteps 用完。实测垃圾桶（锥面 Rmax≈140，
+    // 一圈 383mm≈96 步）每行被追成 2956mm≈741 步（7.7 圈），7 层叠起来就是
+    // 一根螺距 2.5mm 的螺旋弹簧 —— 界面上看到"一条轨迹绕那么多圈、设 30mm
+    // 行距还是很密"，就是这个。
+    // 判据：走过的弧长够长（防种子附近原地打转）且回到起点附近 → 闭合收工。
+    const Vec3  pStart   = p;
+    const double closeTol = 1.8*step;
+    double sRun = 0.0;
     // 单步投影位移上限：按局部采样尺度自适应。稀疏区（线扫条纹间隙）局部平面
     // 拟合本身就有毫米级偏差，用固定值会把正常行进误判成"跳层"。
     double maxOff = std::max(2.0, 1.2*std::max(2.0,8.0*sp.spacing));
@@ -1918,6 +1971,11 @@ static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, doub
             Vec3 tn = (len(uu) > 0.2) ? cross(n, uu) : Vec3{0,0,0};
             if(len(tn) > 0.2){ tn = norm(tn); if(dot(tn,t) < 0) tn = tn*(-1.0); t = tn; }
             outP.push_back(p); outN.push_back(n);
+            sRun += step*(double)got;
+            if(isoH && sRun > 8.0*step && len(p-pStart) < closeTol){
+                if(dbg) fprintf(stderr,"[曲面dbg] 闭合(跨洞后) 弧长=%.0fmm\n", sRun);
+                break;
+            }
             continue;
         }
         // 方向场给新切向，符号延续当前走向
@@ -1938,6 +1996,11 @@ static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, doub
         // 局部法向差 ~120°，枪位（X+100·n）被甩出 100+mm 的假跳跃。
         n = qn;
         outP.push_back(p); outN.push_back(qn);
+        sRun += step;
+        if(isoH && sRun > 8.0*step && len(p-pStart) < closeTol){
+            if(dbg) fprintf(stderr,"[曲面dbg] 闭合 弧长=%.0fmm 步数=%d\n", sRun, s+1);
+            break;
+        }
     }
 }
 
@@ -2398,6 +2461,15 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
             int b = (int)std::floor(hcur-hlo); if(b<0) b=0; if(b>=NH) b=NH-1;
             hcur += L*gm[b];
         }
+        // 收尾贴边：逐层推进必然在 hhi 前停下，留下最多一整个层距的空带。
+        // 实测垃圾桶（hlo=3.7 hhi=187）停在 161.3，顶部 30mm 没有行 —— 覆盖率
+        // 100%→97.2%，贴合残差 6.5→10.2mm。这里把末层推到 hhi，或差得多时补一层。
+        if(anchors.size() >= 2){
+            const double lastStep = anchors.back() - anchors[anchors.size()-2];
+            const double rest = hhi - anchors.back();
+            if(rest > 0.55*lastStep)            anchors.push_back(hhi);
+            else if(rest > 1e-6)                anchors.back() = hhi;
+        }
         if(anchors.size() < 2) return false;
         gap = L;                 // 逐层推进的间隔就是 L，实际行距也就是 L
         fprintf(stderr, "[曲面] 等高线分层: 高差=%.1fmm %zu 层 行距=%.1fmm\n",
@@ -2445,8 +2517,16 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     const bool dbg = (std::getenv("SPRAYTRAJ_DUMP") != nullptr);
     int rowsMade = 0;
 
-    // 一条完整行：seed 向两侧各追一遍，反向前半 + 正向后半拼成整条等值线
+    // 一条完整行：iso 模式追一圈闭合圈；平面截线模式两侧各追一遍再拼接
     auto marchBoth = [&](Vec3 seed, std::vector<Vec3>& oP, std::vector<Vec3>& oN){
+        oP.clear(); oN.clear();
+        if(isoMode){
+            // 等高线是闭合圈：从种子朝一侧追满一圈就回到种子，另一侧不需要再追。
+            // 以前两侧都追、且没有闭合判据，两侧各自绕到步数上限（各 3.85 圈），
+            // 拼起来 7.7 圈 —— 行距 30mm 下锥面 7 层变成一根密集螺旋。
+            surf_march(sp, seed, eIdx, eRow, pstep, bridge, maxSteps, oP, oN, true);
+            return;
+        }
         std::vector<Vec3> fP, fN, bP, bN;
         surf_march(sp, seed, eIdx, eRow*(-1.0), pstep, bridge, maxSteps, bP, bN, isoMode);
         surf_march(sp, seed, eIdx, eRow,        pstep, bridge, maxSteps, fP, fN, isoMode);
@@ -3441,7 +3521,20 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             bool okMesh = false;
             {
                 ProfStage ps("3.轮廓重建", &tMesh);
-                okMesh = build_plane_mesh(uv, params->scanRowSpacing, params->fillHoleSize,
+                // 环形窄面：重建格距必须能分辨环宽。默认格距 = 行距，行距调到 30mm
+                // 时格距 30 > 环宽 32 的一半，开运算把整圈削成几段弧，内点被剔掉
+                // 一半（6977→3653），轨迹只能盖住 250° 的环。
+                double cellMesh = params->scanRowSpacing;
+                {
+                    Vec2 rc; double rin=0, rout=0, rw=0; int ns=0;
+                    if(detect_ring_uv(uv, params->scanRowSpacing, rc, rin, rout, &rw, &ns)){
+                        cellMesh = std::min(params->scanRowSpacing,
+                                            std::max(1.5, rw/6.0));
+                        fprintf(stderr, "[重建] 面片%zu 环形(内径%.1f 外径%.1f 宽%.1f 方位%d/36): 重建格距 %.1fmm (原 %.1f)\n",
+                                i, rin, rout, rw, ns, cellMesh, params->scanRowSpacing);
+                    }
+                }
+                okMesh = build_plane_mesh(uv, cellMesh, params->fillHoleSize,
                                           verts, tris,
                                           SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
                                           SPRAYTRAJ_PLANE_MAX_POLY_TRIS,
@@ -3816,11 +3909,36 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             fprintf(stderr, "[traj] 段(点数=%zu) 没有可用行，跳过\n", inl.size());
             continue;
         }
-        totalRows += (int)bestRows.size();
+        // ---- 环形窄面：平行扫描极度浪费，改走同心圆 ----
+        // 顶环唇边 r143~175、宽 32mm、外径 350。按行距 30mm 平行扫描要铺 12 条弦、
+        // 总长 3.6m，而环面积只有 0.032m² —— 74% 的行程在环内空洞上空走，界面上
+        // 就是"一堆密集平行线"。走同心圆只要 1 圈 ~1.0m（实测 3568→1046mm）。
+        // 四条判据同时成立才改（缺一条都会误伤矩形面 / 实心圆盘）：
+        //   ① 方位覆盖 ≥34/36 格 —— 确实绕成一圈；
+        //   ② 环宽 w = p97-p2 ≤ 2.5×行距 —— 窄带；宽了本来就该正常铺行；
+        //   ③ 内径 ≥ 0.45×外径 —— 排除实心圆盘（底面 r≤57，内径≈0）；
+        //   ④ 外径 ≥ 3×环宽 —— 排除小圆垫片（一圈周长还没行距长）。
+        bool ringMode = false;
+        Vec2 ringC{0,0}; double ringIn=0, ringOut=0; int nRing=0;
+        if(forcedTheta < 0){
+            double rw=0; int ns=0;
+            const bool ringish = detect_ring_uv(P2, L, ringC, ringIn, ringOut, &rw, &ns);
+            fprintf(stderr, "[traj] 面%zu 环形判据: 内径%.1f 外径%.1f 环宽%.1f 方位%d/36 → %s\n",
+                    si, ringIn, ringOut, rw, ns, ringish ? "同心圆" : "平行扫描");
+            if(ringish){
+                ringMode = true;
+                nRing = std::max(1, (int)std::floor(rw/L + 0.5));
+            }
+        }
+        totalRows += ringMode ? nRing : (int)bestRows.size();
         {
             double angN = std::acos(std::min(1.0,std::fabs(dot(pl.n,Vec3{0,0,1}))))*180.0/3.141592653589793;
-            fprintf(stderr, "[traj] 面%zu: 内点=%zu 行数=%zu 与Z夹角=%.1f° 行方向=%.1f°\n",
-                si, inl.size(), bestRows.size(), angN, theta*180.0/3.141592653589793);
+            if(ringMode)
+                fprintf(stderr, "[traj] 面%zu: 内点=%zu 行数=%d(同心圆) 与Z夹角=%.1f°\n",
+                    si, inl.size(), nRing, angN);
+            else
+                fprintf(stderr, "[traj] 面%zu: 内点=%zu 行数=%zu 与Z夹角=%.1f° 行方向=%.1f°\n",
+                    si, inl.size(), bestRows.size(), angN, theta*180.0/3.141592653589793);
         }
 
         double ca=std::cos(theta), sa=std::sin(theta);
@@ -3850,6 +3968,37 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 蛇形端点
         struct Seg2 { Vec2 a,b; };
         std::vector<Seg2> segs2;
+        if(ringMode){
+            // 同心圆：每圈首尾闭合，相邻圈反向下刀，圈间只在角度 0 处横移 w/nRing。
+            // 圈间那一小段也要按点距插点 —— 实测 2 圈时跳 12mm（pstep 的 3 倍），
+            // 会让 seg_max 从 4.0 跳到 12.0，看着像点距失控。
+            auto toRow = [&](Vec2 q)->Vec2{ return {ca*q.x + sa*q.y, -sa*q.x + ca*q.y}; };
+            Vec2 prevEnd{0,0}; bool hasPrev = false;
+            for(int k=0;k<nRing;++k){
+                const double rad  = ringIn + (ringOut-ringIn)*((double)k+0.5)/(double)nRing;
+                const double circ = 2.0*3.14159265358979*rad;
+                int np = std::max(8, (int)std::ceil(circ/pstep));
+                const bool rev = ((k & 1) != 0);
+                {   // 圈间过渡（角度 0 处，沿半径方向 w/nRing）
+                    Vec2 q0{ ringC.x + rad, ringC.y };
+                    Vec2 first = toRow(q0);
+                    if(hasPrev){
+                        double g = len2(first - prevEnd);
+                        int nI = std::max(1, (int)std::ceil(g/pstep));
+                        for(int t=1;t<nI;++t)
+                            traj2.push_back({prevEnd + (first-prevEnd)*((double)t/(double)nI), 1});
+                    }
+                }
+                for(int t=0;t<=np;++t){
+                    int ti = rev ? (np - t) : t;
+                    double aa = 2.0*3.14159265358979*(double)ti/(double)np;
+                    Vec2 q{ ringC.x + rad*std::cos(aa), ringC.y + rad*std::sin(aa) };
+                    traj2.push_back({toRow(q), 1});
+                }
+                prevEnd = traj2.back().first; hasPrev = true;
+            }
+        }
+        if(!ringMode)
         for(size_t i=0;i<bestRows.size();++i){
             Vec2 a{bestRows[i].xs, bestRows[i].yc}, b{bestRows[i].xe, bestRows[i].yc};
             if(i%2==1) std::swap(a,b);
