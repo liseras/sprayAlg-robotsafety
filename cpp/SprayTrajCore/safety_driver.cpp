@@ -352,7 +352,7 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         printf("用法: spray_safety <traj.csv> <cloud.ply> <out.csv> [选项]\n");
         printf("      -standoff -safety -search -tool -tilt -tiltmax -rate -sprayang\n");
-        printf("      -base <x y z rx ry rz>  -quiet\n");
+        printf("      -threads <n>  -stride <n>  -voxel <mm>  -base <x y z rx ry rz>  -quiet\n");
         return 2;
     }
     const char* trajPath = argv[1];
@@ -373,6 +373,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-tiltmax") && i + 1 < argc) p.tiltMaxDeg = atof(argv[++i]);
         else if (!strcmp(argv[i], "-rate") && i + 1 < argc) p.tiltRateDeg = atof(argv[++i]);
         else if (!strcmp(argv[i], "-sprayang") && i + 1 < argc) p.maxSprayAngleDeg = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-threads") && i + 1 < argc) p.threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-stride") && i + 1 < argc) p.linkStride = std::max(1, atoi(argv[++i]));
+        else if (!strcmp(argv[i], "-voxel") && i + 1 < argc) p.voxelMm = atof(argv[++i]);
         else if (!strcmp(argv[i], "-quiet")) quiet = true;
         else if (!strcmp(argv[i], "-base") && i + 6 < argc) {
             double x = atof(argv[i + 1]), y = atof(argv[i + 2]), z = atof(argv[i + 3]);

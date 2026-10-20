@@ -724,6 +724,12 @@ namespace SprayTrajViewer
             p.tiltMaxDeg = ParseDouble(TxtTiltMax.Text, p.tiltMaxDeg);
             p.maxSprayAngleDeg = ParseDouble(TxtMaxSprayAngle.Text, p.maxSprayAngleDeg);
             p.jointMarginMin = ParseDouble(TxtJointMargin.Text, p.jointMarginMin);
+            // 并行线程数：默认取"逻辑核数 - 1"，留一个核给界面线程，否则评估时窗口卡顿。
+            // 单线程（=1）结果与命令行逐字节一致，用于要和存档/对拍对齐的场合。
+            int defThreads = Math.Max(1, Environment.ProcessorCount - 1);
+            p.threads = Math.Clamp((int)ParseDouble(TxtThreads.Text, defThreads), 1, 64);
+            // 点云体素：0=全量精判。>0 只用于在线预判，薄壁件会偏乐观（见 README 的量化数据）。
+            p.voxelMm = Math.Max(0, ParseDouble(TxtVoxel.Text, 0));
 
             double[]? basePose = BuildBasePose();
             var pts = _lastTraj.ToArray();
@@ -841,7 +847,8 @@ namespace SprayTrajViewer
                 $"linkSeg={LinkDesc()} " +
                 $"tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
                 $"tilted={sum.tiltedPoints} reverted={sum.poseReverted} standoffErr={sum.standoffMaxErrMm:E2} " +
-                $"baseAuto={sum.baseAuto} cloudPts={sum.cloudPoints} l0={sum.l0Issues} elapsed={sw.ElapsedMilliseconds}ms");
+                $"baseAuto={sum.baseAuto} cloudPts={sum.cloudPoints} l0={sum.l0Issues} " +
+                $"threads={p.threads} voxel={p.voxelMm:F1} elapsed={sw.ElapsedMilliseconds}ms");
         }
 
         void ShowSafetyCard(string verdict, Color color, string cost, string body)

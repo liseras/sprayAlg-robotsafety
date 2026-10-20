@@ -35,11 +35,13 @@ typedef struct RobotSafetyParams {
     double jointMarginMin;   // 关节限位余量下限（默认 1.0°）
     double condMax;          // 归一化雅可比条件数上限（默认 30，只告警不阻断）
     double transitLiftMax;   // 过渡点（spray=0）碰撞时沿 +Z 最大抬升量 mm
+    double voxelMm;          // 点云体素降采样边长 mm（0 = 不降采样）。碰撞精度只需远小于 safety
     int    linkStride;       // 连杆碰撞每隔几个点查一次（工具段每点都查）
     int    includeBase;      // 点云里含地面/底座时打开（1=查底座段）
     int    fixTransit;       // 1=过渡点碰撞时允许抬升
     int    azFallback;       // 1=允许把「上翻方位」左右偏 30/60° 兜底
     int    maxCloudPoints;   // 保留字段（<=0 = 不抽稀，用全量点云；KD-tree 支撑全量查询）
+    int    threads;          // 并行线程数（<=1 = 单线程，结果可复现；生产建议 = 物理核数）
 } RobotSafetyParams;
 
 // ---------------------------------------------------------------- 违规位

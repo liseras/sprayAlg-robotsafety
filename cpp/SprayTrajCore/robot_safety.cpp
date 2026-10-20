@@ -18,12 +18,15 @@
 #include "robot_safety.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -31,6 +34,29 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDeg = kPi / 180.0;
 constexpr double kRad = 180.0 / kPi;
+
+// ---------------------------------------------------------------- 计时/计数（RS_PROFILE=1 才输出）
+// 生产不看这个；调优时靠它判断"慢在 IK 还是慢在点云查询"，否则只能瞎猜。
+struct Prof {
+    bool on = false;
+    // 并行求解时 +1 会竞争，用 relaxed 原子（计数只在 RS_PROFILE 时看，精度要求不高）
+    std::atomic<long long> ik{0}, seg{0}, evals{0};
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last = t0;
+
+    void reset() {
+        ik = 0; seg = 0; evals = 0;
+    }
+    void mark(const char* what) {
+        if (!on) return;
+        auto now = std::chrono::steady_clock::now();
+        double dt = std::chrono::duration<double, std::milli>(now - last).count();
+        double all = std::chrono::duration<double, std::milli>(now - t0).count();
+        std::fprintf(stderr, "  [prof] %-14s %9.1f ms（累计 %9.1f）\n", what, dt, all);
+        last = now;
+    }
+};
+Prof g_prof;
 constexpr double kEps = 1e-12;
 
 inline double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -540,6 +566,7 @@ inline int rankCmp(const IkSol& a, const IkSol& b) {
 
 // 种子顺序：上一点解（连续性）→ 解析种子（解支正确）→ 固定种子表（兜底）
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
+    ++g_prof.ik;
     double seeds[1 + 16 + 12][6];
     int ns = 0;
     if (seed) {
@@ -678,6 +705,42 @@ struct KdNode {
     int start = 0, count = 0;   // count>0 → 叶
 };
 
+// 体素降采样：每格保留一个代表点。
+// 碰撞判定只关心"表面在哪"，5mm 体素相对 20mm 安全间隙是二阶小量；而 60 万点降到 2 万点，
+// KD 构建从 500ms 降到 20ms（big 样本实测：KD 占了整条流程的 70%）。
+// 想保精度就不开；产线预判开 3~5mm。
+void voxelDecimate(const double* xyz, int n, double voxel, std::vector<double>& out) {
+    out.clear();
+    if (n <= 0 || voxel <= 1e-6) return;
+    const double inv = 1.0 / voxel;
+    struct Entry { long long key; int idx; };
+    std::vector<Entry> ents;
+    ents.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+        long long ix = (long long)std::floor(xyz[i * 3 + 0] * inv);
+        long long iy = (long long)std::floor(xyz[i * 3 + 1] * inv);
+        long long iz = (long long)std::floor(xyz[i * 3 + 2] * inv);
+        // 各 21 位打包（±100 万格，5mm 体素下覆盖 ±5km，足够）
+        long long key = ((ix & 0x1FFFFF) << 42) | ((iy & 0x1FFFFF) << 21) | (iz & 0x1FFFFF);
+        ents.push_back({key, i});
+    }
+    // 排序比哈希快：60 万条 12 字节的记录排序 ~60ms，哈希插入反而更慢
+    std::sort(ents.begin(), ents.end(), [](const Entry& a, const Entry& b) {
+        return a.key != b.key ? a.key < b.key : a.idx < b.idx;
+    });
+    out.reserve((size_t)n * 3 / 4);
+    long long prev = 0;
+    bool first = true;
+    for (const auto& e : ents) {
+        if (!first && e.key == prev) continue;
+        prev = e.key;
+        first = false;
+        out.push_back(xyz[e.idx * 3 + 0]);
+        out.push_back(xyz[e.idx * 3 + 1]);
+        out.push_back(xyz[e.idx * 3 + 2]);
+    }
+}
+
 class CloudIndex {
 public:
     void build(const double* xyz, int n) {
@@ -719,6 +782,7 @@ public:
     // 线段到点云的最短距离；超过 radius 直接返回 radius（= 只报下界）
     double segmentDist(const V3& a, const V3& b, double radius) const {
         if (nodes_.empty()) return radius;
+        ++g_prof.seg;
         double best = radius;
         queryRec(root_, a, b, best);
         return best;
@@ -881,7 +945,7 @@ struct Params {
     double safety = 20.0;
     double search = 120.0;
     double toolLen = kDefaultToolLen;
-    double tiltNonUpDeg = 20.0;      // α=90°（竖直侧壁）时的倾角，实际按 α/90 线性缩放
+    double tiltNonUpDeg = 30.0;      // α=90°（竖直侧壁）时的倾角，实际按 α/90 线性缩放
     double upThresholdDeg = 45.0;    // 保留字段（倾角已改线性，不再依赖阈值判"非朝上"）
     double tiltMaxDeg = 60.0;
     double tiltStepDeg = 5.0;
@@ -890,7 +954,9 @@ struct Params {
     double jointMarginMin = 1.0;
     double condMax = 30.0;
     double transitLiftMax = 400.0;
-    int linkStride = 3;
+    double voxelMm = 0.0;
+    int linkStride = 1;
+    int threads = 1;
     bool includeBase = false;
     bool fixTransit = true;
     bool azFallback = true;
@@ -956,6 +1022,7 @@ public:
     // （θ2=154°、J2 超限 19°、小臂从工件底下穿过去 24.7mm）。
     bool eval(const V3& face, const V3& d, const V3* refX, const double* seed,
               double tiltDeg, double azDeg, bool checkLinks, PR& out) const {
+        ++g_prof.evals;
         V3 zTool = -unit(d);
         V3 pC = face + d * p_.standoff;
         M3 Rc = frameFromZ(zTool);
@@ -1264,6 +1331,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.jointMarginMin = 1.0;
     p.condMax = 30.0;
     p.transitLiftMax = 400.0;
+    p.voxelMm = 0.0;
     // 默认逐点全判连杆。原来的 3 点抽 1 点是为省时间加的，代价是 2/3 的点根本没查连杆，
     // 而"连杆会不会撞工件"恰恰是现场最关心的一条。eval 里已用剪枝上限把开销压回来。
     p.linkStride = 1;
@@ -1271,6 +1339,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.fixTransit = 1;
     p.azFallback = 1;
     p.maxCloudPoints = 0;
+    p.threads = 1;           // 默认单线程：结果可复现，便于对拍/回归
     return p;
 }
 
@@ -1340,16 +1409,35 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         p.jointMarginMin = s.jointMarginMin;
         p.condMax = s.condMax > 0 ? s.condMax : d.condMax;
         p.transitLiftMax = s.transitLiftMax > 0 ? s.transitLiftMax : d.transitLiftMax;
+        p.voxelMm = s.voxelMm > 0 ? s.voxelMm : d.voxelMm;
         p.linkStride = s.linkStride > 0 ? s.linkStride : d.linkStride;
         p.includeBase = s.includeBase != 0;
         p.fixTransit = s.fixTransit != 0;
         p.azFallback = s.azFallback != 0;
+        p.threads = s.threads > 0 ? s.threads : d.threads;
     }
 
     // ---- 点云索引
+    g_prof.on = std::getenv("RS_PROFILE") != nullptr;
+    g_prof.reset();
+    g_prof.t0 = g_prof.last = std::chrono::steady_clock::now();
     CloudIndex cloud;
-    cloud.build(cloudXyz, cloudCount);
+    {
+        // 可选体素降采样：只影响"点云有多细"，不影响判据口径
+        std::vector<double> dec;
+        const double* src = cloudXyz;
+        int srcN = cloudCount;
+        if (p.voxelMm > 0.5) {
+            voxelDecimate(cloudXyz, cloudCount, p.voxelMm, dec);
+            if ((int)(dec.size() / 3) >= 64) {
+                src = dec.data();
+                srcN = (int)(dec.size() / 3);
+            }
+        }
+        cloud.build(src, srcN);
+    }
     double spacing = cloud.estimateSpacing();
+    g_prof.mark("点云KD构建");
 
     // ---- 轨迹
     TrajIn t;
@@ -1411,34 +1499,61 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     std::vector<char> hasCache(n, 0);
     std::vector<PR> cache(n);
     std::vector<char> hasPrevSol(n, 0);
-    double prevTheta[6] = {0, 0, 0, 0, 0, 0};
-    bool hasSeed = false;
-    V3 prevX;
-    bool hasRefX = false;
 
-    for (int i = 0; i < n; ++i) {
-        bool checkLinks = (i % std::max(1, p.linkStride) == 0);
-        double tilt = 0.0, az = 0.0;
-        PR pr;
-        bool has = false;
-        needTilt(ev, p, t, i, hasSeed ? prevTheta : nullptr, hasRefX ? &prevX : nullptr,
-                 checkLinks, tilt, az, pr, has);
-        need[i] = tilt;
-        azOf[i] = az;
-        if (has) {
-            pr.idx = i;
-            cache[i] = pr;
-            hasCache[i] = 1;
-            for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
-            hasSeed = true;
-            FkOut f;
-            fk(pr.theta, p.toolLen, f);
-            prevX = f.tcp.R.col(0);
-            hasRefX = true;
+    // 逐点独立求解（只借用"上一点的解"当 IK 种子加速收敛），所以可以按块并行：
+    // 每块内部仍串行传递种子，块首用解析种子自启。块大小取 n/(线程数·4)，
+    // 让尾块不至于拖尾（长件上点耗时差异很大：臂展中心的点快、边缘的点慢）。
+    int nThreads = std::max(1, std::min(p.threads, 64));
+    int chunk = std::max(1, n / (nThreads * 4));
+
+    auto runRange = [&](int b0, int e0) {
+        double prevTheta[6] = {0, 0, 0, 0, 0, 0};
+        bool hasSeed = false;
+        V3 prevX;
+        bool hasRefX = false;
+        for (int i = b0; i < e0; ++i) {
+            bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+            double tilt = 0.0, az = 0.0;
+            PR pr;
+            bool has = false;
+            needTilt(ev, p, t, i, hasSeed ? prevTheta : nullptr, hasRefX ? &prevX : nullptr,
+                     checkLinks, tilt, az, pr, has);
+            need[i] = tilt;
+            azOf[i] = az;
+            if (has) {
+                pr.idx = i;
+                cache[i] = pr;
+                hasCache[i] = 1;
+                for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
+                hasSeed = true;
+                FkOut f;
+                fk(pr.theta, p.toolLen, f);
+                prevX = f.tcp.R.col(0);
+                hasRefX = true;
+            }
         }
+    };
+
+    if (nThreads <= 1) {
+        runRange(0, n);
+    } else {
+        std::atomic<int> next{0};
+        std::vector<std::thread> pool;
+        pool.reserve(nThreads);
+        for (int k = 0; k < nThreads; ++k) {
+            pool.emplace_back([&] {
+                for (;;) {
+                    int b = next.fetch_add(chunk);
+                    if (b >= n) break;
+                    runRange(b, std::min(n, b + chunk));
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
     }
 
     // ---- 阶段 2：倾角平滑（只升不降）
+    g_prof.mark("阶段1 求倾角");
     std::vector<double> finalTilt = need;
     smoothOnlyUp(finalTilt, rows, p.tiltRateDeg);
 
@@ -1478,89 +1593,141 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     int recomputed = 0, reverted = 0;
     int reachable = 0;
 
-    hasSeed = false;
-    hasRefX = false;
+    // 逐行独立（行内仍需种子连续性，行间互不依赖）→ 可以按行并行。
+    // 每行行首没有"上一点解"，用解析种子自启；行首本来就是换行处，姿态本来就会跳。
+    struct Acc3 {
+        int recomputed = 0, reverted = 0, reachable = 0;
+        double standoffMaxErr = 0.0;
+    };
 
-    for (int i = 0; i < n; ++i) {
-        V3 nrm = t.normal(i);
-        V3 face = t.pos[i] + t.gun[i] * p.standoff;
-        double tilt = finalTilt[i];
-        double az = rowOf[i] >= 0 ? azRow[rowOf[i]] : 0.0;
+    auto runRange3 = [&](int a, int b, Acc3& acc) {
+        double prevTheta[6] = {0, 0, 0, 0, 0, 0};
+        bool hasSeed = false;
+        V3 prevX;
+        bool hasRefX = false;
+        for (int i = a; i <= b; ++i) {
+            V3 nrm = t.normal(i);
+            V3 face = t.pos[i] + t.gun[i] * p.standoff;
+            double tilt = finalTilt[i];
+            double az = rowOf[i] >= 0 ? azRow[rowOf[i]] : 0.0;
 
-        V3 axis, uUp;
-        tiltAxisAndDir(nrm, axis, uUp);
-        if (norm(uUp) < 1e-6) {
-            axis = V3(0, 0, 0);
-            uUp = V3(0, 0, 0);
-        }
-
-        bool reuse = hasCache[i] && std::fabs(cache[i].tiltDeg - tilt) < 1e-6 &&
-                     std::fabs(cache[i].azDeg - az) < 1e-6;
-        PR pr;
-        if (reuse) {
-            pr = cache[i];
-            pr.idx = i;
-        } else {
-            V3 d = dirOf(nrm, uUp, axis, tilt, az);
-            bool checkLinks = (i % std::max(1, p.linkStride) == 0);
-            bool ok = ev.eval(face, d, hasRefX ? &prevX : nullptr, hasSeed ? prevTheta : nullptr,
-                              tilt, az, checkLinks, pr);
-            ++recomputed;
-            if (!ok) {
-                // 所有候选倾角都解不出逆解 → 不可达（P0）
-                PR bad;
-                bad.idx = i;
-                bad.tiltDeg = tilt;
-                bad.clearance = -std::numeric_limits<double>::infinity();
-                // 自碰撞标 nan 而不是 inf：inf 经 %f 落到 CSV 会变成一个天文数字，
-                // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
-                bad.selfGap = std::numeric_limits<double>::quiet_NaN();
-                bad.ikOk = false;
-                bad.pos = t.pos[i];
-                bad.gun = t.gun[i];
-                bad.viol = RS_VIOL_IK_FAIL;
-                results[i] = bad;
-                hasResult[i] = 1;
-                vc.add(RS_VIOL_IK_FAIL);
-                continue;
+            V3 axis, uUp;
+            tiltAxisAndDir(nrm, axis, uUp);
+            if (norm(uUp) < 1e-6) {
+                axis = V3(0, 0, 0);
+                uUp = V3(0, 0, 0);
             }
-            pr.idx = i;
-            // ---- 平滑回退：平滑不许把好点变坏
-            // 平滑位姿只要比本点最优更差，就退回本点最优 —— 宁可姿态跳一下
-            // （由 TILT_JUMP 报出来），也不接受穿透。
-            if (hasCache[i] && poseCmp(pr, cache[i]) < 0) {
+
+            bool reuse = hasCache[i] && std::fabs(cache[i].tiltDeg - tilt) < 1e-6 &&
+                         std::fabs(cache[i].azDeg - az) < 1e-6;
+            PR pr;
+            if (reuse) {
                 pr = cache[i];
                 pr.idx = i;
-                pr.reverted = true;
-                ++reverted;
+            } else {
+                V3 d = dirOf(nrm, uUp, axis, tilt, az);
+                bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+                bool ok = ev.eval(face, d, hasRefX ? &prevX : nullptr, hasSeed ? prevTheta : nullptr,
+                                  tilt, az, checkLinks, pr);
+                ++acc.recomputed;
+                if (!ok) {
+                    // 所有候选倾角都解不出逆解 → 不可达（P0）
+                    PR bad;
+                    bad.idx = i;
+                    bad.tiltDeg = tilt;
+                    bad.clearance = -std::numeric_limits<double>::infinity();
+                    // 自碰撞标 nan 而不是 inf：inf 经 %f 落到 CSV 会变成一个天文数字，
+                    // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
+                    bad.selfGap = std::numeric_limits<double>::quiet_NaN();
+                    bad.ikOk = false;
+                    bad.pos = t.pos[i];
+                    bad.gun = t.gun[i];
+                    bad.viol = RS_VIOL_IK_FAIL;
+                    results[i] = bad;
+                    hasResult[i] = 1;
+                    continue;   // 违规位在输出阶段按 pr.viol 统一统计，这里不必重复累加
+                }
+                pr.idx = i;
+                // ---- 平滑回退：平滑不许把好点变坏
+                // 平滑位姿只要比本点最优更差，就退回本点最优 —— 宁可姿态跳一下
+                // （由 TILT_JUMP 报出来），也不接受穿透。
+                if (hasCache[i] && poseCmp(pr, cache[i]) < 0) {
+                    pr = cache[i];
+                    pr.idx = i;
+                    pr.reverted = true;
+                    ++acc.reverted;
+                }
             }
+            pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
+            acc.standoffMaxErr = std::max(acc.standoffMaxErr, pr.standoffErr);
+
+            // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
+            // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
+            // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
+            if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
+            if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
+            if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
+            if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
+            if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
+            if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
+            if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
+
+            if (pr.ikOk) ++acc.reachable;
+            results[i] = pr;
+            hasResult[i] = 1;
+            for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
+            hasSeed = true;
+            FkOut f;
+            fk(pr.theta, p.toolLen, f);
+            prevX = f.tcp.R.col(0);
+            hasRefX = true;
         }
-        pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
-        standoffMaxErr = std::max(standoffMaxErr, pr.standoffErr);
+    };
 
-        // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
-        // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
-        // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
-        if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
-        if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
-        if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
-        if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
-        if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
-        if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
-        if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
+    if (nThreads <= 1) {
+        Acc3 acc;
+        runRange3(0, n - 1, acc);
+        recomputed = acc.recomputed;
+        reverted = acc.reverted;
+        reachable = acc.reachable;
+        standoffMaxErr = acc.standoffMaxErr;
+    } else {
+        // 任务 = 每行一个区间；再补上没被任何行覆盖的孤立点（正常轨迹没有，防御性处理）
+        std::vector<std::pair<int, int>> tasks;
+        tasks.reserve(rows.size() + 8);
+        std::vector<char> covered(n, 0);
+        for (const auto& r : rows) {
+            if (r.second < r.first) continue;
+            tasks.push_back(r);
+            for (int i = r.first; i <= std::min(r.second, n - 1); ++i) covered[i] = 1;
+        }
+        for (int i = 0; i < n; ++i)
+            if (!covered[i]) tasks.push_back({i, i});
 
-        if (pr.ikOk) ++reachable;
-        results[i] = pr;
-        hasResult[i] = 1;
-        for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
-        hasSeed = true;
-        FkOut f;
-        fk(pr.theta, p.toolLen, f);
-        prevX = f.tcp.R.col(0);
-        hasRefX = true;
+        std::vector<Acc3> accs(nThreads);
+        std::atomic<int> nextTask{0};
+        std::vector<std::thread> pool;
+        pool.reserve(nThreads);
+        for (int k = 0; k < nThreads; ++k) {
+            pool.emplace_back([&, k] {
+                for (;;) {
+                    int t = nextTask.fetch_add(1);
+                    if (t >= (int)tasks.size()) break;
+                    runRange3(tasks[t].first, tasks[t].second, accs[k]);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        for (const auto& a : accs) {
+            recomputed += a.recomputed;
+            reverted += a.reverted;
+            reachable += a.reachable;
+            standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
+        }
     }
 
     // ---- 过渡点抬升（spray=0 ⇒ 位置可改，只求不撞）
+    g_prof.mark("阶段3 重解");
     int lifted = 0;
     if (p.fixTransit) {
         for (int i = 0; i < n; ++i) {
@@ -1621,6 +1788,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     }
 
     // ---- 输出
+    g_prof.mark("过渡+自检");
     RobotSafetyPoint* out = new RobotSafetyPoint[n];
     std::memset(out, 0, sizeof(RobotSafetyPoint) * (size_t)n);
     std::vector<double> angles;
@@ -1712,5 +1880,16 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
 
     (void)hasPrevSol;
     (void)lifted;
+    if (g_prof.on) {
+        g_prof.mark("输出+组装");
+        double total = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - g_prof.t0).count();
+        std::fprintf(stderr,
+                     "  [prof] 总计 %.1f ms / %d 点 = %.3f ms/点 · IK %lld · eval %lld（%.1f/点）"
+                     " · 段查询 %lld（%.1f/点）· 点云 %d 点\n",
+                     total, n, n ? total / n : 0.0, g_prof.ik.load(), g_prof.evals.load(),
+                     n ? (double)g_prof.evals.load() / n : 0.0, g_prof.seg.load(),
+                     n ? (double)g_prof.seg / n : 0.0, cloud.size());
+    }
     return R;
 }

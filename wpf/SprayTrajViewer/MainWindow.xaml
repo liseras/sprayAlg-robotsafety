@@ -183,6 +183,7 @@
                                         <RowDefinition/>
                                         <RowDefinition/>
                                         <RowDefinition/>
+                                        <RowDefinition/>
                                     </Grid.RowDefinitions>
 
                                     <StackPanel Grid.Row="0" Grid.Column="0">
@@ -207,6 +208,17 @@
                                     <StackPanel Grid.Row="2" Grid.Column="0" Margin="0,8,0,0">
                                         <TextBlock Text="关节余量下限 (deg)" FontSize="11" Foreground="#6B7280"/>
                                         <TextBox x:Name="TxtJointMargin" Text="1" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Row="2" Grid.Column="2" Margin="0,8,0,0">
+                                        <TextBlock Text="并行线程数" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="1=单线程，结果与命令行逐字节一致；多线程快 2~3 倍，个别行首点可能选到另一条解支"/>
+                                        <TextBox x:Name="TxtThreads" Text="8" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Row="3" Grid.Column="0" Margin="0,8,0,0">
+                                        <TextBlock Text="点云体素 (mm，0=全量精判)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="在线预判可填 3~5 提速 3~5 倍；薄壁件会偏乐观，最终结论必须用 0"/>
+                                        <TextBox x:Name="TxtVoxel" Text="0" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
                                 </Grid>
 

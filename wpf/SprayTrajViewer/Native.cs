@@ -90,11 +90,13 @@ namespace SprayTrajViewer
         public double jointMarginMin;   // 关节限位余量下限
         public double condMax;          // 归一化雅可比条件数上限
         public double transitLiftMax;   // 过渡点最大抬升量
+        public double voxelMm;          // 点云体素降采样边长（0 = 不降采样）
         public int    linkStride;       // 连杆碰撞抽样步长
         public int    includeBase;      // 1=查底座段
         public int    fixTransit;       // 1=允许过渡点抬升
         public int    azFallback;       // 1=允许换倾斜方位兜底
         public int    maxCloudPoints;   // 保留（<=0 = 用全量点云）
+        public int    threads;          // 并行线程数（1=单线程，结果可复现）
     }
 
     // 违规位（与 RS_VIOL_* 一致）
