@@ -1,0 +1,1129 @@
+{
+  "pass": true,
+  "verdict": "PASS_WITH_WARNINGS",
+  "counts": {
+    "P0": 0,
+    "P1": 60,
+    "P2": 72
+  },
+  "base_frame_note": "⚠ **基座位姿为默认假设**（未提供 `--base-pose` / `--base-json`）：\n工件质心被摆到基座系的 `(0.50·reach, 0, 0.35·reach)` ≈ `(452, 0, 317)` mm，即基座自工件外侧后退、并低于工件质心，+X 指向工件。\n换算到点云系的基座原点假设值：`[781.6, -228.4, -508.5]` mm。\n**坐标闭环（P0）尚未完成**：点云系 → 基座系必须来自手眼标定或工位图纸。\n本报告中的「可达率」与「连杆碰撞」结论依赖这个假设；枪体碰撞与喷距/喷角结论不依赖它。",
+  "stats": {
+    "points": 1647,
+    "spray_points": 1613,
+    "reachable_points": 1647,
+    "reach_fraction": 1.0,
+    "tilted_points": 341,
+    "tilt_mean_deg": 5.051,
+    "tilt_p95_deg": 30.0,
+    "tilt_max_deg": 40.0,
+    "standoff_max_err_mm": 0.0,
+    "min_clearance_mm": 23.6477,
+    "transit_lifted": 0,
+    "recomputed_after_smoothing": 3,
+    "pose_reverted": 1,
+    "violations": 132,
+    "violations_by_rule": {
+      "NEAR_SINGULAR": 72,
+      "SPRAY_ANGLE": 59,
+      "JOINT_LIMIT": 1
+    },
+    "l0_issues": 0
+  },
+  "cloud": {
+    "points": 21590,
+    "raw_points": 21590,
+    "spacing_mm": 1.079,
+    "aabb_min": [
+      1109.028564453125,
+      -349.9961853027344,
+      -199.999267578125
+    ],
+    "aabb_max": [
+      1354.99169921875,
+      -100.03416442871094,
+      -149.89280700683594
+    ],
+    "centroid": [
+      1234.1285400390625,
+      -228.38360595703125,
+      -191.73741149902344
+    ]
+  },
+  "params": {
+    "standoff": 100.0,
+    "safety": 20.0,
+    "search": 120.0,
+    "tilt_nonup_deg": 20.0,
+    "up_threshold_deg": 45.0,
+    "tilt_max_deg": 60.0,
+    "tilt_step_deg": 5.0,
+    "tilt_rate_deg_per_pt": 3.0,
+    "max_spray_angle_deg": 30.0,
+    "tool_len": 150.0,
+    "include_base": false,
+    "joint_margin_min": 1.0,
+    "cond_max": 30.0,
+    "link_stride": 3,
+    "fix_transit": true,
+    "transit_lift_max": 400.0,
+    "az_fallback": true
+  },
+  "violations": [
+    {
+      "index": 1429,
+      "rule": "NEAR_SINGULAR",
+      "value": 43.213,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1432,
+      "rule": "NEAR_SINGULAR",
+      "value": 39.894,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1433,
+      "rule": "NEAR_SINGULAR",
+      "value": 41.686,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1434,
+      "rule": "NEAR_SINGULAR",
+      "value": 43.589,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1435,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.586,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1436,
+      "rule": "NEAR_SINGULAR",
+      "value": 47.688,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1437,
+      "rule": "NEAR_SINGULAR",
+      "value": 49.873,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1438,
+      "rule": "NEAR_SINGULAR",
+      "value": 52.114,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1439,
+      "rule": "NEAR_SINGULAR",
+      "value": 54.377,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1440,
+      "rule": "NEAR_SINGULAR",
+      "value": 56.611,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1441,
+      "rule": "NEAR_SINGULAR",
+      "value": 58.719,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1442,
+      "rule": "NEAR_SINGULAR",
+      "value": 60.691,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1443,
+      "rule": "NEAR_SINGULAR",
+      "value": 62.424,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1444,
+      "rule": "NEAR_SINGULAR",
+      "value": 63.853,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1445,
+      "rule": "NEAR_SINGULAR",
+      "value": 64.918,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1446,
+      "rule": "NEAR_SINGULAR",
+      "value": 65.58,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1447,
+      "rule": "NEAR_SINGULAR",
+      "value": 65.82,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1448,
+      "rule": "NEAR_SINGULAR",
+      "value": 65.627,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1449,
+      "rule": "NEAR_SINGULAR",
+      "value": 65.005,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1450,
+      "rule": "NEAR_SINGULAR",
+      "value": 63.976,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1451,
+      "rule": "NEAR_SINGULAR",
+      "value": 62.57,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1452,
+      "rule": "NEAR_SINGULAR",
+      "value": 60.848,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1453,
+      "rule": "NEAR_SINGULAR",
+      "value": 58.876,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1454,
+      "rule": "NEAR_SINGULAR",
+      "value": 56.716,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1455,
+      "rule": "NEAR_SINGULAR",
+      "value": 54.48,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1456,
+      "rule": "NEAR_SINGULAR",
+      "value": 52.208,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1457,
+      "rule": "NEAR_SINGULAR",
+      "value": 49.954,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1458,
+      "rule": "NEAR_SINGULAR",
+      "value": 47.753,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1459,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.634,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1460,
+      "rule": "NEAR_SINGULAR",
+      "value": 43.61,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1461,
+      "rule": "NEAR_SINGULAR",
+      "value": 41.698,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1462,
+      "rule": "NEAR_SINGULAR",
+      "value": 39.896,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1463,
+      "rule": "NEAR_SINGULAR",
+      "value": 38.204,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1464,
+      "rule": "NEAR_SINGULAR",
+      "value": 36.619,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1465,
+      "rule": "NEAR_SINGULAR",
+      "value": 35.136,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1466,
+      "rule": "NEAR_SINGULAR",
+      "value": 33.751,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1467,
+      "rule": "NEAR_SINGULAR",
+      "value": 32.457,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1468,
+      "rule": "NEAR_SINGULAR",
+      "value": 31.248,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1469,
+      "rule": "NEAR_SINGULAR",
+      "value": 30.116,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1495,
+      "rule": "NEAR_SINGULAR",
+      "value": 30.854,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1496,
+      "rule": "NEAR_SINGULAR",
+      "value": 31.827,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1497,
+      "rule": "NEAR_SINGULAR",
+      "value": 32.836,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1498,
+      "rule": "NEAR_SINGULAR",
+      "value": 33.881,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1499,
+      "rule": "NEAR_SINGULAR",
+      "value": 34.956,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1500,
+      "rule": "NEAR_SINGULAR",
+      "value": 36.057,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1501,
+      "rule": "NEAR_SINGULAR",
+      "value": 37.176,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1502,
+      "rule": "NEAR_SINGULAR",
+      "value": 38.304,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1503,
+      "rule": "NEAR_SINGULAR",
+      "value": 39.431,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1504,
+      "rule": "NEAR_SINGULAR",
+      "value": 40.541,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1505,
+      "rule": "NEAR_SINGULAR",
+      "value": 41.599,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1506,
+      "rule": "NEAR_SINGULAR",
+      "value": 42.621,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1507,
+      "rule": "NEAR_SINGULAR",
+      "value": 43.575,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1508,
+      "rule": "NEAR_SINGULAR",
+      "value": 44.44,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1509,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.2,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1510,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.84,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1511,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.35,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1512,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.723,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1513,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.958,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1514,
+      "rule": "NEAR_SINGULAR",
+      "value": 47.054,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1515,
+      "rule": "NEAR_SINGULAR",
+      "value": 47.013,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1516,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.836,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1517,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.525,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1518,
+      "rule": "NEAR_SINGULAR",
+      "value": 46.084,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1519,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.518,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1520,
+      "rule": "NEAR_SINGULAR",
+      "value": 44.832,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1521,
+      "rule": "NEAR_SINGULAR",
+      "value": 44.038,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1522,
+      "rule": "NEAR_SINGULAR",
+      "value": 43.15,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1523,
+      "rule": "NEAR_SINGULAR",
+      "value": 42.184,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1524,
+      "rule": "NEAR_SINGULAR",
+      "value": 41.157,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1525,
+      "rule": "NEAR_SINGULAR",
+      "value": 40.075,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1526,
+      "rule": "NEAR_SINGULAR",
+      "value": 38.979,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1527,
+      "rule": "NEAR_SINGULAR",
+      "value": 37.871,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 1529,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1530,
+      "rule": "JOINT_LIMIT",
+      "value": -12.13,
+      "limit": 1.0,
+      "severity": "P1",
+      "note": "关节限位余量 -12.1°"
+    },
+    {
+      "index": 1530,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1531,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1532,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1533,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1534,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1535,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1536,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1537,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1538,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1539,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1540,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1541,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1542,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1543,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1544,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1545,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1546,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1547,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1548,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1549,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1550,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1551,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1552,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1553,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1554,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1555,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1556,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1557,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1558,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1559,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1560,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1561,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1562,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1563,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1564,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1565,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1566,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1567,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1568,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1577,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1578,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1579,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1580,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1581,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1582,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1583,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1584,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1585,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1586,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1587,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1588,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1589,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1590,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1591,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1592,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1644,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1645,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1646,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    }
+  ]
+}

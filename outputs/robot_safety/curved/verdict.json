@@ -1,0 +1,2883 @@
+{
+  "pass": true,
+  "verdict": "PASS_WITH_WARNINGS",
+  "counts": {
+    "P0": 0,
+    "P1": 328,
+    "P2": 23
+  },
+  "base_frame_note": "⚠ **基座位姿为默认假设**（未提供 `--base-pose` / `--base-json`）：\n工件质心被摆到基座系的 `(0.50·reach, 0, 0.35·reach)` ≈ `(452, 0, 317)` mm，即基座自工件外侧后退、并低于工件质心，+X 指向工件。\n换算到点云系的基座原点假设值：`[1140.0, -219.2, 874.1]` mm。\n**坐标闭环（P0）尚未完成**：点云系 → 基座系必须来自手眼标定或工位图纸。\n本报告中的「可达率」与「连杆碰撞」结论依赖这个假设；枪体碰撞与喷距/喷角结论不依赖它。",
+  "stats": {
+    "points": 3457,
+    "spray_points": 3065,
+    "reachable_points": 3457,
+    "reach_fraction": 1.0,
+    "tilted_points": 3218,
+    "tilt_mean_deg": 20.6439,
+    "tilt_p95_deg": 40.0,
+    "tilt_max_deg": 60.0,
+    "standoff_max_err_mm": 0.0,
+    "min_clearance_mm": 11.6888,
+    "transit_lifted": 17,
+    "recomputed_after_smoothing": 489,
+    "pose_reverted": 25,
+    "violations": 351,
+    "violations_by_rule": {
+      "JOINT_LIMIT": 4,
+      "SPRAY_ANGLE": 322,
+      "CLEARANCE": 2,
+      "NEAR_SINGULAR": 21,
+      "TILT_JUMP": 2
+    },
+    "l0_issues": 0
+  },
+  "cloud": {
+    "points": 48156,
+    "raw_points": 111137,
+    "spacing_mm": 1.094,
+    "aabb_min": [
+      577.3693237304688,
+      -299.99609375,
+      1003.75
+    ],
+    "aabb_max": [
+      1018.6654663085938,
+      245.921875,
+      1315.3984375
+    ],
+    "centroid": [
+      741.5016479492188,
+      -4.8399457931518555,
+      1190.807861328125
+    ]
+  },
+  "params": {
+    "standoff": 100.0,
+    "safety": 20.0,
+    "search": 120.0,
+    "tilt_nonup_deg": 20.0,
+    "up_threshold_deg": 45.0,
+    "tilt_max_deg": 60.0,
+    "tilt_step_deg": 5.0,
+    "tilt_rate_deg_per_pt": 3.0,
+    "max_spray_angle_deg": 30.0,
+    "tool_len": 150.0,
+    "include_base": false,
+    "joint_margin_min": 1.0,
+    "cond_max": 30.0,
+    "link_stride": 3,
+    "fix_transit": true,
+    "transit_lift_max": 400.0,
+    "az_fallback": true
+  },
+  "violations": [
+    {
+      "index": 724,
+      "rule": "JOINT_LIMIT",
+      "value": -1.751,
+      "limit": 1.0,
+      "severity": "P1",
+      "note": "关节限位余量 -1.8°"
+    },
+    {
+      "index": 724,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1255,
+      "rule": "JOINT_LIMIT",
+      "value": -1.449,
+      "limit": 1.0,
+      "severity": "P1",
+      "note": "关节限位余量 -1.4°"
+    },
+    {
+      "index": 1255,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1256,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1260,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1261,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1262,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1263,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1264,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1265,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1266,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1267,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1268,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1270,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1271,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1272,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1273,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1274,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1275,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1276,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1277,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1278,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1279,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1280,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1281,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1282,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1293,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1294,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1295,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1296,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1297,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1298,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1299,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1300,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1301,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1302,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1303,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1304,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1305,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1306,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1307,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1308,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1309,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1310,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1311,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1312,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1313,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1331,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1332,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1333,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1334,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1335,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1336,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1337,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1338,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1339,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1340,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1341,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1342,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1343,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1360,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1361,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1362,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1363,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1364,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1365,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1366,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1367,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1368,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1369,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1370,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1371,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1372,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1373,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1374,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1375,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1376,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1377,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1378,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1379,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1380,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1388,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1389,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1390,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1391,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1392,
+      "rule": "SPRAY_ANGLE",
+      "value": 43.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 43.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1393,
+      "rule": "SPRAY_ANGLE",
+      "value": 46.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 46.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1394,
+      "rule": "SPRAY_ANGLE",
+      "value": 49.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 49.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1395,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1396,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1397,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1398,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1399,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1400,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1401,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1402,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1403,
+      "rule": "SPRAY_ANGLE",
+      "value": 47.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 47.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1404,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1405,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1406,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1407,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1408,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1409,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1410,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1411,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1462,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1463,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1464,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1465,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1466,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1467,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1468,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1469,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1470,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1471,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1472,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1473,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1474,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1475,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1476,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1477,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1478,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1479,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1480,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1503,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1506,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1507,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1508,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1509,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1510,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1511,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1512,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1513,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1514,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1515,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1516,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1517,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1518,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1519,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1520,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1521,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1522,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1523,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1524,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1525,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1526,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1527,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1528,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1529,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1530,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1531,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1532,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1533,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1534,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1535,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1536,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1537,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1538,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1539,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1540,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1541,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1542,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1543,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1544,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1545,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1546,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1547,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1548,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1549,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1550,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1551,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1552,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1553,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1554,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1555,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1556,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1557,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1558,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1559,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1560,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1561,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1562,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1563,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1564,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1565,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1566,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1568,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1574,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1575,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1576,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1577,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1578,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1579,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1580,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1582,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1583,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1588,
+      "rule": "CLEARANCE",
+      "value": 11.689,
+      "limit": 20.0,
+      "severity": "P1",
+      "note": "工具握把 表面距离 11.7mm < 20mm"
+    },
+    {
+      "index": 1589,
+      "rule": "CLEARANCE",
+      "value": 19.156,
+      "limit": 20.0,
+      "severity": "P1",
+      "note": "工具握把 表面距离 19.2mm < 20mm"
+    },
+    {
+      "index": 1611,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1612,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1613,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1708,
+      "rule": "SPRAY_ANGLE",
+      "value": 33.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 33.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1709,
+      "rule": "SPRAY_ANGLE",
+      "value": 36.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 36.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1710,
+      "rule": "SPRAY_ANGLE",
+      "value": 39.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 39.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1711,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1712,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1713,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1714,
+      "rule": "SPRAY_ANGLE",
+      "value": 39.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 39.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1715,
+      "rule": "SPRAY_ANGLE",
+      "value": 36.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 36.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1716,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1717,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1718,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1719,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1720,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1721,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1722,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1723,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1724,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1739,
+      "rule": "SPRAY_ANGLE",
+      "value": 33.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 33.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1740,
+      "rule": "SPRAY_ANGLE",
+      "value": 36.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 36.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1741,
+      "rule": "SPRAY_ANGLE",
+      "value": 39.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 39.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1742,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1743,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1744,
+      "rule": "SPRAY_ANGLE",
+      "value": 48.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 48.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1745,
+      "rule": "SPRAY_ANGLE",
+      "value": 51.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 51.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1746,
+      "rule": "SPRAY_ANGLE",
+      "value": 54.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 54.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1747,
+      "rule": "SPRAY_ANGLE",
+      "value": 57.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 57.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1748,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1749,
+      "rule": "SPRAY_ANGLE",
+      "value": 57.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 57.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1750,
+      "rule": "SPRAY_ANGLE",
+      "value": 54.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 54.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1751,
+      "rule": "SPRAY_ANGLE",
+      "value": 57.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 57.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1752,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1753,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1754,
+      "rule": "SPRAY_ANGLE",
+      "value": 57.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 57.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1755,
+      "rule": "SPRAY_ANGLE",
+      "value": 54.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 54.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1756,
+      "rule": "SPRAY_ANGLE",
+      "value": 51.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 51.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1757,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1758,
+      "rule": "SPRAY_ANGLE",
+      "value": 47.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 47.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1759,
+      "rule": "SPRAY_ANGLE",
+      "value": 44.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 44.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1760,
+      "rule": "SPRAY_ANGLE",
+      "value": 41.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 41.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1761,
+      "rule": "SPRAY_ANGLE",
+      "value": 38.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 38.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1762,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1763,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1778,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1779,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1780,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1781,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1782,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1783,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1797,
+      "rule": "JOINT_LIMIT",
+      "value": -10.081,
+      "limit": 1.0,
+      "severity": "P1",
+      "note": "关节限位余量 -10.1°"
+    },
+    {
+      "index": 1797,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2244,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2245,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2246,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2247,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2248,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2249,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2250,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2251,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2348,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2349,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2350,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2351,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2352,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2353,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2386,
+      "rule": "SPRAY_ANGLE",
+      "value": 33.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 33.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2387,
+      "rule": "SPRAY_ANGLE",
+      "value": 36.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 36.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2388,
+      "rule": "SPRAY_ANGLE",
+      "value": 39.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 39.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2389,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2390,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2391,
+      "rule": "SPRAY_ANGLE",
+      "value": 47.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 47.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2392,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2393,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2394,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2395,
+      "rule": "SPRAY_ANGLE",
+      "value": 52.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 52.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2396,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2397,
+      "rule": "SPRAY_ANGLE",
+      "value": 47.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 47.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2398,
+      "rule": "SPRAY_ANGLE",
+      "value": 44.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 44.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2399,
+      "rule": "SPRAY_ANGLE",
+      "value": 41.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 41.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2400,
+      "rule": "SPRAY_ANGLE",
+      "value": 38.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 38.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2401,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2402,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2418,
+      "rule": "SPRAY_ANGLE",
+      "value": 33.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 33.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2419,
+      "rule": "SPRAY_ANGLE",
+      "value": 36.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 36.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2420,
+      "rule": "SPRAY_ANGLE",
+      "value": 39.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 39.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2421,
+      "rule": "SPRAY_ANGLE",
+      "value": 42.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 42.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2422,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2423,
+      "rule": "SPRAY_ANGLE",
+      "value": 48.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 48.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2424,
+      "rule": "SPRAY_ANGLE",
+      "value": 51.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 51.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2425,
+      "rule": "SPRAY_ANGLE",
+      "value": 54.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 54.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2426,
+      "rule": "SPRAY_ANGLE",
+      "value": 57.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 57.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2427,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2428,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2429,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2430,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2431,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2432,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2433,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2434,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2435,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2436,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2437,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2481,
+      "rule": "NEAR_SINGULAR",
+      "value": 30.906,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2482,
+      "rule": "NEAR_SINGULAR",
+      "value": 32.179,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2483,
+      "rule": "NEAR_SINGULAR",
+      "value": 33.569,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2484,
+      "rule": "NEAR_SINGULAR",
+      "value": 35.091,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2485,
+      "rule": "NEAR_SINGULAR",
+      "value": 36.766,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2486,
+      "rule": "NEAR_SINGULAR",
+      "value": 38.617,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2487,
+      "rule": "NEAR_SINGULAR",
+      "value": 40.673,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2488,
+      "rule": "NEAR_SINGULAR",
+      "value": 42.971,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2489,
+      "rule": "NEAR_SINGULAR",
+      "value": 45.555,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2490,
+      "rule": "NEAR_SINGULAR",
+      "value": 48.48,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2491,
+      "rule": "NEAR_SINGULAR",
+      "value": 51.825,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2492,
+      "rule": "NEAR_SINGULAR",
+      "value": 55.664,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2493,
+      "rule": "NEAR_SINGULAR",
+      "value": 60.149,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2494,
+      "rule": "NEAR_SINGULAR",
+      "value": 65.43,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2495,
+      "rule": "NEAR_SINGULAR",
+      "value": 71.727,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2496,
+      "rule": "NEAR_SINGULAR",
+      "value": 79.411,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2497,
+      "rule": "NEAR_SINGULAR",
+      "value": 88.958,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2498,
+      "rule": "SPRAY_ANGLE",
+      "value": 60.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 60.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2499,
+      "rule": "SPRAY_ANGLE",
+      "value": 55.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 55.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2500,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2501,
+      "rule": "SPRAY_ANGLE",
+      "value": 50.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 50.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2502,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2503,
+      "rule": "SPRAY_ANGLE",
+      "value": 45.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 45.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2504,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2505,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2506,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2507,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2508,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2528,
+      "rule": "NEAR_SINGULAR",
+      "value": 32.309,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2529,
+      "rule": "NEAR_SINGULAR",
+      "value": 30.983,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2534,
+      "rule": "NEAR_SINGULAR",
+      "value": 30.678,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2535,
+      "rule": "NEAR_SINGULAR",
+      "value": 31.819,
+      "limit": 30.0,
+      "severity": "P2",
+      "note": "接近奇异位形"
+    },
+    {
+      "index": 2673,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 2990,
+      "rule": "JOINT_LIMIT",
+      "value": -11.887,
+      "limit": 1.0,
+      "severity": "P1",
+      "note": "关节限位余量 -11.9°"
+    },
+    {
+      "index": 2990,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3071,
+      "rule": "SPRAY_ANGLE",
+      "value": 31.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 31.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3072,
+      "rule": "SPRAY_ANGLE",
+      "value": 34.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 34.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3073,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3074,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3075,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3076,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3077,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3078,
+      "rule": "SPRAY_ANGLE",
+      "value": 40.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 40.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3079,
+      "rule": "SPRAY_ANGLE",
+      "value": 37.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 37.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3080,
+      "rule": "SPRAY_ANGLE",
+      "value": 35.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 35.0° 超工艺上限 30°"
+    },
+    {
+      "index": 3081,
+      "rule": "SPRAY_ANGLE",
+      "value": 32.0,
+      "limit": 30.0,
+      "severity": "P1",
+      "note": "喷角 32.0° 超工艺上限 30°"
+    },
+    {
+      "index": 1269,
+      "rule": "TILT_JUMP",
+      "value": 35.0,
+      "limit": 3.0,
+      "severity": "P2",
+      "note": "倾角相对上一点跳变 35.0°（限幅 3.0°/点）"
+    },
+    {
+      "index": 1270,
+      "rule": "TILT_JUMP",
+      "value": 35.0,
+      "limit": 3.0,
+      "severity": "P2",
+      "note": "倾角相对上一点跳变 35.0°（限幅 3.0°/点）"
+    }
+  ]
+}
