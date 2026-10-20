@@ -2537,13 +2537,33 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         for(size_t i=0;i<fP.size();++i){ oP.push_back(fP[i]); oN.push_back(fN[i]); }
     };
 
+    // ---- 回转面：让每一行都从"上一行收尾的那个方位角"起头 ----
+    // 只按高度挑种子时，相邻两行的起点会落在圈的任意方位，可能在正对面：
+    // 行 k 收尾在方位 0°，行 k+1 起头在方位 180°，行间连接要横穿整个圆
+    // （面点相距 200mm+），而 emitGap 判据是 "d > 3×行距就走 spray=0 的空移" ——
+    // 于是整条轨迹被切成 7 段、每段之间都要抬枪跨过去。
+    // 实测垃圾桶 30mm 行距：6 处空移全是这个原因（30~61mm 的枪位距离，面点 200mm+）。
+    // 对齐方位后行间连接只有径向一个行距（26mm），可以连续喷涂。
+    double phiPrev = 1e9;
+    auto phiOf = [&](const Vec3& p)->double{
+        Vec3 q = p - sp.c0;
+        return std::atan2(dot(q, eIdx), dot(q, eRow));
+    };
+
     for(size_t k=0; k<anchors.size(); ++k){
         const double tk = anchors[k];
         int seed = -1; double bestd = 1e18;
-        for(int i=0;i<m;++i){
-            if(!isoOk[i]) continue;              // 平面点不参与等高线取种
-            double d = std::fabs(iv[i]-tk);
-            if(d<bestd){ bestd=d; seed=i; }
+        for(int pass=0; pass<(isoMode ? 2 : 1) && seed < 0; ++pass){
+            for(int i=0;i<m;++i){
+                if(!isoOk[i]) continue;              // 平面点不参与等高线取种
+                if(pass==0 && isoMode && phiPrev < 1e8){
+                    double dd = std::fabs(std::remainder(phiOf(sp.P[i]) - phiPrev,
+                                                         6.283185307179586));
+                    if(dd > 0.70) continue;          // 与上一行收尾方位差 > 40° 的不用
+                }
+                double d = std::fabs(iv[i]-tk);
+                if(d<bestd){ bestd=d; seed=i; }
+            }
         }
         if(seed < 0) continue;
         std::vector<Vec3> rp, rn;
@@ -2585,6 +2605,7 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
             std::reverse(rp.begin(), rp.end());
             std::reverse(rn.begin(), rn.end());
         }
+        if(isoMode && !rp.empty()) phiPrev = phiOf(rp.back());   // 下一行从这里起头
         if(dbg){
             double s0 = dot(rp.front(), eIdx), s1 = dot(rp.back(), eIdx);
             fprintf(stderr,"[曲面dbg] 行%02d 锚=%.1f 实到=%.1f..%.1f(漂%.1f) 点数=%zu\n",
@@ -3720,13 +3741,41 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 根穿过工件凸台/槽壁的斜线。工业上必须"抬枪绕行"，否则撞件。
     // 处理：沿上一面法向退出 clear → 抬到全局安全高度 zSafe → 平面内平移 → 下降接下一面首点。
     //   clear 取 standoff：喷头本来就离面 100mm，再退 100mm 即彻底离开该面。
-    //   zSafe 取工件最高点 + 2×standoff：最高面上的工作点正好等于 zSafe，更低的面则向上抬。
+    //   zSafe 取工件最高点 + 1.3×standoff：
+    //     枪位 = 面点 + standoff·n，而 |n_z| <= 1，所以任何喷涂点的 z 都不超过
+    //     zPartMax + standoff。取 1.3 倍即在"最高枪位"之上还留 0.3×standoff(30mm)，
+    //     比原来的 2 倍省 0.7×standoff(70mm) 的上下抬升（每次过渡省 140mm）。
     double zPartMax = -1e18;
     for(const auto& p : Pf){ zPartMax = std::max(zPartMax, p.z); }
     const double clear = params->standoff;
-    const double zSafe = zPartMax + 2.0*params->standoff;
+    const double zSafe = zPartMax + 1.3*params->standoff;
     Vec3 prevNormal{0,0,1};
     int transCount = 0;
+
+    // ---- 空移段"直线可达"判定 ----
+    // 原来面间过渡一律"沿法向退出 → 抬到全局安全高度 zSafe → 平移 → 下降"，
+    // 哪怕两个端点本来就在工件上方很高处。垃圾桶"锥面顶 → 顶环"就是这样：
+    // 两端 z=231.9 / 289.9，直线只有 191mm，却被抬到 391 再落下，走了 507mm。
+    // 更糟的是"顶环 → 内腔底面"这种**下降进入开口腔**的过渡：腔口是敞开的，
+    // 根本没有障碍，还是先抬到 391 再垂直落 291mm，走了 506mm。
+    //
+    // 现在改成直接判几何：沿直线等距采样，逐点查最近工件点，全程都 >= moveClear
+    // 就直连。这比"两端 z 都高于工件最高点"宽松得多，也严格得多——后者对
+    // 上面第一种情形都会漏判（231.9 比 zPartMax+0.5·standoff=241.1 只低 9mm）。
+    KdTree partTree; partTree.init(Pf);
+    const double moveClear = std::max(6.0, 0.25*params->standoff);
+    auto segClearOK = [&](const Vec3& a, const Vec3& b)->bool{
+        const double d = len(b-a);
+        if(d < 1e-6) return true;
+        const int nsep = std::max(2, (int)std::ceil(d/std::max(1.0, pstep*2.0)));
+        for(int i=0;i<=nsep;++i){
+            Vec3 q = a + (b-a)*((double)i/(double)nsep);
+            KnnBuf kb; partTree.knn(q, 1, kb);
+            if(kb.n < 1) return false;
+            if(std::sqrt(kb.d2[0]) < moveClear) return false;
+        }
+        return true;
+    };
 
     for(size_t si=0; si<segs.size(); ++si){
         if(!meshOk[si]) continue;          // 轮廓都重建不出来的面，不喷
@@ -3759,7 +3808,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 double d = len(b-a);
                 if(d <= pstep*0.5) return;
                 int np = std::max(2, (int)std::ceil(d/pstep));
-                int spray = (d <= 3.0*L) ? 1 : 0;
+                // 关枪判据必须看**枪位行程**，不是面点跳距。
+                // 枪位 = 面点 + standoff·n，两行端点法向不同，法向旋转会把面点的大跳距
+                // 在枪位上大幅抵消：垃圾桶 L=12 时面点跳 93mm、枪位只走 13mm。
+                // 用面点跳距判会白关 8 次枪（每次都要停-关-开-加速，很费时间），
+                // 而实际喷嘴只挪了十几毫米，根本不需要断。
+                const double dg = len((b + nb*params->standoff) - (a + na*params->standoff));
+                int spray = (dg <= 3.0*L) ? 1 : 0;
                 for(int t=1;t<np;++t){
                     double f = (double)t/(double)np;
                     emitPt(a + (b-a)*f, na + (nb-na)*f, spray);
@@ -3773,10 +3828,20 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 Vec3 firstPos = firstX + firstN*params->standoff;
                 if(!allPts.empty()){
                     Vec3 pEnd{allPts.back().x, allPts.back().y, allPts.back().z};
-                    Vec3 L1 = pEnd + prevNormal*clear;
-                    allPts.push_back({L1.x,L1.y,L1.z, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
-                    allPts.push_back({L1.x,L1.y,zSafe, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
-                    allPts.push_back({firstPos.x,firstPos.y,zSafe, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                    if(segClearOK(pEnd, firstPos)){
+                        // 直线全程离开件 >= moveClear，直连（不必抬到安全高度）。
+                        // spray 是"段属性"（两端都为 1 才是喷涂段），所以必须在
+                        // 中间插一个 spray=0 才能把线断开；插中点而不插端点，
+                        // 三点共线、物理路径仍是这条直线，也不会产生零长段。
+                        Vec3 mid = pEnd + (firstPos - pEnd)*0.5;
+                        allPts.push_back({mid.x,mid.y,mid.z,
+                                          -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                    } else {
+                        Vec3 L1 = pEnd + prevNormal*clear;
+                        allPts.push_back({L1.x,L1.y,L1.z, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
+                        allPts.push_back({L1.x,L1.y,zSafe, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
+                        allPts.push_back({firstPos.x,firstPos.y,zSafe, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                    }
                     ++transCount;
                 }
                 for(int r=0; r<nr; ++r){
@@ -4013,10 +4078,18 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             sampleLine(segs2[i].a, segs2[i].b, 1);
             if(i+1<segs2.size()){
                 double gap = len2(segs2[i+1].a - segs2[i].b);
-                if(gap > turnR*3){
-                    // 跨段大跳跃（如环形面的左右段切换、跨行大间隔）：
-                    // 直线空移过渡，spray=0（不喷涂）。WPF 按 spray=0 断开显示。
+                // 关枪判据和曲面块统一：一个行距级别的跨接（<= 3L）都还在工艺允许
+                // 的重叠范围内，保持喷涂更省时间；只有真正的"大跳跃"（左右段切换、
+                // 中间有孔洞）才关枪。原来只看 turnR*3（与行距无关），L=30 时
+                // 一个 20mm 的普通换行也被关枪，白停一次。
+                const double gapHard = std::max(turnR*3.0, 3.0*L);
+                if(gap > gapHard){
+                    // 跨段大跳跃：直线空移过渡，spray=0（不喷涂）。
+                    // WPF 按 spray=0 断开显示。
                     sampleLine(segs2[i].b, segs2[i+1].a, 0);
+                } else if(gap > turnR*3){
+                    // 中等跨接：同一平面内平移，直连并保持喷涂（不做圆弧，免得外扩）
+                    sampleLine(segs2[i].b, segs2[i+1].a, 1);
                 } else {
                     Vec2 dir=norm2(segs2[i].b - segs2[i].a);
                     Vec2 cr{-dir.y, dir.x};
@@ -4040,13 +4113,21 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             auto pushMove=[&](const Vec3& p){
                 allPts.push_back({p.x,p.y,p.z, gun.x,gun.y,gun.z, params->speed, 0});
             };
-            // ① 沿上一面法向退出（离开该面，不擦面）
-            Vec3 L1 = pEnd + prevNormal*clear;
-            pushMove(L1);
-            // ② 抬到全局安全高度（最高面上二者等高，不会出现"先冲高再回落"）
-            pushMove({L1.x, L1.y, zSafe});
-            // ③ 在安全高度上平移到本面首点正上方
-            pushMove({pStart.x, pStart.y, zSafe});
+            // ① 直线可达就直接连（见 segClearOK 的说明）。
+            //    spray 是"段属性"（两端都为 1 才是喷涂段），所以必须在中间插一个
+            //    spray=0 把线断开；插中点而非端点：三点共线，物理路径不变，
+            //    也不会在落点产生一个重复点（零长段，部分控制器会报错）。
+            if(segClearOK(pEnd, pStart)){
+                pushMove(pEnd + (pStart - pEnd)*0.5);
+            } else {
+                // ② 沿上一面法向退出（离开该面，不擦面）
+                Vec3 L1 = pEnd + prevNormal*clear;
+                pushMove(L1);
+                // ③ 抬到全局安全高度（最高面上二者等高，不会出现"先冲高再回落"）
+                pushMove({L1.x, L1.y, zSafe});
+                // ④ 在安全高度上平移到本面首点正上方
+                pushMove({pStart.x, pStart.y, zSafe});
+            }
             ++transCount;
         }
         prevNormal = pl.n;
