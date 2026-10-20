@@ -5,7 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 核心库（动态库，导出 C ABI）
-add_library(SprayTraj SHARED spray_traj.cpp)
+# robot_safety.cpp：机器人可执行性校验（倾角规划 + 枪体/连杆碰撞 + IK 可达）。
+# 它与 spray_traj.cpp 各自独立：spray_traj 保证「喷得对不对」，robot_safety 保证
+# 「机器人能不能安全执行」。两者编进同一个 DLL，下游按需调用，互不污染。
+add_library(SprayTraj SHARED spray_traj.cpp robot_safety.cpp)
 target_include_directories(SprayTraj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(SprayTraj PRIVATE SPRAYTRAJ_EXPORTS)
 if(MSVC)
@@ -30,3 +33,13 @@ set_target_properties(spray_driver PROPERTIES
 if(MSVC)
     target_link_options(spray_driver PRIVATE /STACK:16777216)
 endif()
+
+# 安全层命令行驱动（读轨迹 CSV + 点云 PLY -> 校验并输出修正后轨迹）
+# 单独一个 exe：spray_driver 的输出决定 9 个非曲面样本的 CSV 基线，安全层不能碰那条链。
+add_executable(spray_safety safety_driver.cpp)
+target_link_libraries(spray_safety PRIVATE SprayTraj)
+if(MSVC)
+    target_compile_options(spray_safety PRIVATE /utf-8)
+endif()
+set_target_properties(spray_safety PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
