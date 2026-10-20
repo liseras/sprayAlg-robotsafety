@@ -1839,12 +1839,30 @@ static bool surf_project(const SurfPatch& sp, Vec3 q, Vec3& pos, Vec3& nrm)
 // bridge：数据空洞的跨越上限。线扫点云在反光/遮挡处会缺一小段，直接判"到边"
 // 会把长行截断成两截。缺口服 fillHole 语义处理：能接上就补直线点。
 static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, double step,
-                       double bridge, int maxSteps, std::vector<Vec3>& outP, std::vector<Vec3>& outN)
+                       double bridge, int maxSteps, std::vector<Vec3>& outP, std::vector<Vec3>& outN,
+                       bool isoH = false)
 {
     Vec3 p, n;
     if(!surf_project(sp, start, p, n)) return;
+    // ---- 上坡方向：决定"行"是什么曲线 ----
+    // isoH=false（老路，可展柱面）：上坡方向固定为 eIdx，行 = 过轴平面截线。
+    //   曲型板沿长边可展，截线就是一条沿长边的直线，正确。
+    // isoH=true（回转/双曲率面）：上坡方向取**高度场的梯度**
+    //   h(p)=dot(p-c0,n0) → ∇h = n0·(n·n0) - n（法向的面内分量取反）。
+    //   行 = 等高线，即绕轴的闭合圈。
+    //   梯度≈0 处是平面（底面/盖板），等值线无定义，直接判定行到此为止 ——
+    //   这正好把"平面区"从行走向里摘出去，不会像老路那样直线横穿整个曲面。
+    auto upOf = [&](const Vec3& nn)->Vec3{
+        if(!isoH) return eIdx;
+        Vec3 g = sp.n0*dot(nn, sp.n0) - nn;
+        double l = len(g);
+        if(l < 0.15) return Vec3{0,0,0};
+        return g*(1.0/l);
+    };
     // 起点切向用方向场给（t0 只用来定符号，保证朝期望的一侧走）
-    Vec3 t = cross(n, eIdx);
+    Vec3 u0 = upOf(n);
+    if(len(u0) < 0.2) return;
+    Vec3 t = cross(n, u0);
     if(len(t) < 0.2) return;
     t = norm(t);
     if(dot(t, t0) < 0) t = t*(-1.0);
@@ -1896,13 +1914,16 @@ static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, doub
                 }
             }
             p = bp; n = bn;
-            Vec3 tn = cross(n, eIdx);
+            Vec3 uu = upOf(n);
+            Vec3 tn = (len(uu) > 0.2) ? cross(n, uu) : Vec3{0,0,0};
             if(len(tn) > 0.2){ tn = norm(tn); if(dot(tn,t) < 0) tn = tn*(-1.0); t = tn; }
             outP.push_back(p); outN.push_back(n);
             continue;
         }
         // 方向场给新切向，符号延续当前走向
-        Vec3 tn = cross(qn, eIdx);
+        Vec3 uu = upOf(qn);
+        if(len(uu) < 0.2) break;                                  // 平面区：等高线无定义，行到此为止
+        Vec3 tn = cross(qn, uu);
         if(len(tn) < 0.2) break;                                  // 法向与横向轴近平行，行在此退化
         tn = norm(tn);
         if(dot(tn, t) < 0) tn = tn*(-1.0);
@@ -2199,11 +2220,22 @@ static bool surf_model_query(const SurfPatch& sp, const Vec3& p, double& hout, V
 }
 
 // 在曲面块上生成蛇形行（就地写回 sp.rowP/rowN/rowBeg）
-static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillHole, int dirMode)
+static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillHole,
+                             int dirMode, double speed)
 {
     const int m = (int)sp.P.size();
     if(m < 50 || L <= 0 || pstep <= 0) return false;
     if(!sp.modelOk) build_surf_model(sp, 0.0);   // 显示网格已建则复用，避免重复计算
+    // ---- 姿态限幅上限：按末端允许角速度反算 ----
+    //   Δmax[°/点] = ω_max[°/s] · pstep[mm] / speed[mm/s]
+    // 老版本固定 6°/点：点距 4mm、速度 200mm/s 时等于 **300°/s** 的末端角速度，
+    // 多数六轴机器人（典型 100~200°/s）跟不上，实际表现是到位滞后/超调，
+    // 视觉上就是"轨迹在拐角处甩出去"。默认 ω_max=150°/s → 3.0°/点。
+    // 夹在 [0.5, 6.0]：点距很大或速度很慢时不至于把真实折边也抹平。
+    const double wMax = 150.0;   // °/s
+    const double slewDeg = std::min(6.0, std::max(0.5, wMax*pstep/std::max(1.0, speed)));
+    fprintf(stderr, "[曲面] 姿态限幅 %.2f°/点 = %.0f°/s (点距%.1fmm 速度%.0fmm/s)\n",
+            slewDeg, slewDeg*std::max(1.0,speed)/std::max(1e-9,pstep), pstep, speed);
     // 空洞跨越上限：跟平面路径的 fillHole 语义一致，但曲面行不宜跨太远
     const double bridge = std::min(fillHole, 3.0*L);
 
@@ -2238,29 +2270,157 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     if(ext1 < ext2) std::swap(eRow, eIdx);          // 保证 eRow 是长的那一维
     if(dirMode == 2) std::swap(eRow, eIdx);         // 沿短边喷：行平行短边
 
-    // ---- 两遍定距：先估横向跨度，再定行数与实际行距 ----
-    auto idxOf=[&](const Vec3& p){ return dot(p, eIdx); };
+    // ---- 行走向自检：可展柱面 vs 回转/双曲率面 ----
+    // "过轴平面截线"（沿 eRow 走的等 eIdx 曲线）只有在曲面沿 eRow **可展**
+    // 时才是一条像样的行。回转体（圆锥/圆柱/槽盘）沿 eRow 走一圈方位角要变
+    // 几十度，截线会退化成沿母线的一束双曲线：外圈挤、内圈疏，端点在轴心汇聚。
+    // 实测垃圾桶(锥台+底面)：27 行全部从上沿直插到底面中心，总长 12.7m、
+    // 母线间距 20.4mm(外)~7.0mm(内)；等高线圈只要 17 圈 / 11.4m，间距均匀。
+    //
+    // 判据用"沿长轴的高程起伏"而不是"法向离散"：后者在双曲率板上也会很大，
+    // 实测曲型板 p90=50.8° 被误判成回转体，行数从 18 涨到 34、rms 8.9→18.9。
+    // 高程起伏ratio = 箱内 h 的极差 / 箱内 eRow 跨度：
+    //   柱面的母线是沿 eRow 的直线 → h 沿 eRow 不变 → ratio ~0.02（只剩箱宽引起的那点）
+    //   圆锥的截线是双曲线      → h 沿 eRow 剧变   → ratio ~0.3
+    // 门限 0.10，两边各有 3~4 倍余量。
+    bool isoMode = false;
+    double isoG = 1.0;          // 高度方向走 1mm 时曲面上实际走多少 mm（= 1/|∇h|）
+    {
+        const int NB = 12;
+        double rlo=1e18, rhi=-1e18, ilo=1e18, ihi=-1e18;
+        for(int i=0;i<m;++i){
+            double tr=dot(sp.P[i], eRow), ti=dot(sp.P[i], eIdx);
+            rlo=std::min(rlo,tr); rhi=std::max(rhi,tr);
+            ilo=std::min(ilo,ti); ihi=std::max(ihi,ti);
+        }
+        if(ihi-ilo > 1e-6 && rhi-rlo > 1e-6){
+            std::vector<double> rat;
+            for(int b=0;b<NB;++b){
+                double a0 = ilo + (ihi-ilo)*(double)b/(double)NB;
+                double a1 = ilo + (ihi-ilo)*(double)(b+1)/(double)NB;
+                double tlo=1e18, thi=-1e18, hlo=1e18, hhi=-1e18;
+                int cnt=0;
+                for(int i=0;i<m;++i){
+                    double ti = dot(sp.P[i], eIdx);
+                    if(ti < a0 || ti >= a1) continue;
+                    double tr = dot(sp.P[i], eRow);
+                    double h  = dot(sp.P[i], sp.n0);
+                    tlo=std::min(tlo,tr); thi=std::max(thi,tr);
+                    hlo=std::min(hlo,h);  hhi=std::max(hhi,h);
+                    ++cnt;
+                }
+                if(cnt < 40 || thi-tlo < 1e-6) continue;
+                rat.push_back((hhi-hlo)/(thi-tlo));
+            }
+            double ratio = 0.0;
+            if(rat.size() >= 4){
+                std::nth_element(rat.begin(), rat.begin()+rat.size()/2, rat.end());
+                ratio = rat[rat.size()/2];
+            }
+            // 第二个条件：投影是否绕满一圈。回转体的 (u,v) 投影必然覆盖 360° 方位；
+            // 一片板（哪怕弯成 60° 的弧板）投影出来是个矩形/细长条，方位只覆盖
+            // 100°~150°。实测曲型板 ratio=0.372（它确实是双曲率的），只靠起伏
+            // 判据会被误判成回转体，行数从 18 涨到 30、覆盖率 92%→55%。
+            const int NS = 36;
+            std::vector<unsigned char> sec(NS, 0);
+            int npj = 0;
+            for(int i=0;i<m;++i){
+                Vec3 d = sp.P[i]-sp.c0;
+                double aa = dot(d, sp.eL), bb = dot(d, sp.eS);
+                if(std::fabs(aa) < 1e-9 && std::fabs(bb) < 1e-9) continue;
+                double th = std::atan2(bb, aa);
+                int k = (int)((th + 3.14159265358979)/(2.0*3.14159265358979)*(double)NS);
+                if(k<0) k=0; if(k>=NS) k=NS-1;
+                sec[k]=1; ++npj;
+            }
+            int nsec=0; for(int k=0;k<NS;++k) if(sec[k]) ++nsec;
+            const double cover = npj>0 ? (double)nsec/(double)NS : 0.0;
+            // 第三个条件：外接框不能太狭长。回转体的投影接近正方形/圆；
+            // 一片长条板（曲型板实测 548×176，宽高比 3.1）方位也能覆盖满一圈，
+            // 但它显然不是回转体 —— 少了这条会把它带进等高线模式，行被切成
+            // 6 个点的碎片（覆盖率 92%→55%）。
+            const double aspect = (ext1 > ext2) ? ext1/std::max(1e-9,ext2)
+                                                : ext2/std::max(1e-9,ext1);
+            isoMode = (ratio > 0.10) && (cover >= 5.0/6.0) && (aspect < 1.8);
+            fprintf(stderr, "[曲面] 行走向自检: 高程起伏=%.3f 方位覆盖=%.0f%% 宽高比=%.2f → %s\n",
+                    ratio, cover*100.0, aspect,
+                    isoMode ? "回转/双曲率，按等高线圈布行" : "可展/开放面，按平面截线布行");
+        }
+    }
+
+    // ---- 定距：两条路分别是"横向等距锚点"和"等高线逐层等弧长推进" ----
     std::vector<double> iv(m);
-    for(int i=0;i<m;++i) iv[i]=idxOf(sp.P[i]);
-    std::vector<double> ivs = iv;
+    std::vector<unsigned char> isoOk(m, 1);
+    std::vector<double> anchors;          // 每一行的锚（平面=横向坐标，iso=高度）
     auto qt=[&](std::vector<double>& v, double f)->double{
         if(v.empty()) return 0.0;
         size_t k=(size_t)((v.size()-1)*f);
         std::nth_element(v.begin(), v.begin()+k, v.end());
         return v[k];
     };
-    double lo = qt(ivs, 0.005), hi = qt(ivs, 0.995);
-    double D = hi - lo;
-    if(D < L*0.5) return false;
-    int N = (int)std::floor(D/L + 0.5);
-    if(N < 1) N = 1;
-    if(N > 2000) N = 2000;
-    double gap = D/(double)N;
-    sp.rowGap = gap;
+    double lo=0.0, hi=0.0, D=0.0, gap=L;
+    if(isoMode){
+        // 锚点沿**高度**分层。只有"法向明显偏离 n0"的点参与 —— 平面区
+        // （底面/盖板）的高度是常数，既会把范围压扁，也生不出等高线。
+        double hlo=1e18, hhi=-1e18;
+        for(int i=0;i<m;++i){
+            iv[i]=dot(sp.P[i]-sp.c0, sp.n0);
+            Vec3 g = sp.n0*dot(sp.N[i], sp.n0) - sp.N[i];
+            if(len(g) < 0.15){ isoOk[i]=0; continue; }
+            hlo=std::min(hlo,iv[i]); hhi=std::max(hhi,iv[i]);
+        }
+        if(hhi-hlo < 1e-6) return false;
+        lo=hlo; hi=hhi;
+        // |∇h| 随高度的查找表（1mm 箱取中位）。**不能用全局平均值**：
+        // 曲型板（碗形）的 |∇h| 从 0.1 到 1.0，用平均 0.6 会让底部行距 72mm、
+        // 陡壁 7mm，实测覆盖率只有 54.7%、贴合残差 18.9mm。
+        const int NH = (int)std::floor(hhi-hlo)+1;
+        std::vector<std::vector<double>> gb(NH);
+        double gAll=0; int gAllN=0;
+        for(int i=0;i<m;++i){
+            if(!isoOk[i]) continue;
+            Vec3 g = sp.n0*dot(sp.N[i], sp.n0) - sp.N[i];
+            double gl = len(g);
+            int b = (int)std::floor(iv[i]-hlo); if(b<0) b=0; if(b>=NH) b=NH-1;
+            gb[b].push_back(gl); gAll += gl; ++gAllN;
+        }
+        const double gGlob = gAllN>0 ? std::max(0.10, gAll/(double)gAllN) : 0.5;
+        std::vector<double> gm(NH, gGlob);
+        for(int b=0;b<NH;++b){
+            if(gb[b].size() < 5) continue;
+            std::nth_element(gb[b].begin(), gb[b].begin()+gb[b].size()/2, gb[b].end());
+            gm[b] = std::max(0.08, gb[b][gb[b].size()/2]);
+        }
+        // 逐层推进：每层的间隔 = L·|∇h|(该层)，等价于"沿曲面量每层都走 L"
+        double hcur = hlo;
+        for(int it=0; it<2000 && hcur <= hhi; ++it){
+            anchors.push_back(hcur);
+            int b = (int)std::floor(hcur-hlo); if(b<0) b=0; if(b>=NH) b=NH-1;
+            hcur += L*gm[b];
+        }
+        if(anchors.size() < 2) return false;
+        gap = L;                 // 逐层推进的间隔就是 L，实际行距也就是 L
+        fprintf(stderr, "[曲面] 等高线分层: 高差=%.1fmm %zu 层 行距=%.1fmm\n",
+                hhi-hlo, anchors.size(), gap);
+    }else{
+        for(int i=0;i<m;++i) iv[i]=dot(sp.P[i], eIdx);
+        std::vector<double> ivs = iv;
+        lo = qt(ivs, 0.005); hi = qt(ivs, 0.995);
+        D = hi - lo;
+        if(D < L*0.5) return false;
+        int N = (int)std::floor(D/L + 0.5);
+        if(N < 1) N = 1;
+        if(N > 2000) N = 2000;
+        gap = D/(double)N;
+        anchors.reserve(N);
+        for(int k=0;k<N;++k) anchors.push_back(lo + (k+0.5)*gap);
+    }
+    sp.rowGap = gap;                 // 沿曲面的实际行距
     if(std::getenv("SPRAYTRAJ_DUMP"))
         fprintf(stderr, "[曲面dbg] ext(a1)=%.1f ext(a2)=%.1f eRow=(%.3f,%.3f,%.3f) eIdx=(%.3f,%.3f,%.3f) "
-                        "lo=%.1f hi=%.1f D=%.1f N=%d gap=%.2f\n",
-                ext1, ext2, eRow.x,eRow.y,eRow.z, eIdx.x,eIdx.y,eIdx.z, lo, hi, D, N, gap);
+                        "lo=%.1f hi=%.1f D=%.1f N=%zu gap=%.2f iso=%d\n",
+                ext1, ext2, eRow.x,eRow.y,eRow.z, eIdx.x,eIdx.y,eIdx.z, lo, hi, D,
+                anchors.size(), gap, (int)isoMode);
 
     // ---- 逐行独立起步 ----
     // 早期版本是"上一行末点沿 t×n 侧移一格 gap 起下一行"，结果行会随曲面法向的
@@ -2272,15 +2432,24 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     // 从中间起步则能走满整条弦。
     sp.rowP.clear(); sp.rowN.clear(); sp.rowBeg.clear();
     sp.rowBeg.push_back(0);          // 首行起点哨兵（发射段按 rowBeg[r]..rowBeg[r+1] 切行）
-    const int maxSteps = (int)std::ceil((ext1+ext2)*2.0/pstep) + 32;
+    // 单行步数上限。平面截线是"一串从边到边的开放曲线"，2×(外接尺寸) 够用；
+    // 等高线圈是**闭合**的，最长一圈 = 2π·Rmax，实测曲型板（碗形，Rmax=334）
+    // 一圈要 525 步，而按外接尺寸只给 373 步 —— 行被腰斩成 340mm 的碎片，
+    // 覆盖率只有 54.8%、残差 15.8mm。
+    int maxSteps = (int)std::ceil((ext1+ext2)*2.0/pstep) + 32;
+    if(isoMode){
+        double rmax = 0.0;
+        for(int i=0;i<m;++i) rmax = std::max(rmax, len(sp.P[i]-sp.c0));
+        maxSteps = (int)std::ceil(2.0*3.14159265358979*rmax*1.3/pstep) + 32;
+    }
     const bool dbg = (std::getenv("SPRAYTRAJ_DUMP") != nullptr);
     int rowsMade = 0;
 
     // 一条完整行：seed 向两侧各追一遍，反向前半 + 正向后半拼成整条等值线
     auto marchBoth = [&](Vec3 seed, std::vector<Vec3>& oP, std::vector<Vec3>& oN){
         std::vector<Vec3> fP, fN, bP, bN;
-        surf_march(sp, seed, eIdx, eRow*(-1.0), pstep, bridge, maxSteps, bP, bN);
-        surf_march(sp, seed, eIdx, eRow,        pstep, bridge, maxSteps, fP, fN);
+        surf_march(sp, seed, eIdx, eRow*(-1.0), pstep, bridge, maxSteps, bP, bN, isoMode);
+        surf_march(sp, seed, eIdx, eRow,        pstep, bridge, maxSteps, fP, fN, isoMode);
         oP.clear(); oN.clear();
         oP.reserve(bP.size()+fP.size()); oN.reserve(bP.size()+fN.size());
         // 反向前半是"seed, seed-1步, seed-2步…"，倒序后末尾那个点就是 seed
@@ -2288,14 +2457,25 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         for(size_t i=0;i<fP.size();++i){ oP.push_back(fP[i]); oN.push_back(fN[i]); }
     };
 
-    for(int k=0; k<N; ++k){
-        const double tk = lo + (k+0.5)*gap;
+    for(size_t k=0; k<anchors.size(); ++k){
+        const double tk = anchors[k];
         int seed = -1; double bestd = 1e18;
-        for(int i=0;i<m;++i){ double d = std::fabs(iv[i]-tk); if(d<bestd){ bestd=d; seed=i; } }
+        for(int i=0;i<m;++i){
+            if(!isoOk[i]) continue;              // 平面点不参与等高线取种
+            double d = std::fabs(iv[i]-tk);
+            if(d<bestd){ bestd=d; seed=i; }
+        }
         if(seed < 0) continue;
         std::vector<Vec3> rp, rn;
         marchBoth(sp.P[seed], rp, rn);
         if(rp.size() < 2) continue;
+        // 闭合等高线：向两侧各追一遍会绕满一圈并在种子附近相遇，尾部是重复段。
+        // 不去掉的话蛇形串接会在圈末原地折返 180°（枪位图上是个尖刺）。
+        if(isoMode && rp.size() > 8){
+            while(rp.size() > 8 && len(rp.back()-rp.front()) < 1.5*pstep){
+                rp.pop_back(); rn.pop_back();
+            }
+        }
         // ---- 姿态来自重建曲面模型（跨行一致化）----
         // 逐点 PCA 法向的重尾误差（p95 17°、max 48°）经 100mm 枪位放大成
         // 30~74mm 横移，而行距只有 11.76mm，相邻行枪位就大面积互相穿越。
@@ -2317,10 +2497,10 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         // "姿态跳跃"，渲染出来就是"轨迹乱七八糟"。枪头旋转本身有惯性/限速，
         // 这里分两段处理（位置 rp 一律不动，覆盖率/贴合残差完全不受影响）：
         //   1) 行内 [1,2,3,2,1] 低通 ×4 遍（等效高斯 σ≈6.5mm）：压逐点法向噪声；
-        //   2) 双向角速率限幅 6°/步（≈1.5°/mm）：换墙/卷边的折角摊成缓转。
+        //   2) 双向角速率限幅：换墙/卷边的折角摊成缓转。
         //      折角处一两个点转几十度，枪位（100mm 外）横甩 ±50mm，
         //      是"轨迹乱"的最大来源；限幅后枪头像真机一样匀速转过去。
-        smooth_row_normals(rn, 4, 6.0);
+        smooth_row_normals(rn, 4, slewDeg);
         if((rowsMade & 1) != 0){                     // 蛇形：奇数行反向存放
             std::reverse(rp.begin(), rp.end());
             std::reverse(rn.begin(), rn.end());
@@ -2423,7 +2603,7 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
             const int b=sp.rowBeg[r], e=sp.rowBeg[r+1];
             if(e-b < 5) continue;
             std::vector<Vec3> seg(sp.rowN.begin()+b, sp.rowN.begin()+e);
-            smooth_row_normals(seg, 2, 6.0);
+            smooth_row_normals(seg, 2, slewDeg);
             std::copy(seg.begin(), seg.end(), sp.rowN.begin()+b);
         }
         if(std::getenv("SPRAYTRAJ_DUMP"))
@@ -2706,6 +2886,37 @@ static bool patch_is_polyhedral(const std::vector<Vec3>& P, const std::vector<in
     return false;
 }
 
+// 在给定点集（按 blk 索引）上跑一轮 RANSAC，返回最大紧公差平面的内点（全局下标）。
+// 与 patch_is_polyhedral 同源，但只取第一个平面 —— 用于"块内大平盘"剥离。
+static bool ransac_one_plane(const std::vector<Vec3>& P, const std::vector<int>& blk,
+                             double tol, int iters, Vec3& nOut, double& dOut,
+                             std::vector<int>& inlOut)
+{
+    inlOut.clear();
+    const int N = (int)blk.size();
+    if(N < 100) return false;
+    std::mt19937 rng(20771);
+    std::uniform_int_distribution<int> ud(0, N-1);
+    int bestCnt = 0; Vec3 bn{0,0,1}; double bd = 0;
+    for(int k=0;k<iters;++k){
+        int a=ud(rng), b=ud(rng), c=ud(rng);
+        if(a==b || b==c || a==c) continue;
+        Vec3 nn = cross(P[blk[b]]-P[blk[a]], P[blk[c]]-P[blk[a]]);
+        double ln = len(nn);
+        if(ln < 1e-9) continue;
+        nn = nn*(1.0/ln);
+        double d = -dot(nn, P[blk[a]]);
+        int cnt = 0;
+        for(int t=0;t<N;++t) if(std::fabs(dot(P[blk[t]], nn)+d) < tol) ++cnt;
+        if(cnt > bestCnt){ bestCnt = cnt; bn = nn; bd = d; }
+    }
+    if(bestCnt < 100) return false;
+    nOut = bn; dOut = bd;
+    inlOut.reserve(bestCnt);
+    for(int t=0;t<N;++t) if(std::fabs(dot(P[blk[t]], bn)+bd) < tol) inlOut.push_back(blk[t]);
+    return true;
+}
+
 // 曲面块检测：找"法向局部连续"的最大连通块，再判断它平不平。
 //   * 连通条件用**相邻点**法向夹角 < 20°，不是"与种子夹角"——否则弯过 60°
 //     的曲面会被种子法向切成几块（这正是原来被硬切成 8 个平面的原因）；
@@ -2780,6 +2991,89 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
                 tolPl, np, cov*100.0,
                 poly ? " → 多面体，退回平面分割" : "（未达 93%，仍按曲面处理）");
         if(poly) return false;
+    }
+
+    // ---- 剥离块内的"平行于 n0 的大平盘"（底面 / 盖板 / 环形唇边）----
+    // 曲面块靠"相邻点法向差 < 20°"连通，棱边处的过渡点会把平盘和曲面串成一块。
+    // 平盘对曲面行追踪是致命的：沿 n0 的高度场在盘上是常数，等值线无定义，
+    // 追踪会退化成"沿一条直线横穿整个曲面"。
+    // 实测垃圾桶（顶部环形唇边 + 锥台 + 底面圆盘）三者连成 100% 的块，27 行
+    // 全部从上沿直插到底面中心，母线间距外圈 20.4mm / 内圈 7.0mm，端点在轴心抱团。
+    //
+    // 找法**不能用 RANSAC**：锥面本身在 2.4mm 公差下就能凑出"伪平面窄带"
+    // （实测 3043 点、法向 (0.85,-0.25,0.46)，把 2726 点的底面比下去）。
+    // 改用**沿 nf 的 1mm 高度直方图**：平盘在高度场上必然是一个尖峰 ——
+    //   垃圾桶：底面 2700 点/箱 vs 锥面 ~36 点/箱；曲型板：~150 点/箱、占 1.7%。
+    // 两条判据同时满足才剥：
+    //   ① 峰值箱 ±tol 的点占块 ≥ 5%；
+    //   ② 这些点在垂直于 nf 的平面上最小宽度 ≥ 3×行距 —— 排除弯曲板被 2.4mm
+    //      薄层切出的窄条（曲型板实测宽度只有 4~5mm）。
+    // 循环最多 3 轮：一个件可能同时有顶部唇边和底面两个平盘。
+    for(int pass=0; pass<3; ++pass){
+        const double tolPl = std::min(3.0, std::max(1.5, 0.20*rowSpacing));
+        {   // 每轮用"剩下这些点"重拟合法向，第二个盘才不会被第一个盘带偏
+            Vec3 nf2, cf2;
+            if(outInl.size() >= 200 && ls_plane(P, outInl, nf2, cf2)){
+                nf2 = norm(nf2);
+                if(dot(nf2, nf) < 0) nf2 = nf2*(-1.0);
+                nf = nf2;
+            }
+        }
+        double hlo=1e18, hhi=-1e18;
+        for(int i : outInl){ double h=dot(P[i],nf); hlo=std::min(hlo,h); hhi=std::max(hhi,h); }
+        if(hhi-hlo < 2.0*tolPl) break;
+        const int nb = (int)std::floor(hhi-hlo)+1;
+        std::vector<int> hc(nb, 0);
+        for(int i : outInl){
+            int b = (int)std::floor(dot(P[i],nf)-hlo);
+            if(b<0) b=0; if(b>=nb) b=nb-1;
+            hc[b]++;
+        }
+        int bb=-1, bc=0;
+        for(int b=0;b<nb;++b) if(hc[b]>bc){ bc=hc[b]; bb=b; }
+        if(bb<0 || bc < 100) break;
+        const double hc0 = hlo + (double)bb + 0.5;
+        std::vector<int> pin; pin.reserve(outInl.size());
+        for(int i : outInl) if(std::fabs(dot(P[i],nf)-hc0) <= tolPl) pin.push_back(i);
+        if(pin.size() < 100) break;
+        const double share2 = (double)pin.size()/(double)outInl.size();
+        // 平面内 2D 最小宽度（4σ）
+        double wmin = 0.0;
+        {
+            Vec3 u = cross(nf, Vec3{0,0,1});
+            if(len(u) < 0.5) u = cross(nf, Vec3{1,0,0});
+            u = norm(u);
+            Vec3 v = norm(cross(nf, u));
+            double mu=0, mv=0;
+            for(int i : pin){ mu += dot(P[i],u); mv += dot(P[i],v); }
+            mu /= (double)pin.size(); mv /= (double)pin.size();
+            double suu=0,svv=0,suv=0;
+            for(int i : pin){
+                double a = dot(P[i],u)-mu, b = dot(P[i],v)-mv;
+                suu += a*a; svv += b*b; suv += a*b;
+            }
+            suu /= (double)pin.size(); svv /= (double)pin.size(); suv /= (double)pin.size();
+            double tr = suu+svv, det = suu*svv - suv*suv;
+            double lm = tr*0.5 - std::sqrt(std::max(0.0, tr*tr*0.25 - det));
+            wmin = 4.0*std::sqrt(std::max(0.0, lm));
+        }
+        const bool big  = (share2 >= 0.05);
+        const bool wide = (wmin >= 3.0*rowSpacing);
+        if(big && wide){
+            fprintf(stderr, "[曲面] 剥离块内平盘[%d]: %zu 点(%.1f%%) 沿nf高度=%.1fmm 宽%.1fmm\n",
+                    pass, pin.size(), share2*100.0, hc0, wmin);
+            std::vector<char> drop(n, 0);
+            for(int i : pin) drop[i] = 1;
+            std::vector<int> keep; keep.reserve(outInl.size());
+            for(int i : outInl) if(!drop[i]) keep.push_back(i);
+            if((int)keep.size() < 200) break;
+            outInl.swap(keep);
+            continue;                    // 可能还有第二个平盘
+        }
+        if(pass == 0)
+            fprintf(stderr, "[曲面] 块内平盘检查: 最大高度峰 %zu 点(%.1f%%) 宽%.1fmm → 不剥离\n",
+                    pin.size(), share2*100.0, wmin);
+        break;
     }
 
     // ---- 组装 SurfPatch ----
@@ -3349,7 +3643,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         if(seg.curved && isCurved){
             if(surf.nRow <= 0){
                 ProfStage ps("4b.曲面行追踪", &tTraj);
-                if(!gen_surface_rows(surf, L, pstep, params->fillHoleSize, params->scanDirMode)){
+                if(!gen_surface_rows(surf, L, pstep, params->fillHoleSize,
+                                     params->scanDirMode, params->speed)){
                     fprintf(stderr, "[曲面] 行追踪失败，跳过该块\n");
                     continue;
                 }

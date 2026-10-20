@@ -77,14 +77,20 @@ int main(int argc, char** argv){
     SprayTrajParams p = spray_traj_default_params();
     // 可选参数：-flat <平面拟合阈值mm>  -curve <曲面升级阈值mm>
     //           -fill <孔洞填补阈值mm>  -dir <0自动/1长边/2短边>
+    //           -row <行距mm>  -pt <点距mm>  -so <离面距离mm>  -sp <速度mm/s>
     for(int i=4;i+1<argc;++i){
         if(!strcmp(argv[i],"-flat"))  p.flatnessTol  = atof(argv[i+1]);
         if(!strcmp(argv[i],"-curve")) p.curvatureTol = atof(argv[i+1]);
         if(!strcmp(argv[i],"-fill"))  p.fillHoleSize = atof(argv[i+1]);
         if(!strcmp(argv[i],"-dir"))   p.scanDirMode  = atoi(argv[i+1]);
+        if(!strcmp(argv[i],"-row"))   p.scanRowSpacing = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-pt"))    p.pointSpacing   = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-so"))    p.standoff       = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-sp"))    p.speed          = atof(argv[i+1]);
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d\n",
-        p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode);
+    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f\n",
+        p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
+        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed);
     SprayTrajResult r = spray_traj_generate(xyz.data(), n, &p);
     if(r.error){ printf("失败: %s\n", r.error); spray_traj_free(&r); return 1; }
     printf("OK: rows=%d points=%d rms=%.3f seg_mean=%.3f seg_max=%.3f\n",
