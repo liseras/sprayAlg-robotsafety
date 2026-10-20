@@ -1557,6 +1557,100 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
         }
     }
 
+    // ---- 终局同面合并：法向接近 + 距离接近 → 必须并成同一张脸 ----
+    // 现象（现场点云 2026-08-21-11-33-13 的板边倒角）：同一条倒角带被拆成两条平行窄带
+    // （36.0°/28mm 宽 与 47.9°/18mm 宽），法向只差 11.9°、平面偏移只差 1.1mm、
+    // 点云直接相连。两块各有一套行方向、各布一套行，中间还多一次空移——
+    // 肉眼看就是"同一个面上两套乱轨迹"。
+    // 判据（必须同时满足，缺一条都会把真折边/台阶吞掉）：
+    //   ① 同向：法向夹角 <= 15°（法向接近）；
+    //   ② 距离接近：小块点到大块平面的高度 |h| 的 p95 <= 6mm（真折边过不了这条）；
+    //   ③ 相邻：KNN 图里有边横跨两面（同一次扫描的连续数据，排除同平面孤岛）；
+    //   ④ 并后仍是平面：重拟合 RMS <= max(flatnessTol, 8mm)。
+    // 与上一条"连续曲面合并"的分工：那条是 8° 硬门限（防缓翘板链式漂移），
+    // 这条用"距离极近"换角度余量，专治扫描条带把同一张窄面切成多条。
+    if(out.size() > 1 && out.size() <= 24){
+        const size_t F0 = out.size();
+        std::vector<int> lab(P.size(), -1);
+        for(size_t i=0;i<F0;++i) for(int k : out[i].inl) lab[k] = (int)i;
+        std::vector<char> adj(F0*F0, 0);
+        for(size_t i=0;i<P.size();++i){
+            int a = lab[i]; if(a < 0) continue;
+            const int* row = &knnFlat[i*(size_t)K];
+            for(int t=0;t<K;++t){
+                int j = row[t]; if(j<0) continue;
+                int b = lab[j];
+                if(b >= 0 && b != a) adj[(size_t)a*F0+b] = adj[(size_t)b*F0+a] = 1;
+            }
+        }
+        double angG = 15.0, hCap = 6.0;   // 现场实测标定；环境变量仅供标定用
+        if(const char* e = std::getenv("SPRAYTRAJ_MERGE_ANG")){ double v = atof(e); if(v > 0) angG = v; }
+        if(const char* e = std::getenv("SPRAYTRAJ_MERGE_H"))  { double v = atof(e); if(v > 0) hCap = v; }
+        const char* dumpEnv = std::getenv("SPRAYTRAJ_DUMP");
+        const bool dbg = dumpEnv && dumpEnv[0] == '1';
+        const double cosG   = std::cos(angG*3.141592653589793/180.0);
+        const double rmsCap = std::max(tol, 8.0);
+        // 法向定向（与出函数后的统一定向口径一致）：先 +Z 半球，近竖直按背离质心。
+        // 必须用有向夹角：薄板双面扫描时上下两面法向相反，夹角=0 但绝不是同一张脸。
+        Vec3 partC{0,0,0};
+        for(const auto& p : P) partC = partC + p;
+        partC = partC*(1.0/(double)std::max<size_t>(1,P.size()));
+        auto orient = [&](Vec3 n, const Vec3& c){
+            if(std::fabs(n.z) > 0.05){ if(n.z < 0) n = n*(-1.0); }
+            else if(dot(n, c - partC) < 0) n = n*(-1.0);
+            return n;
+        };
+        std::vector<std::vector<int>> members(F0);          // out[i] 由哪些原始面组成
+        for(size_t i=0;i<F0;++i) members[i] = {(int)i};
+        bool did = true;
+        while(did && out.size() > 1){
+            did = false;
+            for(size_t a=0; a<out.size() && !did; ++a){
+                for(size_t b=a+1; b<out.size() && !did; ++b){
+                    double ang = std::acos(std::max(-1.0, std::min(1.0, dot(orient(out[a].pl.n, out[a].pl.c),
+                                                                         orient(out[b].pl.n, out[b].pl.c)))))*180.0/3.141592653589793;
+                    if(ang > angG) continue;
+                    bool touch = false;
+                    for(int x : members[a]){ for(int y : members[b]) if(adj[(size_t)x*F0+y]){ touch = true; break; } if(touch) break; }
+                    if(dbg) fprintf(stderr, "[dbg] 同面候选: 面%zu-%zu 夹角%.1f° 相邻=%d\n", a, b, ang, (int)touch);
+                    if(!touch) continue;
+                    const PlaneSeg& big = out[a].inl.size() >= out[b].inl.size() ? out[a] : out[b];
+                    const PlaneSeg& sml = out[a].inl.size() >= out[b].inl.size() ? out[b] : out[a];
+                    if(sml.inl.empty()) continue;
+                    std::vector<double> hh; hh.reserve(sml.inl.size());
+                    for(int k : sml.inl) hh.push_back(std::fabs(dot(P[k]-big.pl.c, big.pl.n)));
+                    size_t q = (size_t)(0.95*(double)(hh.size()-1));
+                    std::nth_element(hh.begin(), hh.begin()+q, hh.end());
+                    double h95 = hh[q];
+                    if(dbg) fprintf(stderr, "[dbg] 同面判距: 面%zu-%zu 高度p95=%.2fmm\n", a, b, h95);
+                    if(h95 > hCap) continue;
+                    std::vector<int> all = out[a].inl;
+                    all.insert(all.end(), out[b].inl.begin(), out[b].inl.end());
+                    std::sort(all.begin(), all.end());
+                    all.erase(std::unique(all.begin(), all.end()), all.end());
+                    Vec3 nf, cf;
+                    if(!ls_plane(P, all, nf, cf)) continue;
+                    double rms = 0;
+                    for(int k : all){ double d = dot(P[k]-cf, nf); rms += d*d; }
+                    rms = std::sqrt(rms/(double)std::max<size_t>(1,all.size()));
+                    if(rms > rmsCap){
+                        if(dbg) fprintf(stderr, "[dbg] 同面合并放弃: 面%zu-%zu 重拟合RMS=%.2f > %.2f\n", a, b, rms, rmsCap);
+                        continue;
+                    }
+                    fprintf(stderr, "[split] 同面合并(法向%.1f° 距离p95=%.2fmm): 面%zu(%zu点) + 面%zu(%zu点) -> %zu点 RMS=%.2f(门限%.1f)\n",
+                            ang, h95, a, out[a].inl.size(), b, out[b].inl.size(), all.size(), rms, rmsCap);
+                    if(dot(nf, out[a].pl.n) < 0) nf = nf*(-1.0);
+                    out[a].pl = {nf, -dot(nf,cf), cf};
+                    out[a].inl = std::move(all);
+                    out.erase(out.begin()+(long)b);
+                    members[a].insert(members[a].end(), members[b].begin(), members[b].end());
+                    members.erase(members.begin()+(long)b);
+                    did = true;
+                }
+            }
+        }
+    }
+
     // 最终按点数降序：保证 plane0 永远是主面（报告/显示/配色都按此约定）
     std::stable_sort(out.begin(), out.end(), [](const PlaneSeg&a, const PlaneSeg&b){
         return a.inl.size() > b.inl.size(); });
