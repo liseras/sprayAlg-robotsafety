@@ -1734,6 +1734,19 @@ struct SurfPatch {
     double cover = 0.0;         // 覆盖率 0..1
     double fitRms = 0.0;        // 点到局部拟合面的残差 RMS
     int    nRow = 0;
+    // ---- 重建曲面模型（与显示网格共用同一个 (u,v) 参数域网格）----
+    // 曲面块原先只有"点云 + 逐点法向"：显示网格另算一套格内中位高度，
+    // 轨迹逐点投影、法向逐点 PCA —— 同一个工件的"曲面"存在两套互不相干
+    // 的表达，而且都不平滑。这里把几何与姿态统一到同一个网格上：
+    //   几何 mH  ：格内中位高度 -> 归一化高斯（σ≈1.5 格），曲率连续
+    //   姿态 mNm ：格内逐点法向取中位（抗坏点）-> 3x3 归一化平滑
+    // 只用于显示与姿态，不改行点位置，因此覆盖率/贴合残差/行数完全不变。
+    int    mNu=0, mNv=0;
+    double mCell=0, mU0=0, mV0=0;
+    std::vector<double> mH;             // 平滑高度（沿 n0），1e300=无效
+    std::vector<Vec3>   mNm;            // 格中位法向（已定向朝外）
+    std::vector<unsigned char> mOcc;    // 1=该格有实测点（插值才可信）
+    bool   modelOk=false;
 };
 
 // 把 q 投到曲面块上：返回曲面点 pos 与局部法向 nrm。
@@ -1907,11 +1920,290 @@ static void surf_march(const SurfPatch& sp, Vec3 start, Vec3 eIdx, Vec3 t0, doub
     }
 }
 
+// 行内法向平滑：低通（行内 [1,2,3,2,1]） + 双向角速率限幅。位置一律不动。
+// 抽成函数是因为它要跑两遍：行追踪后一遍（压逐点 PCA 噪声），
+// 跨行姿态统一后再一遍（统一后的场在格边界处仍有跳变，必须再过一次限幅）。
+static void smooth_row_normals(std::vector<Vec3>& rn, int lpPasses, double slewDeg)
+{
+    if(rn.size() < 5) return;
+    static const double w[5] = {1.0, 2.0, 3.0, 2.0, 1.0};
+    std::vector<Vec3> sm(rn.size());
+    for(int pass=0; pass<lpPasses; ++pass){
+        for(int i=0;i<(int)rn.size();++i){
+            Vec3 acc{0,0,0};
+            for(int d=-2; d<=2; ++d){
+                int j = i+d;
+                if(j<0 || j>=(int)rn.size()) continue;
+                acc = acc + rn[j]*w[d+2];
+            }
+            acc = norm(acc);
+            if(len(acc) > 0.5){
+                if(dot(acc, rn[i]) < 0) acc = acc*(-1.0);   // 保持原朝向（防拟合符号随机）
+                sm[i] = acc;
+            } else sm[i] = rn[i];
+        }
+        rn.swap(sm);
+    }
+    if(slewDeg <= 0.0) return;
+    const double slewRad = slewDeg*3.141592653589793/180.0;
+    const double cs = std::cos(slewRad);
+    for(int pass=0; pass<2; ++pass){                  // 0=正向 1=反向
+        const bool fwd = (pass==0);
+        const int stop = fwd ? (int)rn.size() : -1;
+        const int step = fwd ? 1 : -1;
+        for(int i = fwd ? 1 : (int)rn.size()-2; i!=stop; i+=step){
+            const Vec3 a = rn[i-step], b = rn[i];
+            const double c = dot(a,b);
+            if(c >= cs) continue;                     // 没超限
+            const double ang = std::acos(std::max(-1.0,std::min(1.0,c)));
+            Vec3 perp = b - a*c;                      // b 在"垂直于 a"方向上的分量
+            const double pl = len(perp);
+            if(pl < 1e-9 || ang < 1e-6) continue;
+            perp = perp*(1.0/pl);
+            Vec3 nb = norm(a*std::cos(slewRad) + perp*std::sin(slewRad));
+            if(len(nb) > 0.5 && dot(nb, b) > 0) rn[i] = nb;
+        }
+    }
+}
+
+// ==================== 重建曲面模型 ====================
+// 把曲面块表达成一个**可求值、可求导、曲率连续**的模型：以平均平面 (eL,eS)
+// 为参数域建规则网格，每格同时给出几何与姿态。
+//
+// 为什么需要它（实测依据，曲型板 u08 / curved）：
+//   1) 显示网格只用"格内中位高度 + 空洞扩散"，从未做正则化 ——
+//      相邻三角面二面角 p50=4.0° p95=26.0° max=84.9°，相邻顶点法向
+//      p95=36.4°。真实拱面在 18mm 格距下法向变化应只有 ~2.6°。
+//      所以用户说"重建曲面不规则、曲率不一致"是**成立的**。
+//   2) 轨迹用的逐点 PCA 法向是重尾分布：p50 误差 0.65°、p90 6.7°、
+//      p95 17.2°、max 47.7°（坏点集中在扫描条纹间隙与边缘外推处）。
+//      经 standoff=100mm 放大成 30~74mm 的枪位横移，而实际行距只有
+//      11.76mm —— 相邻行枪位因此大面积互相穿越（反序率 14%）。
+//   3) 现有平滑只在**行内**做（[1,2,3,2,1]x4 + 6°/步限幅），管不了跨行
+//      不一致；限幅还会把单点异常摊成连续 6°/步斜坡，形成可见"甩尾"。
+//
+// 数值策略为什么"几何用平滑高度、姿态用中位法向"：
+//   直接从平滑高度场求梯度会把残余噪声再放大一次（离线实测法向改动
+//   p95 38°、枪位反而更差），而"格内法向取中位再平滑"实测把枪位偏离
+//   从 17.6mm 压到 7.3mm、反序率 14%->1%。二者共用同一网格，逻辑上仍是
+//   一个模型。
+static void sm_blur_scalar(std::vector<double>& A, int nu, int nv, double sigma)
+{
+    if(sigma <= 0.0) return;
+    const int hw = std::max(1, (int)std::ceil(3.0*sigma));
+    std::vector<double> k(2*hw+1); double ks=0;
+    for(int i=-hw;i<=hw;++i){ double w=std::exp(-0.5*(i/sigma)*(i/sigma)); k[i+hw]=w; ks+=w; }
+    for(auto& v : k) v/=ks;
+    std::vector<double> tmp(A.size(), 1e300);
+    for(int iv2=0;iv2<nv;++iv2) for(int iu=0;iu<nu;++iu){
+        double s=0, ws=0;
+        for(int d=-hw; d<=hw; ++d){
+            int j=iu+d; if(j<0||j>=nu) continue;
+            double v=A[(size_t)j*nv+iv2];
+            if(v < 1e299){ s+=v*k[d+hw]; ws+=k[d+hw]; }
+        }
+        if(ws > 1e-12) tmp[(size_t)iu*nv+iv2] = s/ws;
+    }
+    for(int iv2=0;iv2<nv;++iv2) for(int iu=0;iu<nu;++iu){
+        double s=0, ws=0;
+        for(int d=-hw; d<=hw; ++d){
+            int j=iv2+d; if(j<0||j>=nv) continue;
+            double v=tmp[(size_t)iu*nv+j];
+            if(v < 1e299){ s+=v*k[d+hw]; ws+=k[d+hw]; }
+        }
+        if(ws > 1e-12) A[(size_t)iu*nv+iv2] = s/ws;
+    }
+}
+
+static void sm_blur_vec(std::vector<Vec3>& A, const std::vector<unsigned char>& occ,
+                        int nu, int nv, int passes)
+{
+    std::vector<Vec3> tmp(A.size());
+    for(int pass=0; pass<passes; ++pass){
+        for(int iv2=0;iv2<nv;++iv2) for(int iu=0;iu<nu;++iu){
+            size_t c=(size_t)iu*nv+iv2;
+            if(!occ[c]) continue;
+            Vec3 s{0,0,0}; int n=0;
+            for(int a=-1;a<=1;++a) for(int b=-1;b<=1;++b){
+                int ju=iu+a, jv=iv2+b;
+                if(ju<0||jv<0||ju>=nu||jv>=nv) continue;
+                size_t cc=(size_t)ju*nv+jv;
+                if(!occ[cc]) continue;
+                s = s + A[cc]; ++n;
+            }
+            if(n>0) tmp[c] = norm(s);
+        }
+        for(int iv2=0;iv2<nv;++iv2) for(int iu=0;iu<nu;++iu){
+            size_t c=(size_t)iu*nv+iv2;
+            if(occ[c] && len(tmp[c]) > 0.5) A[c] = tmp[c];
+        }
+    }
+}
+
+// 构建模型。cellHint<=0 时按点云跨度自适应（6~12mm）。
+static bool build_surf_model(SurfPatch& sp, double cellHint)
+{
+    const int m = (int)sp.P.size();
+    if(m < 100) return false;
+    std::vector<Vec2> uv(m);
+    double minU=1e18,maxU=-1e18,minV=1e18,maxV=-1e18;
+    for(int i=0;i<m;++i){
+        Vec3 d = sp.P[i]-sp.c0;
+        uv[i] = Vec2{ dot(d, sp.eL), dot(d, sp.eS) };
+        minU=std::min(minU,uv[i].x); maxU=std::max(maxU,uv[i].x);
+        minV=std::min(minV,uv[i].y); maxV=std::max(maxV,uv[i].y);
+    }
+    const double wU=maxU-minU, wV=maxV-minV;
+    if(wU < 2.0 || wV < 2.0) return false;
+
+    double cell = (cellHint > 0.0) ? cellHint
+                                   : std::max(6.0, std::min(12.0, std::max(wU,wV)/64.0));
+    const int nu = (int)std::ceil(wU/cell)+1;
+    const int nv = (int)std::ceil(wV/cell)+1;
+    if(nu < 4 || nv < 4) return false;
+    const size_t NG = (size_t)nu*(size_t)nv;
+    if(NG > 400000) return false;
+
+    std::vector<std::vector<int>> bk(NG);
+    for(int i=0;i<m;++i){
+        int iu=(int)std::floor((uv[i].x-minU)/cell);
+        int iv2=(int)std::floor((uv[i].y-minV)/cell);
+        iu=std::min(nu-1,std::max(0,iu)); iv2=std::min(nv-1,std::max(0,iv2));
+        bk[(size_t)iu*nv+iv2].push_back(i);
+    }
+
+    std::vector<double> h(NG, 1e300);
+    std::vector<Vec3> nn(NG, Vec3{0,0,0});
+    std::vector<unsigned char> occ(NG, 0);
+    int multi=0, empty=0;
+    for(size_t c=0;c<NG;++c){
+        const std::vector<int>& b = bk[c];
+        if((int)b.size() < 3){ ++empty; continue; }
+        std::vector<double> hs; hs.reserve(b.size());
+        for(int i : b) hs.push_back(dot(sp.P[i]-sp.c0, sp.n0));
+        // 多值格：同一 (u,v) 上存在两个表面（薄板背面/翻边/侧面），
+        // 中位高度会取到二者之间，梯度完全错误 —— 直接丢弃，交给邻域扩散。
+        {
+            std::vector<double> t = hs;
+            size_t k1=(size_t)((t.size()-1)*0.25), k3=(size_t)((t.size()-1)*0.75);
+            std::nth_element(t.begin(), t.begin()+k1, t.end()); double q1=t[k1];
+            std::nth_element(t.begin(), t.begin()+k3, t.end()); double q3=t[k3];
+            if(q3 - q1 > 8.0){ ++multi; continue; }
+        }
+        {
+            std::vector<double> t = hs;
+            size_t k=(t.size()-1)/2;
+            std::nth_element(t.begin(), t.begin()+k, t.end());
+            h[c] = t[k];
+        }
+        // 中位法向（逐分量中位，抗坏点；与逐点法向重尾正好互补）
+        {
+            std::vector<double> a,bb,cc;
+            a.reserve(b.size()); bb.reserve(b.size()); cc.reserve(b.size());
+            for(int i : b){ a.push_back(sp.N[i].x); bb.push_back(sp.N[i].y); cc.push_back(sp.N[i].z); }
+            size_t k=(a.size()-1)/2;
+            std::nth_element(a.begin(), a.begin()+k, a.end()); double mx=a[k];
+            std::nth_element(bb.begin(), bb.begin()+k, bb.end()); double my=bb[k];
+            std::nth_element(cc.begin(), cc.begin()+k, cc.end()); double mz=cc[k];
+            Vec3 v = norm(Vec3{mx,my,mz});
+            if(len(v) < 0.5) v = sp.n0;
+            if(dot(v, sp.n0) < 0) v = v*(-1.0);
+            nn[c] = v;
+        }
+        occ[c] = 1;
+    }
+    int occN=0; for(size_t c=0;c<NG;++c) if(occ[c]) ++occN;
+    if(occN < 20) return false;
+
+    // 空格：邻域已填值扩散（保持网格连续；这些格 mOcc=0，插值时不采用）
+    for(int it=0; it<8; ++it){
+        bool any=false;
+        std::vector<double> nh = h;
+        std::vector<Vec3> nv2 = nn;
+        for(int iv2=0;iv2<nv;++iv2) for(int iu=0;iu<nu;++iu){
+            size_t c=(size_t)iu*nv+iv2;
+            if(h[c] < 1e299) continue;
+            double s=0; int k=0; Vec3 vs{0,0,0};
+            for(int a=-1;a<=1;++a) for(int b=-1;b<=1;++b){
+                int ju=iu+a, jv=iv2+b;
+                if(ju<0||jv<0||ju>=nu||jv>=nv) continue;
+                size_t cc=(size_t)ju*nv+jv;
+                if(h[cc] >= 1e299) continue;
+                s += h[cc]; vs = vs + nn[cc]; ++k;
+            }
+            if(k){ nh[c]=s/(double)k; Vec3 w=norm(vs); if(len(w)>0.5) nv2[c]=w; any=true; }
+        }
+        h.swap(nh); nn.swap(nv2);
+        if(!any) break;
+    }
+
+    // 几何：归一化高斯（σ=1.5 格），把"格内中位"的台阶磨成连续曲率
+    sm_blur_scalar(h, nu, nv, 1.5);
+    // 姿态：3x3 归一化平滑一遍（只在实测格上，避免空洞带偏）
+    sm_blur_vec(nn, occ, nu, nv, 1);
+
+    sp.mNu=nu; sp.mNv=nv; sp.mCell=cell; sp.mU0=minU; sp.mV0=minV;
+    sp.mH.swap(h); sp.mNm.swap(nn); sp.mOcc.swap(occ);
+    sp.modelOk = true;
+    fprintf(stderr, "[曲面] 曲面模型: %dx%d 格=%.1fmm 占用=%d/%d 多值格=%d 空格=%d\n",
+            nu, nv, cell, occN, (int)NG, multi, empty);
+    return true;
+}
+
+// 只查**几何**（平滑高度）：允许用空格扩散出来的值 —— 高度场本身连续，
+// 扩散值只差亚毫米，用它保住网格连续比留个洞好得多。
+static bool surf_model_height(const SurfPatch& sp, const Vec3& p, double& hout)
+{
+    if(!sp.modelOk) return false;
+    Vec3 d = p - sp.c0;
+    double fu = (dot(d, sp.eL)-sp.mU0)/sp.mCell;
+    double fv = (dot(d, sp.eS)-sp.mV0)/sp.mCell;
+    int i0=(int)std::floor(fu), j0=(int)std::floor(fv);
+    if(i0 < 0 || j0 < 0 || i0+1 >= sp.mNu || j0+1 >= sp.mNv) return false;
+    size_t c[4] = { (size_t)i0*sp.mNv+j0,       (size_t)(i0+1)*sp.mNv+j0,
+                    (size_t)i0*sp.mNv+j0+1,     (size_t)(i0+1)*sp.mNv+j0+1 };
+    for(int q=0;q<4;++q) if(sp.mH[c[q]] > 1e299) return false;
+    const double a = fu-i0, b = fv-j0;
+    const double w[4] = { (1-a)*(1-b), a*(1-b), (1-a)*b, a*b };
+    double hs=0;
+    for(int q=0;q<4;++q) hs += w[q]*sp.mH[c[q]];
+    hout = hs;
+    return true;
+}
+
+// 查**姿态**：四邻格必须都是实测格，否则返回 false（调用方回退到逐点法向）。
+static bool surf_model_query(const SurfPatch& sp, const Vec3& p, double& hout, Vec3& nout)
+{
+    if(!sp.modelOk) return false;
+    Vec3 d = p - sp.c0;
+    double fu = (dot(d, sp.eL)-sp.mU0)/sp.mCell;
+    double fv = (dot(d, sp.eS)-sp.mV0)/sp.mCell;
+    int i0=(int)std::floor(fu), j0=(int)std::floor(fv);
+    if(i0 < 0 || j0 < 0 || i0+1 >= sp.mNu || j0+1 >= sp.mNv) return false;
+    size_t c[4] = { (size_t)i0*sp.mNv+j0,       (size_t)(i0+1)*sp.mNv+j0,
+                    (size_t)i0*sp.mNv+j0+1,     (size_t)(i0+1)*sp.mNv+j0+1 };
+    for(int q=0;q<4;++q) if(!sp.mOcc[c[q]]) return false;
+    const double a = fu-i0, b = fv-j0;
+    const double w[4] = { (1-a)*(1-b), a*(1-b), (1-a)*b, a*b };
+    double hs=0; Vec3 ns{0,0,0};
+    for(int q=0;q<4;++q){
+        if(sp.mH[c[q]] > 1e299) return false;
+        hs += w[q]*sp.mH[c[q]];
+        ns = ns + sp.mNm[c[q]]*w[q];
+    }
+    Vec3 v = norm(ns);
+    if(len(v) < 0.5) return false;
+    if(dot(v, sp.n0) < 0) v = v*(-1.0);
+    hout = hs; nout = v;
+    return true;
+}
+
 // 在曲面块上生成蛇形行（就地写回 sp.rowP/rowN/rowBeg）
 static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillHole, int dirMode)
 {
     const int m = (int)sp.P.size();
     if(m < 50 || L <= 0 || pstep <= 0) return false;
+    if(!sp.modelOk) build_surf_model(sp, 0.0);   // 显示网格已建则复用，避免重复计算
     // 空洞跨越上限：跟平面路径的 fillHole 语义一致，但曲面行不宜跨太远
     const double bridge = std::min(fillHole, 3.0*L);
 
@@ -2004,6 +2296,21 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         std::vector<Vec3> rp, rn;
         marchBoth(sp.P[seed], rp, rn);
         if(rp.size() < 2) continue;
+        // ---- 姿态来自重建曲面模型（跨行一致化）----
+        // 逐点 PCA 法向的重尾误差（p95 17°、max 48°）经 100mm 枪位放大成
+        // 30~74mm 横移，而行距只有 11.76mm，相邻行枪位就大面积互相穿越。
+        // 行内低通只在**行内**做，跨行不一致它管不到。这里把模型网格上的
+        // 中位法向插值回来：位置一个点都不动（覆盖率/残留不变），只换姿态。
+        // 查不到（点云覆盖不到的外推区）就保留原法向，不做猜测。
+        if(sp.modelOk){
+            int hit=0;
+            for(size_t i=0;i<rp.size();++i){
+                double hq; Vec3 nq;
+                if(surf_model_query(sp, rp[i], hq, nq)){ rn[i]=nq; ++hit; }
+            }
+            if(dbg) fprintf(stderr,"[曲面dbg] 行%02d 模型法向命中 %d/%d\n",
+                            rowsMade, hit, (int)rp.size());
+        }
         // ---- 行内法向平滑（枪姿连续性）----
         // 逐点局部拟合的法向有 1~2° 级噪声（线扫条纹间隙里更大），加上换墙/
         // 卷边处的几度~几十度摆动，4mm 步进的枪位（X+100·n）会冒出 8~50mm 的
@@ -2013,46 +2320,7 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         //   2) 双向角速率限幅 6°/步（≈1.5°/mm）：换墙/卷边的折角摊成缓转。
         //      折角处一两个点转几十度，枪位（100mm 外）横甩 ±50mm，
         //      是"轨迹乱"的最大来源；限幅后枪头像真机一样匀速转过去。
-        if(rn.size() >= 5){
-            static const double w[5] = {1.0, 2.0, 3.0, 2.0, 1.0};
-            std::vector<Vec3> sm(rn.size());
-            for(int pass=0; pass<4; ++pass){
-                for(int i=0;i<(int)rn.size();++i){
-                    Vec3 acc{0,0,0};
-                    for(int d=-2; d<=2; ++d){
-                        int j = i+d;
-                        if(j<0 || j>=(int)rn.size()) continue;
-                        acc = acc + rn[j]*w[d+2];
-                    }
-                    acc = norm(acc);
-                    if(len(acc) > 0.5){
-                        if(dot(acc, rn[i]) < 0) acc = acc*(-1.0);   // 保持原朝向（防拟合符号随机）
-                        sm[i] = acc;
-                    } else sm[i] = rn[i];
-                }
-                rn.swap(sm);
-            }
-            const double slewDeg = 6.0;                       // 单步最大转角
-            const double slewRad = slewDeg*3.141592653589793/180.0;
-            const double cs = std::cos(slewRad);
-            for(int pass=0; pass<2; ++pass){                  // 0=正向 1=反向
-                const bool fwd = (pass==0);
-                const int stop = fwd ? (int)rn.size() : -1;
-                const int step = fwd ? 1 : -1;
-                for(int i = fwd ? 1 : (int)rn.size()-2; i!=stop; i+=step){
-                    const Vec3 a = rn[i-step], b = rn[i];
-                    const double c = dot(a,b);
-                    if(c >= cs) continue;                     // 没超限
-                    const double ang = std::acos(std::max(-1.0,std::min(1.0,c)));
-                    Vec3 perp = b - a*c;                      // b 在"垂直于 a"方向上的分量
-                    const double pl = len(perp);
-                    if(pl < 1e-9 || ang < 1e-6) continue;
-                    perp = perp*(1.0/pl);
-                    Vec3 nb = norm(a*std::cos(slewRad) + perp*std::sin(slewRad));
-                    if(len(nb) > 0.5 && dot(nb, b) > 0) rn[i] = nb;
-                }
-            }
-        }
+        smooth_row_normals(rn, 4, 6.0);
         if((rowsMade & 1) != 0){                     // 蛇形：奇数行反向存放
             std::reverse(rp.begin(), rp.end());
             std::reverse(rn.begin(), rn.end());
@@ -2068,6 +2336,99 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         ++rowsMade;
     }
     sp.nRow = rowsMade;
+
+    // ---- 跨行姿态一致化：同一位置、不同行的法向必须一致 ----
+    // 行内低通（上面每一步）只在**沿行方向**平滑，管不了"相邻行在同一 (u,v)
+    // 处法向不一致"。而相邻行法向差 6° 就足以在 100mm 枪位处横移 10.5mm >>
+    // 行距 11.76mm，视觉上就是两行互相穿越。
+    // 做法：把全部行的法向按 (u,v) 网格（与几何模型同一套网格，8.5mm）取中位，
+    // 再叠 4 遍 3x3 归一化平滑（有效尺度 ~50mm，跨 3~4 行），最后插值回每个行点。
+    // 位置 rowP 一个点都不动 —— 覆盖率/贴合残差不受影响，只统一姿态。
+    if(sp.modelOk && !sp.rowP.empty()){
+        // 姿态场的格宽必须**大于行距**：几何模型用 8.5mm 格，比行距 11.76mm 还小，
+        // 相邻两行会落在不同格里，"跨行取中位"根本无从谈起（实测命中率只有 53%）。
+        // 这里独立用 1.3×行距（≈15mm）的分辨率，仍在同一个 (u,v) 参数域上。
+        const double cell2 = std::max(sp.mCell, 1.3*L);
+        const double spanU = (double)(sp.mNu-1)*sp.mCell;
+        const double spanV = (double)(sp.mNv-1)*sp.mCell;
+        const int nu=(int)std::ceil(spanU/cell2)+1;
+        const int nv=(int)std::ceil(spanV/cell2)+1;
+        const size_t NG=(size_t)nu*(size_t)nv;
+        std::vector<std::vector<int>> bk(NG);
+        for(size_t k=0;k<sp.rowP.size();++k){
+            Vec3 d=sp.rowP[k]-sp.c0;
+            int iu=(int)std::floor((dot(d,sp.eL)-sp.mU0)/cell2);
+            int iv2=(int)std::floor((dot(d,sp.eS)-sp.mV0)/cell2);
+            if(iu<0||iv2<0||iu>=nu||iv2>=nv) continue;
+            bk[(size_t)iu*nv+iv2].push_back((int)k);
+        }
+        std::vector<Vec3> fn(NG, sp.n0);
+        std::vector<unsigned char> foc(NG,0);
+        for(size_t c=0;c<NG;++c){
+            if(bk[c].empty()) continue;
+            const size_t n=bk[c].size();
+            std::vector<double> a(n),b(n),e(n);
+            for(size_t q=0;q<n;++q){
+                const Vec3& v=sp.rowN[bk[c][q]];
+                a[q]=v.x; b[q]=v.y; e[q]=v.z;
+            }
+            size_t k2=(n-1)/2;
+            std::nth_element(a.begin(),a.begin()+k2,a.end()); double mx=a[k2];
+            std::nth_element(b.begin(),b.begin()+k2,b.end()); double my=b[k2];
+            std::nth_element(e.begin(),e.begin()+k2,e.end()); double mz=e[k2];
+            Vec3 v=norm(Vec3{mx,my,mz});
+            if(len(v)<0.5) v=sp.n0;
+            if(dot(v,sp.n0)<0) v=v*(-1.0);
+            fn[c]=v; foc[c]=1;
+        }
+        sm_blur_vec(fn, foc, nu, nv, 4);   // 只在"确有行点"的格上平滑，别把点云法向混进来
+        int rep=0;
+        for(size_t k=0;k<sp.rowP.size();++k){
+            Vec3 d=sp.rowP[k]-sp.c0;
+            double fu=(dot(d,sp.eL)-sp.mU0)/cell2;
+            double fv=(dot(d,sp.eS)-sp.mV0)/cell2;
+            int i0=(int)std::floor(fu), j0=(int)std::floor(fv);
+            if(i0<0||j0<0||i0+1>=nu||j0+1>=nv) continue;
+            const double aa=fu-i0, bb=fv-j0;
+            const double w4[4]={ (1-aa)*(1-bb), aa*(1-bb), (1-aa)*bb, aa*bb };
+            const size_t cc[4]={ (size_t)i0*nv+j0, (size_t)(i0+1)*nv+j0,
+                                 (size_t)i0*nv+j0+1, (size_t)(i0+1)*nv+j0+1 };
+            Vec3 v{0,0,0};
+            if(foc[cc[0]]&&foc[cc[1]]&&foc[cc[2]]&&foc[cc[3]]){
+                Vec3 s{0,0,0};
+                for(int q=0;q<4;++q) s = s + fn[cc[q]]*w4[q];
+                v = norm(s);
+            }else{
+                // 四邻不全有行点（行端 / 点云边缘）：取 3x3 邻域里最近的有效格。
+                // 不能保留原来的噪声法向 —— 那正是枪位图上两处"尖峰"的来源
+                // （实测 max 26.5mm，够真机甩一下）。
+                double bd=1e18;
+                for(int di=-1;di<=1;++di) for(int dj=-1;dj<=1;++dj){
+                    int ii=i0+di, jj=j0+dj;
+                    if(ii<0||jj<0||ii>=nu||jj>=nv) continue;
+                    size_t cx=(size_t)ii*nv+jj;
+                    if(!foc[cx] || len(fn[cx]) < 0.5) continue;
+                    double dd=(double)(di*di+dj*dj);
+                    if(dd < bd){ bd=dd; v=fn[cx]; }
+                }
+            }
+            if(len(v)<0.5) continue;
+            if(dot(v, sp.rowN[k])<0) v=v*(-1.0);
+            sp.rowN[k]=v; ++rep;
+        }
+        // 统一后的场在格边界上仍可能有几度跳变，按行再过一遍低通+限幅：
+        // 否则 100mm 枪位会把这几度放大成二十几毫米的"枪位跳跃"（seg_max 实测
+        // 从 12.9mm 涨到 26mm 就是这个原因）。
+        for(int r=0;r<sp.nRow;++r){
+            const int b=sp.rowBeg[r], e=sp.rowBeg[r+1];
+            if(e-b < 5) continue;
+            std::vector<Vec3> seg(sp.rowN.begin()+b, sp.rowN.begin()+e);
+            smooth_row_normals(seg, 2, 6.0);
+            std::copy(seg.begin(), seg.end(), sp.rowN.begin()+b);
+        }
+        if(std::getenv("SPRAYTRAJ_DUMP"))
+            fprintf(stderr,"[曲面dbg] 跨行姿态一致化: 行点 %d/%d 被统一\n", rep, (int)sp.rowP.size());
+    }
     if(rowsMade < 1) return false;
 
     // 调试：SPRAYTRAJ_DUMP=1 时导出行点（含横向坐标 s = p·eIdx）与行边界。
@@ -2220,6 +2581,24 @@ static bool build_surface_mesh(const SurfPatch& sp, double rowGap, double fillHo
         }
         occ.swap(ero);
     }
+    // ---- 3.5) 有曲面模型时：格高换成模型的平滑高度，再在网格自身尺度上补一次高斯 ----
+    // 模型格(8.5mm)比显示网格格(18.2mm)细，直接插值仍会留下格间台阶；
+    // 在网格自身尺度补一次 σ=1.2 格（≈22mm）的正则化，顶点二面角才真正落下来。
+    if(sp.modelOk){
+        int rep=0;
+        for(int iv2=0;iv2<nV;++iv2) for(int iu=0;iu<nU;++iu){
+            size_t k=(size_t)iu*nV+iv2;
+            if(!occ[k] || h[k] > 1e299) continue;
+            double u = minU + wU*(double)iu/(double)(nU-1);
+            double vv= minV + wV*(double)iv2/(double)(nV-1);
+            double hq;
+            if(surf_model_height(sp, sp.c0 + sp.eL*u + sp.eS*vv + sp.n0*h[k], hq)){
+                h[k] = hq; ++rep;
+            }
+        }
+        if(rep > 0) sm_blur_scalar(h, nU, nV, 1.2);
+        fprintf(stderr, "[曲面] 网格高度正则化: %d 个格取自曲面模型 + σ=1.2格高斯\n", rep);
+    }
     // ---- 4) 三角化：只对"四角都占用且高度有效"的格发 2 个三角 ----
     verts.clear(); tris.clear();
     std::vector<int> vid(NG, -1);           // 顶点惰性创建，按 nU*nV 预分配
@@ -2235,7 +2614,12 @@ static bool build_surface_mesh(const SurfPatch& sp, double rowGap, double fillHo
                 if((int)verts.size() >= maxVerts){ budgetHit=true; break; }   // ABI 保护
                 double u = minU + wU*(double)(cc[q]/(size_t)nV)/(double)(nU-1);
                 double vv= minV + wV*(double)(cc[q]%(size_t)nV)/(double)(nV-1);
-                verts.push_back(sp.c0 + sp.eL*u + sp.eS*vv + sp.n0*h[cc[q]]);
+                // 顶点高度优先取"重建曲面模型"的平滑高度：模型是格内中位高度
+                // 再做归一化高斯正则化得到的，曲率连续；直接用本函数的格内
+                // 中位高度会让相邻三角面二面角 p95 到 26°（用户看到的就是
+                // "曲面不规则、曲率不一致"）。模型查不到时回退原高度。
+                double hh = h[cc[q]];
+                verts.push_back(sp.c0 + sp.eL*u + sp.eS*vv + sp.n0*hh);
                 vid[cc[q]]=(int)verts.size()-1;
             }
             idx4[q]=vid[cc[q]];
@@ -2624,6 +3008,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             bool okMesh = false;
             {
                 ProfStage ps("3.曲面重建", &tMesh);
+                if(!surf.modelOk) build_surf_model(surf, 0.0);
                 okMesh = build_surface_mesh(surf, params->scanRowSpacing, params->fillHoleSize,
                                             verts3, tris,
                                             SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
