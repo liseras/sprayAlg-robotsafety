@@ -159,7 +159,9 @@ L0 没闭环之前，L1/L2 的结论都不可信。**先做 L0 与 L1，再谈 L
 2. curved 保持 14+4 行 / 11.76mm / 92.2% / 8.88mm / `seg_mean 4.843` / `seg_max 9.038`。
 3. 安全层**只能新增文件**，不许改 `spray_traj.cpp` / `spray_traj.h` / `Native.cs`；
    确需改 ABI 时必须单开 issue 并同步更新 C# 与基线。
-4. `master` 的文档（HANDOFF / PROMPT）只在合并回主干时更新，避免两边冲突。
+4. **文档归属**：`HANDOFF_交接说明.md` / `PROMPT_接手提示词.md` / 本文档都随 **`master`** 走——
+   改文档直接提到 master，分支定期 `merge master` 同步，避免两边各写一版、互相覆盖。
+   分支上只放**代码与阶段报告**（`robot_safety/` 目录）。
 
 ---
 
