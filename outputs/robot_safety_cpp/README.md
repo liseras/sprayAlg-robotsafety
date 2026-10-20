@@ -245,13 +245,13 @@ SprayTrajViewer.exe --ply xxx.ply --auto --safety 1 --tab 1 --view iso \
 `--safety` 不给就完全不调安全层，行为与以前一模一样（实测日志里 0 条 `SAFETY`）。
 `--shot` 只截 3D 视图，`--shot-win` 截整窗（含结论卡）。
 
-**已验证**（`E:/tmp_build/wpf_*.png`，日志见 `%TEMP%\SprayTrajViewer.log`）：
+**已验证**（截图在 `wpf_shots/`，日志见 `%TEMP%\SprayTrajViewer.log`）：
 
-| 样本 | 结论 | 关键数字 | 耗时 |
-|---|---|---|---|
-| `tray` | PASS | 1323/1323 可达 · 最小间隙 54.87mm · 喷角 2.9/20/20° | 50 ms |
-| `complex` | PASS WITH WARNINGS | 4989/4989 · 最小间隙 19.87mm · 喷角 11.9/45/60° · 回退 116 点 | 883 ms |
-| `longstripe` | REJECT | 11497/11558 · 最小间隙 **−20.86mm** · P0=82 | 13.4 s（22 万点） |
+| 样本 | 结论 | 关键数字 | 耗时 | 截图 |
+|---|---|---|---|---|
+| `tray` | PASS | 1323/1323 可达 · 最小间隙 54.87mm · 喷角 2.9/20/20° | 50 ms | `tray_pass.png` / `tray_pass_safety_tab.png` |
+| `complex` | PASS WITH WARNINGS | 4989/4989 · 最小间隙 19.87mm · 喷角 11.9/45/60° · 回退 116 点 | 883 ms | `complex_warnings.png` |
+| `longstripe` | REJECT | 11497/11558 · 最小间隙 **−20.86mm** · P0=82 | 13.4 s（22 万点） | `longstripe_reject.png` |
 
 三组读数与 `spray_safety.exe` 命令行版逐项一致；界面导出的 CSV 与命令行输出逐点对比，
 间隙最大差 0.01mm、倾角 0°、TCP 0.0024mm（都是 CSV 小数位舍入）。
