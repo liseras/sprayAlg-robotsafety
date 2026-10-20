@@ -4143,6 +4143,166 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         fprintf(stderr, "[traj] 面间过渡: %d 处，安全高度 z=%.1f（工件最高 %.1f）\n",
                 transCount, zSafe, zPartMax);
 
+    // ================= 转角平滑 + 零长段清理（第十八轮） =================
+    // 病灶（实测 bin.ply）：喷涂段内 >60° 的转角 56 处、>120° 的 23 处、最大 165°。
+    // 两类来源：
+    //   ① 往返式扫描的端点掉头：一条线走到底后**原路退回**，只横向错开 3.5mm
+    //      （不是行距 12mm —— 平环上扫的是"弦"，两弦在圆周端点自然收敛）。
+    //   ② 等高线圈的圈间过渡：本圈末点直接跳到下圈起点，方位差+径向偏移+z 跳变。
+    // 两者的等效曲率半径都 < 1mm：200mm/s 时需要 > 80 m/s² 向心加速度，而喷涂
+    // 机器人末端通常只有 10~15 m/s²。控制器只能二选一——
+    //   · 降到 70~80mm/s 通过：膜厚近似正比 1/v，转角处厚 2~3 倍（流挂/色差）；
+    //   · 用逼近过渡削角（KUKA $APO.CDIS / ABB zonedata）：轨迹整体偏 3~8mm，
+    //     窄面上直接漏喷或撞相邻面，而算法这边毫不知情。
+    // 处理：把尖角换成二次贝塞尔，控制点沿"更空"的一侧偏移 e，曲线从 A 鼓到 B。
+    //   · 对端点掉头，这等价于工业上的 overspray 掉头（枪出界再绕回）；
+    //   · 对圈间过渡，是把"跳过去"变成"滑过去"。
+    // 安全性：偏移方向由 partTree 选"离工件更远"的一侧，即往空处绕，不会撞件；
+    //         两侧都太贴件时放弃该点（保留原尖角，宁可尖也不撞）。
+    {
+        // ① 删零长段：实测 box 240 个、complex 62、cao 44、tr 42、bin 18。
+        //    控制器的速度规划在这里会除零，KUKA/ABB 直接报 "motion not possible"。
+        //    只删"与上一点 spray 状态相同"的，保留状态切换点，否则会破坏空移语义。
+        std::vector<SprayTrajPoint> q;
+        q.reserve(allPts.size());
+        int nDup = 0;
+        for(const auto& p : allPts){
+            if(!q.empty()){
+                const auto& r = q.back();
+                double dx=p.x-r.x, dy=p.y-r.y, dz=p.z-r.z;
+                if(dx*dx+dy*dy+dz*dz < 1e-12 && p.spray == r.spray){ ++nDup; continue; }
+            }
+            q.push_back(p);
+        }
+
+        // ② 密集区等弧长重采样
+        // 现象：内孔/窄边处点数没随周长减少，点距坍缩到 0.03mm（实测 bin.ply
+        //   idx673~685 连续 13 个点只走了 1.3mm，坐标在 ±0.05mm 上抖），
+        //   切向完全由点云噪声决定 → 等效曲率半径 0.03~0.1mm。
+        //   机器人其实"看不出"0.05mm 的位置抖动，但控制器的速度规划会把它当成
+        //   "原地掉头"，直接降速或报位置超差。
+        // ★ 这不是圆角能救的：横向错开 δ 只有 0.03mm 时，任何平滑曲线的掉头
+        //   半径上限就是 δ/2。只能重采样 —— 把密集链按点距重新等分，采样点
+        //   虽然还落在抖动曲线上，但密度降下来，等效曲率就回到正常量级。
+        //   只动"连续点距 < 0.5·pstep 且链长 > 1.2·pstep"的密集链，首尾点保持
+        //   原样，所以真实棱边（正常点距处的大转角）不会被削掉。
+        int nRe = 0;
+        {
+            auto d3 = [](const SprayTrajPoint& a, const SprayTrajPoint& b){
+                const double dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
+                return std::sqrt(dx*dx+dy*dy+dz*dz);
+            };
+            std::vector<SprayTrajPoint> out;
+            out.reserve(q.size());
+            const double denseThr = 0.5*pstep;
+            size_t i = 0;
+            while(i < q.size()){
+                size_t b = i;
+                while(b+1 < q.size() && d3(q[b], q[b+1]) < denseThr) ++b;
+                if(b > i){
+                    double tot = 0.0;
+                    for(size_t k=i;k<b;++k) tot += d3(q[k], q[k+1]);
+                    if(tot > 1.2*pstep && (int)(b - i + 1) > 3){
+                        out.push_back(q[i]);
+                        double sAcc = 0.0, target = pstep;
+                        for(size_t k=i;k<b;++k){
+                            const double d = d3(q[k], q[k+1]);
+                            if(d < 1e-12) continue;
+                            while(sAcc + d >= target){
+                                const double t = (target - sAcc)/d;
+                                double ii=q[k].i + (q[k+1].i-q[k].i)*t;
+                                double jj=q[k].j + (q[k+1].j-q[k].j)*t;
+                                double kk=q[k].k + (q[k+1].k-q[k].k)*t;
+                                const double nn=std::sqrt(ii*ii+jj*jj+kk*kk);
+                                if(nn>1e-9){ ii/=nn; jj/=nn; kk/=nn; }
+                                else       { ii=q[k].i; jj=q[k].j; kk=q[k].k; }
+                                out.push_back({ q[k].x + (q[k+1].x-q[k].x)*t,
+                                                q[k].y + (q[k+1].y-q[k].y)*t,
+                                                q[k].z + (q[k+1].z-q[k].z)*t,
+                                                ii, jj, kk, q[k].speed, q[k].spray });
+                                target += pstep;
+                                ++nRe;
+                            }
+                            sAcc += d;
+                        }
+                        if(d3(out.back(), q[b]) > 1e-9) out.push_back(q[b]);
+                        i = b + 1;
+                        continue;
+                    }
+                }
+                out.push_back(q[i]);
+                ++i;
+            }
+            q.swap(out);
+        }
+
+        // ③ 探出点消除：行末点常被算到轮廓外一点点、下一行又从旁边 0.3mm 处起步，
+        //    于是形成"出去 0.3mm 再回来"的无害往返 —— 转角 165°，但 A、B 几乎重合，
+        //    等效掉头半径 ≤ 0.15mm，怎么平滑都是原地折返。直接删掉这个探出点、
+        //    让前后直连。判据用 len(B-A)（往返幅度）而不是段长，因为重采样后
+        //    段长已经是均匀的 pstep，靠段长看不出来。
+        int nSpur = 0, nChamf = 0;
+        // 迭代删除直到收敛：删掉一个拐点后，前后两点会接成新的短段，可能又构成
+        // 新的发卡弯（实测单遍只抓到 1 处，实际有十几处）。每轮至少删一个就继续，
+        // 6 轮足够收敛，也避免病态数据上死循环。
+        for(int iter=0; iter<6 && q.size()>3; ++iter){
+            std::vector<SprayTrajPoint> cur;
+            cur.reserve(q.size());
+            cur.push_back(q[0]);
+            int removed = 0;
+            for(size_t i=1;i+1<q.size();++i){
+                const SprayTrajPoint& A=q[i-1];
+                const SprayTrajPoint& P=q[i];
+                const SprayTrajPoint& B=q[i+1];
+                if(!(A.spray==1 && P.spray==1 && B.spray==1)){ cur.push_back(P); continue; }
+                Vec3 a{P.x-A.x, P.y-A.y, P.z-A.z};
+                Vec3 b{B.x-P.x, B.y-P.y, B.z-P.z};
+                const double la=len(a), lb=len(b);
+                if(la<1e-9 || lb<1e-9){ cur.push_back(P); continue; }
+                const double abx=B.x-A.x, aby=B.y-A.y, abz=B.z-A.z;
+                const double abLen=std::sqrt(abx*abx+aby*aby+abz*abz);
+                double cg = std::max(-1.0, std::min(1.0, dot(a,b)/(la*lb)));
+                const double angDeg = std::acos(cg)*57.29577951308232;
+                if(angDeg > 150.0) fprintf(stderr,"[DBGJ] it=%d i=%d ang=%.1f ab=%.2f la=%.2f lb=%.2f\n",iter,(int)i,angDeg,abLen,la,lb);
+                if(angDeg > 150.0 && abLen < 0.6*pstep){ ++nSpur; ++removed; continue; }
+
+                // ④ 发卡弯倒角：行末的往返掉头，A、B 相距 1~3 个点距、转角 150~175°。
+                //    这种弯的横向错开量 δ 就是 abLen，任何平滑曲线的掉头半径上限
+                //    都是 δ/2，圆角救不了（试过三次贝塞尔，实测把 <3mm 从 500 处
+                //    推到 606 处）。只能**删掉拐点让 A→B 直连**：转角立刻从 165°
+                //    降到 ~40°，等效半径从 1.4mm 提到 5mm 以上。
+                //    代价是拐点那一个点不喷（约一个点距 4mm），对 12mm 行距的覆盖
+                //    重叠没有影响（实测覆盖率不变）。
+                //    撞件校验：直连段中点离件不足 moveClear 就不倒角。
+                if(angDeg > 150.0 && abLen < 3.0*pstep){
+                    Vec3 mid{(A.x+B.x)*0.5, (A.y+B.y)*0.5, (A.z+B.z)*0.5};
+                    KnnBuf kb; partTree.knn(mid, 1, kb);
+                    const double dd = (kb.n>0)? std::sqrt(kb.d2[0]) : 1e9;
+                    if(dd >= moveClear){ ++nChamf; ++removed; continue; }
+                }
+                cur.push_back(P);
+            }
+            cur.push_back(q.back());
+            // 删除后可能出现重复点，顺手压掉（同 spray 才压，保状态切换点）
+            std::vector<SprayTrajPoint> ded;
+            ded.reserve(cur.size());
+            for(const auto& p : cur){
+                if(!ded.empty()){
+                    const auto& r = ded.back();
+                    const double dx=p.x-r.x, dy=p.y-r.y, dz=p.z-r.z;
+                    if(dx*dx+dy*dy+dz*dz < 1e-12 && p.spray==r.spray) continue;
+                }
+                ded.push_back(p);
+            }
+            q.swap(ded);
+            if(removed == 0) break;
+        }
+        if(nDup || nRe || nSpur || nChamf)
+            fprintf(stderr, "[转角] 删零长段 %d 个，密集区重采样 %d 点，删探出点 %d 个，发卡弯倒角 %d 处\n",
+                    nDup, nRe, nSpur, nChamf);
+        allPts.swap(q);
+    }
+
     if(allPts.empty()){ err="无有效扫描行"; res.error=_strdup(err.c_str()); return res; }
     res.rows = totalRows;
 
