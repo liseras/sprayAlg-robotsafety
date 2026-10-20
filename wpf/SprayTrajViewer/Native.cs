@@ -97,6 +97,7 @@ namespace SprayTrajViewer
         public int    azFallback;       // 1=允许换倾斜方位兜底
         public int    maxCloudPoints;   // 保留（<=0 = 用全量点云）
         public int    threads;          // 并行线程数（1=单线程，结果可复现）
+        public int    azMode;           // 进刀侧策略：0=按机器人站位逐行择优（默认）；1=只用「向上」
     }
 
     // 违规位（与 RS_VIOL_* 一致）
@@ -183,6 +184,8 @@ namespace SprayTrajViewer
         public int    baseAuto;
         public int    cloudPoints;
         public double cloudSpacingMm;
+        public int    azRows;        // 方位角决策单元数（= 轨迹行数）
+        public int    azStanceRows;  // 其中实际改用「站位侧」的行数（azMode=1 时恒为 0）
         public int    l0Issues;
         public double standoffMedianMm;
         public IntPtr error;         // const char*

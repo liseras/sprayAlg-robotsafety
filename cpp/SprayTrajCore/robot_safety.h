@@ -42,6 +42,7 @@ typedef struct RobotSafetyParams {
     int    azFallback;       // 1=允许把「上翻方位」左右偏 30/60° 兜底
     int    maxCloudPoints;   // 保留字段（<=0 = 不抽稀，用全量点云；KD-tree 支撑全量查询）
     int    threads;          // 并行线程数（<=1 = 单线程，结果可复现；生产建议 = 物理核数）
+    int    azMode;           // 进刀侧策略：0=按机器人站位逐行择优（默认）；1=只用「向上」（旧口径，供对拍）
 } RobotSafetyParams;
 
 // ---------------------------------------------------------------- 违规位
@@ -119,6 +120,9 @@ typedef struct RobotSafetyResult {
     int    baseAuto;         // 1 = 基座位姿是猜的（不是标定值）
     int    cloudPoints;      // 参与判定的点数（抽稀后）
     double cloudSpacingMm;   // 点云平均间距
+
+    int    azRows;           // 方位角决策单元数（= 笔画数：按折返切，不是"连续 spray 段"）
+    int    azStanceRows;     // 其中**实际生效**地改用「站位侧」的笔画数（被逐点回退的不算）
 
     int    l0Issues;         // L0 输入层自检问题数（吊臂余量 / 反推喷距不一致），非 0 时结论不可信
     double standoffMedianMm; // 沿枪轴反推的喷距中位数（<0 = 未测到）

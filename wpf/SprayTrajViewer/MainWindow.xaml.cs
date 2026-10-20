@@ -126,6 +126,8 @@ namespace SprayTrajViewer
             if (o.TryGetValue("flip", out v)) CmbNormalFlip.SelectedIndex = Math.Clamp(int.TryParse(v, out var fi) ? fi : 0, 0, 1);
             // --tab 1：启动就停在「机器人安全」页（UI 探针截图用）
             if (o.TryGetValue("tab", out v)) Tabs.SelectedIndex = Math.Clamp(int.TryParse(v, out var ti) ? ti : 0, 0, 1);
+            // --azmode 1：切回「只用向上」的旧口径（与 spray_safety -azmode 1 等价）
+            if (o.TryGetValue("azmode", out v)) CmbAzMode.SelectedIndex = (int.TryParse(v, out var azm) && azm == 1) ? 1 : 0;
 
             // 显示项（显式给值时才改，避免把用户默认勾选状态打乱）
             if (o.TryGetValue("show-cloud", out v)) ChkShowCloud.IsChecked = v != "0";
@@ -730,6 +732,8 @@ namespace SprayTrajViewer
             p.threads = Math.Clamp((int)ParseDouble(TxtThreads.Text, defThreads), 1, 64);
             // 点云体素：0=全量精判。>0 只用于在线预判，薄壁件会偏乐观（见 README 的量化数据）。
             p.voxelMm = Math.Max(0, ParseDouble(TxtVoxel.Text, 0));
+            // 进刀侧：0=按机器人站位逐行择优（默认），1=只用「向上」（旧口径，用于和历史存档对拍）
+            p.azMode = CmbAzMode.SelectedIndex == 1 ? 1 : 0;
 
             double[]? basePose = BuildBasePose();
             var pts = _lastTraj.ToArray();
@@ -826,6 +830,11 @@ namespace SprayTrajViewer
                           (sum.minClearanceMm < 0 ? "  ← 穿透" : ""));
             sb.AppendLine($"　枪体 {ToolDesc()}　连杆 {LinkDesc()}");
             sb.AppendLine($"喷角 均值 {sum.tiltMeanDeg:F1}° · p95 {sum.tiltP95Deg:F1}° · 最大 {sum.tiltMaxDeg:F1}°");
+            // 进刀侧：说明"姿势是谁定的"——重力（向上）还是机器人站位。
+            // 只报**实际生效**的行数：改判了但被逐点回退掉的不算（否则数字会虚高）。
+            sb.AppendLine(p.azMode == 1
+                ? $"进刀侧：全部向上（旧口径，{sum.azRows} 行）"
+                : $"进刀侧：{sum.azRows} 行中 {sum.azStanceRows} 行按站位侧（其余沿法向上）");
             sb.AppendLine($"喷距守恒偏差 {sum.standoffMaxErrMm:E2} mm");
             if (sum.poseReverted > 0)
                 sb.AppendLine($"平滑回退 {sum.poseReverted} 点（碰撞优先于姿态连续）");

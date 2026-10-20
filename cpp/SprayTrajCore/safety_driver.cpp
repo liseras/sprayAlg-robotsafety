@@ -346,13 +346,19 @@ int main(int argc, char** argv) {
                    (int)offsetof(RobotSafetyPoint, violation));
             printf("  Res.byRule=%d basePose=%d error=%d\n", (int)offsetof(RobotSafetyResult, byRule),
                    (int)offsetof(RobotSafetyResult, basePose), (int)offsetof(RobotSafetyResult, error));
+            // 新增字段的偏移也要报：C# 侧用 Marshal.OffsetOf 对这几个数，
+            // 只对总尺寸不够（字段整体错位时总尺寸常常还是对的）。
+            printf("  Res.azRows=%d azStanceRows=%d · Params.azMode=%d\n",
+                   (int)offsetof(RobotSafetyResult, azRows), (int)offsetof(RobotSafetyResult, azStanceRows),
+                   (int)offsetof(RobotSafetyParams, azMode));
             return 0;
         }
     }
     if (argc < 4) {
         printf("用法: spray_safety <traj.csv> <cloud.ply> <out.csv> [选项]\n");
         printf("      -standoff -safety -search -tool -tilt -tiltmax -rate -sprayang\n");
-        printf("      -threads <n>  -stride <n>  -voxel <mm>  -base <x y z rx ry rz>  -quiet\n");
+        printf("      -threads <n>  -stride <n>  -voxel <mm>  -azmode <0|1>  -base <x y z rx ry rz>  -quiet\n");
+        printf("      -azmode 0 = 按机器人站位逐行择优进刀侧（默认）；1 = 只用「向上」（旧口径）\n");
         return 2;
     }
     const char* trajPath = argv[1];
@@ -376,6 +382,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-threads") && i + 1 < argc) p.threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-stride") && i + 1 < argc) p.linkStride = std::max(1, atoi(argv[++i]));
         else if (!strcmp(argv[i], "-voxel") && i + 1 < argc) p.voxelMm = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-azmode") && i + 1 < argc) p.azMode = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-quiet")) quiet = true;
         else if (!strcmp(argv[i], "-base") && i + 6 < argc) {
             double x = atof(argv[i + 1]), y = atof(argv[i + 2]), z = atof(argv[i + 3]);
@@ -536,6 +543,15 @@ int main(int argc, char** argv) {
         }
         if (wi >= 0)
             printf("  连杆/关节最近：%s  %+.2fmm（idx %d）\n", segName(wk, wj0, wj1).c_str(), worst, wi);
+    }
+    // 进刀侧：这一行数字说明"姿势是被谁定的"——是重力（向上）还是机器人站位。
+    {
+        int rs = r.azRows > 0 ? r.azRows : 0;
+        if (rs > 0)
+            printf("  进刀侧：%d 行中 %d 行改用站位侧（其余沿法向上）%s\n", rs, r.azStanceRows,
+                   p.azMode == 1 ? "  [已锁定为只向上]" : "");
+        else
+            printf("  进刀侧：单行轨迹，按站位侧择优\n");
     }
     if (r.baseAuto) printf("  ⚠ 基座位姿为自动假设（未给 -base），可达率与连杆碰撞结论依赖它\n");
     if (r.l0Issues) printf("  ⚠ L0 输入层自检有 %d 项问题（详见 -standoff / 臂展），结论需谨慎\n", r.l0Issues);

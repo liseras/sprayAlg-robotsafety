@@ -923,17 +923,48 @@ struct TrajIn {
     V3 normal(int i) const { return -gun[i]; }
 };
 
+// 「行」的定义：**一笔**（走完一趟、掉头之前的那段连续运动），不是"一段连续 spray"。
+//
+// 这个区别是致命的：母版生成器跨折返**不关喷**，所以 longstripe 的 45 笔在 CSV 里只有
+// 2 个 spray 连续段（11044 + 511 点）。按 spray 段当行，等于把 22 笔当成 1 行 ——
+// 方位角只能取一个（22 笔朝向不同的壁共用一个进刀侧）、倾角"只升不降"的平滑会跨折返
+// 传递（上一笔的高倾角把下一笔整段抬起来）。
+//
+// 折返判据用**水平投影**方向掉头：与"本笔起始方向"夹角 > 120°（dot < −0.5）即断行。
+// 不用三维方向是因为曲面/法向变化会让三维步长抖动；而折返在水平面上一定是掉头。
+// 断点落在折返圆弧里（≈120° 处），正是两笔之间该断开的位置。
+// 阈值取 120° 而不是 90°：曲面上的笔画本身会连续转向，90° 会把一笔正常弯道切成两行。
 void computeRows(const TrajIn& t, std::vector<std::pair<int, int>>& rows) {
     rows.clear();
+    const double kRevCos = -0.5;      // cos120°
+    const int kMinRowPts = 4;         // 短于此不再断，避免折返圆弧里连着断出碎片行
     int n = t.n(), i = 0;
     while (i < n) {
         if (!t.spray[i]) {
             ++i;
             continue;
         }
-        int j = i;
-        while (j + 1 < n && t.spray[j + 1]) ++j;
-        rows.push_back({i, j});
+        int a = i, j = i;
+        double hx = 0.0, hy = 0.0;
+        bool hasH = false;
+        while (j + 1 < n && t.spray[j + 1]) {
+            V3 st = t.pos[j + 1] - t.pos[j];
+            double L = std::sqrt(st.x * st.x + st.y * st.y);
+            if (L > 1e-9) {
+                double ux = st.x / L, uy = st.y / L;
+                if (!hasH) {
+                    hx = ux; hy = uy; hasH = true;
+                } else if (ux * hx + uy * hy < kRevCos && (j - a + 1) >= kMinRowPts) {
+                    rows.push_back({a, j});
+                    a = j + 1;
+                    hx = ux; hy = uy;      // 新一笔的起始方向
+                    ++j;
+                    continue;
+                }
+            }
+            ++j;
+        }
+        rows.push_back({a, j});
         i = j + 1;
     }
 }
@@ -957,6 +988,7 @@ struct Params {
     double voxelMm = 0.0;
     int linkStride = 1;
     int threads = 1;
+    bool azStance = true;    // true = 按机器人站位逐行择优；false = 只用「向上」（旧口径）
     bool includeBase = false;
     bool fixTransit = true;
     bool azFallback = true;
@@ -1015,6 +1047,8 @@ public:
     V3 toBaseP(const V3& p) const { return m3mul(baseRT_, p - baseT_); }
     M3 toBaseR(const M3& R) const { return m3mul(baseRT_, R); }
     V3 toCloudP(const V3& p) const { return m3mul(baseR_, p) + baseT_; }
+    // 基座原点（点云系）。方位决策要用它判"机器人从哪一侧够过来"。
+    V3 baseOrigin() const { return baseT_; }
 
     // 给定枪身朝外方向 d（倾斜后的法向 n'），求 IK + 碰撞 + 自碰撞。
     // **工具 +Z 是 −d**：d 是从工件指向枪的外法向，工具 +Z 是喷射方向（法兰→喷嘴）= −d。
@@ -1137,6 +1171,44 @@ inline void tiltAxisAndDir(const V3& nIn, V3& axis, V3& uUp) {
     axis = unit(cross(n, uUp));
 }
 
+// 该法向**需要多大倾角**（0 = 正朝上，α=90° 侧壁时给满 tiltNonUpDeg）。
+// 抽成独立函数是因为行级方位打分也要用它 —— 两处若各写一份，
+// 打分用的倾角和真正执行的倾角会悄悄分叉，A/B 结论就不可信了。
+inline double tiltNeedDeg(const V3& nIn, const Params& p) {
+    V3 n = unit(nIn);
+    double alphaDeg = std::acos(std::max(-1.0, std::min(1.0, n.z))) * kRad;
+    double t = p.tiltNonUpDeg * (alphaDeg / 90.0);
+    if (t > p.tiltMaxDeg) t = p.tiltMaxDeg;
+    // 朝下的悬垂面：往上扳会把枪顶进工件本体，这条路物理上不成立，不做线性外推
+    if (n.z < -0.7) t = 0.0;
+    return t;
+}
+
+// 「站位侧」方位角：机器人基座相对该加工点在哪一侧，枪就往那一侧倾。
+//   u  = (base - face) 在切平面上的投影（指向基座）
+//   方位角按 dirOf 的约定给：az 是 uUp 绕 n 右手旋转的角度。
+// 为什么不用"向上"当默认：向上只是"重力上方通常空旷"的经验代理，
+// 内腔里上方往往正对着对面的壁；而基座必然立在件外，从基座侧压进来
+// 天然不需要把腕子伸进腔体里。两种都可能是错的，所以下面按**实测**择优。
+// 退化（基座几乎在法向延长线上，如平放件的正上方）→ 返回 nan，表示无倾向。
+inline double stanceAzDeg(const V3& nIn, const V3& face, const V3& base,
+                          const V3& uUp, const V3& axis) {
+    if (norm(axis) < 1e-6 || norm(uUp) < 1e-6) return std::numeric_limits<double>::quiet_NaN();
+    V3 n = unit(nIn);
+    V3 toBase = base - face;
+    double L = norm(toBase);
+    if (L < 1e-6) return std::numeric_limits<double>::quiet_NaN();
+    V3 u = toBase - n * dot(toBase, n);
+    // 切向分量 < sin(20°)·|toBase| ⇔ 基座基本在法向上，没有"哪一侧"可言
+    if (norm(u) < 0.34 * L) return std::numeric_limits<double>::quiet_NaN();
+    u = unit(u);
+    double az = std::atan2(dot(u, cross(n, uUp)), dot(u, uUp)) * kRad;
+    // 归一化到 (-180, 180]
+    while (az <= -180.0) az += 360.0;
+    while (az > 180.0) az -= 360.0;
+    return az;
+}
+
 // ================================================================ 主规划
 
 struct VioCount {
@@ -1150,8 +1222,10 @@ struct VioCount {
 };
 
 // 第 i 点「至少需要多大倾角 / 要不要换方位」
+//   azPref：本行的进刀侧方位（行级决策的结果；0 = 向上）。逐点不再自己决定方位，
+//           因为方位角是"枪从哪一侧压过来"，逐点变等于沿轨迹反复拧腕，实机不可执行。
 void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
-              const double* seed, const V3* refX, bool checkLinks,
+              const double* seed, const V3* refX, bool checkLinks, double azPref,
               double& outTilt, double& outAz, PR& outPR, bool& hasPR) {
     V3 n = t.normal(i);
     V3 face = t.pos[i] + t.gun[i] * p.standoff;
@@ -1163,11 +1237,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     // 比侧壁更倒挂的面（α>90°）继续线性增长，直到上限。
     // 阶梯做法在 45° 边界上产生 20° 的阶跃，反映到轨迹上就是相邻点倾角突跳，
     // 实机过不了；线性化之后法向连续 → α 连续 → 倾角需求连续。
-    double alphaDeg = std::acos(std::max(-1.0, std::min(1.0, n.z))) * kRad;
-    double tilt0 = p.tiltNonUpDeg * (alphaDeg / 90.0);
-    if (tilt0 > p.tiltMaxDeg) tilt0 = p.tiltMaxDeg;
-    // 朝下的悬垂面：往上扳会把枪顶进工件本体，这条路物理上不成立，不做线性外推
-    if (n.z < -0.7) tilt0 = 0.0;
+    double tilt0 = tiltNeedDeg(n, p);
 
     V3 axis, uUp;
     tiltAxisAndDir(n, axis, uUp);
@@ -1179,7 +1249,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     }
 
     std::vector<std::pair<double, double>> cand;
-    cand.push_back({tilt0, 0.0});          // 线性基准值原样先试（贴合需求，不无谓加大）
+    cand.push_back({tilt0, azPref});       // 线性基准值 + 本行进刀侧，先试这一发（贴合需求，不无谓加大）
     if (!degenerate) {
         // 之后的搜索走**固定 5° 网格**，不能锚在 tilt0 上等距偏移。
         // tilt0 随法向连续变化，若候选 = tilt0 + k·step，候选值会随 α 一起漂移：
@@ -1188,7 +1258,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
         double g = std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg;
         while (g <= tilt0 + 1e-9) g += p.tiltStepDeg;   // 网格首档必须严格大于 tilt0
         for (double tt = g; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg)
-            cand.push_back({tt, 0.0});
+            cand.push_back({tt, azPref});
     }
 
     bool hasBest = false;
@@ -1244,17 +1314,27 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     }
 
     // 兜底：换倾斜方位（有些内壁往上扳会顶到对面的壁）
+    // 方位清单围绕**本行进刀侧**展开；进刀侧本身不是"向上"时，把向上也留作最后一档
+    // —— 站位侧可能正对着对面的壁，那时候"往上"反而是唯一空的方向。
     if (p.azFallback && !degenerate && flatRun < 4) {
-        const double azs[4] = {30.0, -30.0, 60.0, -60.0};
+        std::vector<double> azs;
+        azs.push_back(azPref + 30.0);
+        azs.push_back(azPref - 30.0);
+        azs.push_back(azPref + 60.0);
+        azs.push_back(azPref - 60.0);
+        if (std::fabs(azPref) > 1e-9) azs.push_back(0.0);
         const double ttBase[4] = {10.0, 25.0, 40.0, 55.0};
-        for (int k = 0; k < 4; ++k) {
+        for (double az : azs) {
+            // 归一到 (-180,180]，并夹掉因 ±180 撞车的重复候选（如 azPref=180 时 +30/-30 同一条线）
+            while (az <= -180.0) az += 360.0;
+            while (az > 180.0) az -= 360.0;
             for (int m = 0; m < 4; ++m) {
                 double tt = std::max(std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg, ttBase[m]);
                 if (tt > p.tiltMaxDeg + 1e-9) continue;
                 PR got;
-                if (tryCand(tt, azs[k], got)) {
+                if (tryCand(tt, az, got)) {
                     outTilt = tt;
-                    outAz = azs[k];
+                    outAz = az;
                     outPR = got;
                     hasPR = true;
                     return;
@@ -1271,7 +1351,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
         return;
     }
     outTilt = tilt0;
-    outAz = 0.0;
+    outAz = azPref;
     hasPR = false;
 }
 
@@ -1340,6 +1420,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.azFallback = 1;
     p.maxCloudPoints = 0;
     p.threads = 1;           // 默认单线程：结果可复现，便于对拍/回归
+    p.azMode = 0;            // 默认「按站位逐行择优」；1 = 只用向上（旧口径）
     return p;
 }
 
@@ -1415,6 +1496,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         p.fixTransit = s.fixTransit != 0;
         p.azFallback = s.azFallback != 0;
         p.threads = s.threads > 0 ? s.threads : d.threads;
+        // 语义：0（含零初始化结构）= 默认＝按站位择优；只有显式填 1 才退回旧口径
+        p.azStance = (s.azMode != 1);
     }
 
     // ---- 点云索引
@@ -1494,6 +1577,18 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
 
     Evaluator ev(cloud, base, p);
 
+    int nThreads = std::max(1, std::min(p.threads, 64));
+
+    // 点 → 行 的归属在建行之后就定死，阶段 0/1/3 都按它取行级方位
+    std::vector<int> rowOf(n, -1);
+    for (size_t ri = 0; ri < rows.size(); ++ri)
+        for (int i = rows[ri].first; i <= std::min(rows[ri].second, n - 1); ++i) rowOf[i] = (int)ri;
+
+    std::vector<char> stanceRow(rows.size(), 0);   // 该行方位是否被改判为「站位侧」
+    // ---- 进刀侧（方位角）逐行决策放在「阶段 2」之后 —— 必须先有真实倾角，
+    // 否则判的是 tilt0 那个位姿，而实际执行倾角常常大 20~30°，P0 结论会反号（见阶段 2 末尾）。
+    int azStanceRows = 0;
+
     // ---- 阶段 1：每点的倾角需求（带 IK 种子连续性）
     std::vector<double> need(n, 0.0), azOf(n, 0.0);
     std::vector<char> hasCache(n, 0);
@@ -1503,7 +1598,6 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     // 逐点独立求解（只借用"上一点的解"当 IK 种子加速收敛），所以可以按块并行：
     // 每块内部仍串行传递种子，块首用解析种子自启。块大小取 n/(线程数·4)，
     // 让尾块不至于拖尾（长件上点耗时差异很大：臂展中心的点快、边缘的点慢）。
-    int nThreads = std::max(1, std::min(p.threads, 64));
     int chunk = std::max(1, n / (nThreads * 4));
 
     auto runRange = [&](int b0, int e0) {
@@ -1516,8 +1610,10 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             double tilt = 0.0, az = 0.0;
             PR pr;
             bool has = false;
+            // 阶段 1 一律按「向上」找倾角：方位要等倾角定下来才谈得上（见阶段 2 末尾）。
+            // 这也保证了"旧口径安全的样本"在阶段 1 得到与旧版完全相同的倾角与缓存。
             needTilt(ev, p, t, i, hasSeed ? prevTheta : nullptr, hasRefX ? &prevX : nullptr,
-                     checkLinks, tilt, az, pr, has);
+                     checkLinks, 0.0, tilt, az, pr, has);
             need[i] = tilt;
             azOf[i] = az;
             if (has) {
@@ -1558,14 +1654,18 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     smoothOnlyUp(finalTilt, rows, p.tiltRateDeg);
 
     // 方位：同一行内有任一点需要换方位 → 整行统一用该方位（否则倾斜方向逐点跳，姿态更乱）。
-    // 取该行出现次数最多的非零方位；并列时取较小的（与 numpy.unique+argmax 同口径）。
+    // 基准值取阶段 0 的行级决策（azStance=false 时恒为 0 = 向上，与旧口径逐字节一致）。
+    // 取该行出现次数最多的方位；并列时取较小的（与 numpy.unique+argmax 同口径）。
     std::vector<double> azRow(rows.size(), 0.0);
-    std::vector<int> rowOf(n, -1);
     for (size_t ri = 0; ri < rows.size(); ++ri) {
         int a = rows[ri].first, b = rows[ri].second;
         std::vector<double> vals;
-        for (int i = a; i <= b; ++i)
-            if (std::fabs(azOf[i]) > 1e-9) vals.push_back(std::round(azOf[i] * 1000.0) / 1000.0);
+        for (int i = a; i <= b; ++i) {
+            // 旧口径只统计非零方位（0 是默认值，投它等于没投）；
+            // 站位口岸位非零，0 就变成了一个**有意义的候选**，必须一起投票。
+            if (std::fabs(azOf[i]) > 1e-9)
+                vals.push_back(std::round(azOf[i] * 1000.0) / 1000.0);
+        }
         if (!vals.empty()) {
             std::sort(vals.begin(), vals.end());
             double bestV = vals[0];
@@ -1582,7 +1682,137 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             }
             azRow[ri] = bestV;
         }
-        for (int i = a; i <= b; ++i) rowOf[i] = (int)ri;
+    }
+
+    // 说明：曾在这里加过"拿到真实倾角后复核方位"的一轮（阶段 2.5），实测是负收益，
+    // 已删。原因写在阶段 0 的注释里：复核用的是抽样，判断与阶段 3 的 poseCmp（逐点）
+    // 不一致时会整行被 poseCmp 退回旧位姿 —— complex 上花了 15~20% 时间，
+    // 输出与旧口径逐字节相同。要真正按"最差点"决策，就必须整行逐点评估两个方位，
+    // 那是 2× 阶段 1 的开销（阶段 1 已占 84%），产线不接受。
+    // ---- 阶段 2.5：进刀侧（方位角）逐行决策
+    //
+    // 为什么必须放在这里（倾角已定之后），而不是更早：
+    // 早期版本在阶段 1 之前就定方位，只能用 tilt0 打分。实测 complex 上就是这么翻车的
+    // —— 那行执行倾角是 40~55°（倾角搜索为了躲碰撞自己加上去的），而 tilt0 只有 20°，
+    // 在 tilt0 上"向上撞、站位不撞"，到真倾角上完全不成立：换完方位冒出 110 点关节超限，
+    // 间隙从 77mm 掉到 37mm。**判 P0 必须判真正要执行的那个位姿。**
+    //
+    // 方位角只能是行级常量（它描述"枪从哪一侧压过来"，逐点变等于沿轨迹反复拧腕，
+    // 实机执行不了），所以决策也在行级：候选只有 0（向上，旧口径）与站位侧。
+    // 两者都不是先验正确的 —— 向上只是"重力上方通常空旷"的代理，内腔里上方常常正对
+    // 对面的壁；站位侧则可能隔着工件本体。所以按实测择优，并且：
+    //   1. 只在 P0（穿透 / 自碰撞 / 不可达）上严格改善才换；
+    //   2. 采样先稀后密，稀采样看不出优势就直接放弃，看出优势再密集确认。
+    // 于是"旧口径本来安全的样本"逐字节不变，方位只在旧口径真的撞了的行上动手。
+    {
+        struct AzScore {
+            int hit = 0;        // 枪体/连杆 穿透点数
+            int selfHit = 0;    // 自碰撞点数
+            int unreach = 0;    // IK 解不出
+            int jointBad = 0;   // 超软限位 / 余量不足（只统计，不参与换方位决策）
+            int sing = 0;       // 近奇异（只统计）
+            double minClr = 1e300;
+        };
+        auto p0Wins = [](const AzScore& a, const AzScore& b) {
+            if (a.hit != b.hit) return a.hit < b.hit;
+            if (a.unreach != b.unreach) return a.unreach < b.unreach;
+            return a.selfHit < b.selfHit;
+        };
+        // 按**该点实际执行倾角** finalTilt[i] 打分
+        auto scoreAz = [&](int a, int b, double az, int S) {
+            AzScore s;
+            int len = b - a + 1;
+            S = std::min(S, len);
+            for (int k = 0; k < S; ++k) {
+                int i = (S <= 1) ? a : a + (int)((long long)k * (len - 1) / (S - 1));
+                if (t.spray[i] == 0) continue;          // 过渡点位置可改，不参与方位决策
+                V3 n = t.normal(i);
+                V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                V3 axis, uUp;
+                tiltAxisAndDir(n, axis, uUp);
+                if (norm(uUp) < 1e-6) continue;
+                double tilt = finalTilt[i];
+                V3 d = dirOf(n, uUp, axis, tilt, az);
+                PR pr;
+                if (!ev.eval(face, d, nullptr, nullptr, tilt, az, true, pr)) { ++s.unreach; continue; }
+                if (pr.clrTool < 0.0 || pr.clrLink < 0.0) ++s.hit;
+                if (pr.selfGap < 0.0) ++s.selfHit;
+                if (pr.over || pr.margin < p.jointMarginMin) ++s.jointBad;
+                if (pr.cond > p.condMax) ++s.sing;
+                if (std::isfinite(pr.clearance) && pr.clearance < s.minClr) s.minClr = pr.clearance;
+            }
+            return s;
+        };
+        auto decideRow = [&](size_t ri) {
+            int a = rows[ri].first, b = rows[ri].second;
+            if (b < a) return;
+            int im = a + (b - a) / 2;
+            V3 n = t.normal(im);
+            V3 face = t.pos[im] + t.gun[im] * p.standoff;
+            V3 axis, uUp;
+            tiltAxisAndDir(n, axis, uUp);
+            double azs = stanceAzDeg(n, face, ev.baseOrigin(), uUp, axis);
+            // 无倾向（基座在法向延长线上）或与当前方位几乎重合 → 不做无谓计算
+            if (!std::isfinite(azs) || std::fabs(azs - azRow[ri]) < 5.0) return;
+            // 候选必须包含**当前真正执行的方位**：它常常已经不是 0 —— 阶段 1 的兜底
+            // （azPref±30/60）会把整行投成 ±30。早期版本拿"0"当基准、见到非零就跳过，
+            // 结果最需要救的 longstripe 两行（azRow=±30）根本没进决策，阶段 2.5 只花 0.3ms。
+            std::vector<double> cands{azRow[ri]};
+            if (std::fabs(0.0 - azRow[ri]) >= 5.0) cands.push_back(0.0);
+            cands.push_back(azs);
+            int len = b - a + 1;
+            // 稀采样先筛：只有出现了"不是当前方位"的赢家才值得上密集采样
+            int best = 0;
+            AzScore bestS = scoreAz(a, b, cands[0], 5);
+            for (size_t k = 1; k < cands.size(); ++k) {
+                AzScore s = scoreAz(a, b, cands[k], 5);
+                if (p0Wins(s, bestS)) { bestS = s; best = (int)k; }
+            }
+            if (best == 0) return;
+            int Sd = std::min(120, std::max(8, len / 20));
+            bestS = scoreAz(a, b, cands[0], Sd);
+            best = 0;
+            for (size_t k = 1; k < cands.size(); ++k) {
+                AzScore s = scoreAz(a, b, cands[k], Sd);
+                if (p0Wins(s, bestS)) { bestS = s; best = (int)k; }
+            }
+            if (best != 0) {
+                azRow[ri] = cands[best];
+                // 只有把方位换成**站位侧**才记账；换成 0（向上）不算本层做了什么
+                stanceRow[ri] = (std::fabs(cands[best] - azs) < 1e-6) ? 1 : 0;
+            }
+        };
+        if (p.azStance) {
+            if (nThreads <= 1) {
+                for (size_t ri = 0; ri < rows.size(); ++ri) decideRow(ri);
+            } else {
+                std::atomic<size_t> nextRow{0};
+                std::vector<std::thread> pool;
+                int nt = std::max(1, std::min<int>(nThreads, (int)rows.size()));
+                pool.reserve(nt);
+                for (int k = 0; k < nt; ++k) {
+                    pool.emplace_back([&] {
+                        for (;;) {
+                            size_t ri = nextRow.fetch_add(1);
+                            if (ri >= rows.size()) break;
+                            decideRow(ri);
+                        }
+                    });
+                }
+                for (auto& th : pool) th.join();
+            }
+        }
+    }
+    g_prof.mark("阶段2.5 进刀侧");
+    int azChangedRows = 0;
+    for (char c : stanceRow) if (c) ++azChangedRows;
+    if (g_prof.on) {
+        std::fprintf(stderr, "  [az] rows=%zu 非零方位行=%d :", rows.size(), azChangedRows);
+        for (size_t t = 0; t < azRow.size(); ++t)
+            if (std::fabs(azRow[t]) > 1e-9) std::fprintf(stderr, " r%zu=%.1f", t, azRow[t]);
+        int nonZeroPts = 0;
+        for (int i = 0; i < n; ++i) if (rowOf[i] >= 0 && std::fabs(azRow[rowOf[i]]) > 1e-9) ++nonZeroPts;
+        std::fprintf(stderr, " · 受影响点=%d\n", nonZeroPts);
     }
 
     // ---- 阶段 3：按 final 重新求解 + 归集违规
@@ -1724,6 +1954,21 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             reachable += a.reachable;
             standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
         }
+    }
+
+    // 生效行数：只有"确实改变了个点位姿"的行才计入 azStanceRows。
+    // 阶段 3 的 poseCmp 会把更差的位姿逐点退回，于是会出现"改判 N 行、实际一点没变"
+    // （complex 上就是：改判 1 行、输出与旧口径逐字节相同）。报数字要报生效的。
+    {
+        std::vector<char> applied(rows.size(), 0);
+        for (int i = 0; i < n; ++i) {
+            if (rowOf[i] < 0) continue;
+            int ri = rowOf[i];
+            if (!stanceRow[ri]) continue;
+            if (!results[i].reverted && std::fabs(results[i].azDeg - azRow[ri]) < 1e-6) applied[ri] = 1;
+        }
+        azStanceRows = 0;
+        for (char c : applied) if (c) ++azStanceRows;
     }
 
     // ---- 过渡点抬升（spray=0 ⇒ 位置可改，只求不撞）
@@ -1870,6 +2115,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     R.baseAuto = baseAuto ? 1 : 0;
     R.cloudPoints = cloud.size();
     R.cloudSpacingMm = spacing;
+    R.azRows = (int)rows.size();
+    R.azStanceRows = azStanceRows;
     R.l0Issues = l0Issues;
     R.standoffMedianMm = standoffMedian;
 

@@ -220,6 +220,14 @@
                                                    ToolTip="在线预判可填 3~5 提速 3~5 倍；薄壁件会偏乐观，最终结论必须用 0"/>
                                         <TextBox x:Name="TxtVoxel" Text="0" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
+                                    <StackPanel Grid.Row="3" Grid.Column="2" Margin="0,8,0,0">
+                                        <TextBlock Text="进刀侧方位" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="按机器人站位：每行在「向上」与「站位侧」之间按 P0 实测择优，只在旧口径真撞的行上改动"/>
+                                        <ComboBox x:Name="CmbAzMode" Margin="0,2,0,0" SelectedIndex="0">
+                                            <ComboBoxItem Content="按机器人站位择优"/>
+                                            <ComboBoxItem Content="只用「向上」(旧口径)"/>
+                                        </ComboBox>
+                                    </StackPanel>
                                 </Grid>
 
                                 <CheckBox x:Name="ChkAutoSafety" Content="生成轨迹后自动评估"
