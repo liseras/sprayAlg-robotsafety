@@ -1,4 +1,4 @@
-# 接手提示词 · 喷涂轨迹算法（截至第十三轮）
+# 接手提示词 · 喷涂轨迹算法（截至第十四轮）
 
 > 用法：新开一个对话窗口，**把下面整段（含反引号代码块）原样粘贴给 AI**，
 > 它会先读 `HANDOFF_交接说明.md` 再动手。所有路径、命令、基线数据都已写死，不需要你再解释。
@@ -12,9 +12,9 @@
 
 ## 第一步：必读
 完整读一遍 E:\Code\喷涂算法自研\HANDOFF_交接说明.md。重点看：
-- 第 0 节开头的「第十三轮」，那是最近一次改动（重建曲面模型 + 跨行姿态一致化）；
+- 第 0 节开头的「第十四轮」（多平面件排除）与紧随其后的「第十三轮」（重建曲面模型）；
 - 6.4「本轮未收尾项」，剩下的都是**等用户拍板**的取舍，不是技术难题；
-- 第 9 节「踩过的坑」共 43 条，第 30~43 条是曲面件与"轨迹乱"相关的，动手前必读。
+- 第 9 节「踩过的坑」共 44 条，第 30~44 条是曲面件/多面体件与"轨迹乱"相关的，动手前必读。
 
 ## 分支约定
 - `master`：算法主干，只接受"9 个非曲面样本逐字节一致"的改动。
@@ -22,10 +22,11 @@
   E:\Code\喷涂算法自研\ROBOT_SAFETY_交接说明.md。**别在 master 上直接做安全功能。**
 
 ## 项目背景（30 秒版）
-C++ DLL 导出 C ABI（spray_traj.cpp，约 3570 行），C# WPF 查看器调它。
-流程：点云 → SOR/KNN 法向 → 5° 区域生长 → 8° 块合并 → 陡壁 RANSAC 剥离
-→ 矢量化轮廓重建 → 行生成 → 蛇形轨迹；曲面块走独立的「曲面模型 → 行追踪」分支。
-10 个回归样本在 cpp/_regress\*.ply（panel big zhe cao tray complex longstripe longwide synth curved）。
+C++ DLL 导出 C ABI（spray_traj.cpp，约 3660 行），C# WPF 查看器调它。
+流程：点云 → SOR/KNN 法向 → **曲面块判定（含多平面件排除）** → 5° 区域生长 → 8° 块合并
+→ 陡壁 RANSAC 剥离 → 矢量化轮廓重建 → 行生成 → 蛇形轨迹；曲面块走独立的「曲面模型 → 行追踪」分支。
+10 个回归样本在 cpp/_regress\*.ply（panel big zhe cao tray complex longstripe longwide synth curved），
+另有第十四个样本 box（开口盒子，`E:/tmp_build/userclouds/box6.ply`，ascii 版）。
 现场点云 17 份在 E:/tmp_build/userclouds/u01..u17（映射见 _map.txt，u08=曲型板、u04=复杂点云）。
 
 ## 编译（C 盘紧张，临时目录必须指到 E 盘）
@@ -44,6 +45,9 @@ cp cpp/SprayTrajCore/build/bin/Release/SprayTraj.dll \
 （若被占用：Get-Process SprayTrajViewer | Stop-Process -Force）
 
 ## 验收红线（违反任何一条都算没做完）
+0. **最省事的一次性全量对拍**：`C:/Python38/python.exe E:/tmp_build/reg.py <tag>`，
+   会跑完 25 个样本并写 `reg_<tag>.txt`（逐样本 行数/点数/rms/seg_mean/seg_max/面数/CSV的MD5）。
+   与上一轮的 `reg_*.txt` 直接 diff，只有你打算改的样本才允许有差异。
 1. **9 个非曲面样本的轨迹 CSV 必须与基线逐字节一致**：
    cd /e/tmp_build/reg9
    for f in panel big zhe cao tray complex longstripe longwide synth; do
@@ -55,6 +59,7 @@ cp cpp/SprayTrajCore/build/bin/Release/SprayTraj.dll \
    注意 reg9 目录里没有 curved.ply，曲型板只在 cpp/_regress/。
 2. curved 必须保持：14 行曲面 + 4 行平面、行距 11.76mm、覆盖率 92.2%、贴合残差 8.88mm、
    rms=8.878、seg_mean=4.843 / seg_max=9.038（允许小数点级波动，量级不能掉）。
+   box 必须保持：5 面 / 125 行 / 12028 点 / rms=0.30 / seg_mean=3.847 / seg_max=3.999。
 3. 不要动 split_planes 的非曲面逻辑，也不要改参数语义（flatnessTol/fillHoleSize/
    scanRowSpacing/curvatureTol 的含义见文档第 2 节，用户是照着这套理解的）。
 4. 曲面块的改动只允许动姿态与显示，不许动行点位置：位置一变，覆盖率与贴合残差的
@@ -69,7 +74,9 @@ cp cpp/SprayTrajCore/build/bin/Release/SprayTraj.dll \
 ### 已完成，不要重做
 - 曲面可视化网格（第十轮）、seg_len_max 偏大（第十~十三轮已解决）、
   row00 只有 77 点（已定性为真实卷边，留档不改）；
-- 重建网格曲率正则化 + 枪位跨行一致化（第十三轮，见 outputs/round13/）。
+- 重建网格曲率正则化 + 枪位跨行一致化（第十三轮，见 outputs/round13/）；
+- 开口盒子被误判成曲面块（第十四轮，见 outputs/round14/）：新增 `patch_is_polyhedral()`，
+  "能被 ≤8 个精确平面覆盖 ≥93%" 就不是曲面。别再用"整体平面残差大小"当唯一判据。
 
 ## 常用调试
 SPRAYTRAJ_DUMP=1 spray_driver.exe curved.ply ... 2>&1 | grep -E "曲面dbg|曲面模型"
@@ -99,4 +106,5 @@ E:/tmp/plotcv.py <ply> <csv> <png>                                            # 
 | 曲面块可视化网格（原来只有 4 顶点 / 2 三角） | ✅ 第十轮完成，第十三轮又做了曲率正则化 |
 | `seg_len_max=25.3mm` 偏大（其它样本 ~4mm） | ✅ 第十轮定位 3 处、第十一轮限幅摊平；第十三轮 `seg_max=9.038` |
 | 第 00 行只有 77 点 | 📝 已定性：外缘卷边处自然到边，留档不改 |
-| 提交 | ✅ `3fde1e1`（第十三轮） |
+| 开口盒子（纯多面体）被误判为曲面块，24 行覆盖 57% | ✅ 第十四轮：`patch_is_polyhedral()`，5 面 125 行、残差 0.30mm |
+| 提交 | ✅ `3fde1e1`（第十三轮）；第十四轮见 `git log -1` |

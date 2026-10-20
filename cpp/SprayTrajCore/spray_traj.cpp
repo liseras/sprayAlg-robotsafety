@@ -2635,6 +2635,77 @@ static bool build_surface_mesh(const SurfPatch& sp, double rowGap, double fillHo
     return !verts.empty() && !tris.empty();
 }
 
+// 多平面件排除（第十四轮）。
+// 现象：开口盒子这种"底面 + 4 个侧壁"的纯多面体，被当成曲面块走行追踪，
+//       覆盖率只有 57.3%、残差 59.6mm，轨迹完全不对。
+// 原因：连通判据是"相邻点法向夹角 < 20°"。棱边两侧的点，KNN 邻域同时包含两个面，
+//       法向落在中间过渡带；这一串过渡点把 0° 的底面和 90° 的侧壁一段段接起来，
+//       于是 91.2% 的点连成一个"光滑块"，整体平面拟合 p95 自然高达 167.7mm，
+//       超过"曲面"门限（max(4*curvatureTol, 2*行距) = 24mm）而被判成曲面。
+//
+// 判据：真正的曲面没法被少数几个平面**精确**覆盖；多面体可以。
+//       用紧公差顺序 RANSAC 剥离，若 <=nmax 个平面就能覆盖 >=coverReq 的点 → 多面体。
+// 实测（tol=2mm, nmax=6）：
+//       开口盒子  5 个平面覆盖 100.0%（底面 23.2 / 侧壁 22.3+22.3 / 端壁 16.0+16.0）
+//       曲型板    6 个平面只覆盖 43.5%（曲面是连续的，每个 2mm 薄层只吃一条带）
+// 余量约 46 个百分点，两边都不靠边。
+static bool patch_is_polyhedral(const std::vector<Vec3>& P, const std::vector<int>& blk,
+                                int nmax, double tolPlane, double coverReq,
+                                int& nPlaneOut, double& covOut)
+{
+    nPlaneOut = 0; covOut = 0.0;
+    const int N = (int)blk.size();
+    if(N < 200) return false;
+
+    // 抽样到 <=20000 点：判据是"覆盖比例"，抽样不改变结论，但把 RANSAC 成本压到常数级
+    const int cap = 20000;
+    const int step = std::max(1, N/cap);
+    std::vector<Vec3> Q;
+    Q.reserve((size_t)(N/step) + 1);
+    for(int i=0;i<N;i+=step) Q.push_back(P[blk[i]]);
+    const int M = (int)Q.size();
+    if(M < 200) return false;
+
+    const int iters = 200;
+    const int minPts = std::max(50, (int)(M*0.02));
+    std::mt19937 rng(20771);
+    std::vector<int> cur(M), rest;
+    std::iota(cur.begin(), cur.end(), 0);
+    int covered = 0;
+    for(int it=0; it<nmax; ++it){
+        const int m = (int)cur.size();
+        if(m < minPts) break;
+        int bestCnt = -1;
+        Vec3 bn{0,0,1}; double bd = 0;
+        std::uniform_int_distribution<int> ud(0, m-1);
+        for(int k=0;k<iters;++k){
+            int a=ud(rng), b=ud(rng), c=ud(rng);
+            if(a==b || b==c || a==c) continue;
+            Vec3 nn = cross(Q[cur[b]]-Q[cur[a]], Q[cur[c]]-Q[cur[a]]);
+            double ln = len(nn);
+            if(ln < 1e-9) continue;
+            nn = nn*(1.0/ln);
+            double d = -dot(nn, Q[cur[a]]);
+            int cnt = 0;
+            for(int t=0;t<m;++t) if(std::fabs(dot(Q[cur[t]], nn)+d) < tolPlane) ++cnt;
+            if(cnt > bestCnt){ bestCnt = cnt; bn = nn; bd = d; }
+        }
+        if(bestCnt < minPts) break;
+        rest.clear(); rest.reserve((size_t)(m-bestCnt));
+        int got = 0;
+        for(int t=0;t<m;++t){
+            if(std::fabs(dot(Q[cur[t]], bn)+bd) < tolPlane) ++got;
+            else rest.push_back(cur[t]);
+        }
+        covered += got;
+        ++nPlaneOut;
+        cur.swap(rest);
+        covOut = (double)covered/(double)M;
+        if(covOut >= coverReq) return true;
+    }
+    return false;
+}
+
 // 曲面块检测：找"法向局部连续"的最大连通块，再判断它平不平。
 //   * 连通条件用**相邻点**法向夹角 < 20°，不是"与种子夹角"——否则弯过 60°
 //     的曲面会被种子法向切成几块（这正是原来被硬切成 8 个平面的原因）；
@@ -2695,6 +2766,20 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
         fprintf(stderr, "[曲面] 最大光滑块: %d/%d 点(%.1f%%) 平面残差 p95=%.1fmm (门限=%.1fmm)\n",
                 bestCnt, n, share*100.0, p95, thr);
         if(share < 0.5 || p95 < thr) return false;
+    }
+
+    // ---- 多平面件排除：能拆成几个精确平面 → 不是曲面，退回平面分割 ----
+    {
+        // 公差取 0.2×行距（11.76mm → 2.4mm）：既容得下现场点云的墙面噪声（~0.5mm），
+        // 又远小于"浅曲面被切成薄带"的厚度，避免把 sag 30mm 级的缓曲面误判成多面体
+        // （sag 30mm 的板在 2.4mm 带宽下要 12 个平面才铺满，nmax=8 只够盖 ~75%）。
+        const double tolPl = std::min(3.0, std::max(1.5, 0.20*rowSpacing));
+        int np = 0; double cov = 0.0;
+        bool poly = patch_is_polyhedral(P, outInl, 8, tolPl, 0.93, np, cov);
+        fprintf(stderr, "[曲面] 多平面校验: 紧公差(%.1fmm)剥离 %d 个平面覆盖 %.1f%%%s\n",
+                tolPl, np, cov*100.0,
+                poly ? " → 多面体，退回平面分割" : "（未达 93%，仍按曲面处理）");
+        if(poly) return false;
     }
 
     // ---- 组装 SurfPatch ----
