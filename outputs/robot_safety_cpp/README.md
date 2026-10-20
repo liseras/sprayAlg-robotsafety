@@ -1,8 +1,9 @@
-# 机器人安全层（robot-safety 分支）· C++ 实现与验证
+# 机器人安全层（robot-safety 分支）· C++ 实现 + 上位机集成
 
-> 分支 `robot-safety`。**既有源码一行未改**：`spray_traj.cpp` / `spray_traj.h` 完全没动，
+> 分支 `robot-safety`。**既有算法源码一行未改**：`spray_traj.cpp` / `spray_traj.h` 完全没动，
 > 只在 `CMakeLists.txt` 里把一个新源文件加进同一个 DLL，并在 `Native.cs` 里追加 P/Invoke 声明。
 > 结果：10 个回归样本中 **9 个非曲面样本逐字节一致（9/9 IDENTICAL）**，红线守住。
+> 上位机（`wpf/SprayTrajViewer`）已经接上：两个页签 + 结论卡 + 风险点标注 + 修正轨迹导出。
 
 ---
 
@@ -22,6 +23,7 @@
 | `cpp/SprayTrajCore/robot_safety.cpp` | 1190 | 几何、VS-087 FK/IK/雅可比、KD-tree 点云、胶囊碰撞、倾角规划 |
 | `cpp/SprayTrajCore/safety_driver.cpp` | 470 | 命令行驱动 `spray_safety.exe`（轨迹 CSV + 点云 PLY → 校验后 CSV） |
 | `wpf/SprayTrajViewer/Native.cs` | +105 | P/Invoke 声明（结构体 / 三个出口函数 / 违规位常量） |
+| `wpf/SprayTrajViewer/MainWindow.xaml(.cs)` | ~450 | 双页签界面、安全评估调用、风险点分层渲染、修正轨迹导出 |
 
 **为什么单独一个 exe 而不是改 `driver.cpp`**：`driver.cpp` 的输出决定 9 个样本的 CSV 基线，
 安全层不能有一丝机会碰到那条链。`spray_safety` 是并行的独立入口。
@@ -194,7 +196,7 @@ J1_deg..J6_deg, violation`。
 
 退出码：`0` 无 P0（可执行）、`1` 有 P0（撞了/不可达）、`2` 参数或读文件错误。
 
-### C# 侧
+### C# 侧（上位机已接好）
 
 `Native.cs` 已加好声明，调用方式：
 
@@ -205,11 +207,57 @@ var rs = Native.robot_safety_check(pts, pts.Length, cloudXyz, cloudXyz.Length / 
 try {
     // rs.points / rs.byRule / rs.minClearanceMm …
 } finally {
-    Native.robot_safety_free(ref rs);
+    Native.robot_safety_free(ref rs);   // ⚠ 注意：free 会把 rs.count 清 0，标量要先留副本
 }
 ```
 
-UI 上的按钮与结果面板尚未接（属于下一步，不在本阶段范围）。
+### 6.1 上位机集成（`wpf/SprayTrajViewer`）
+
+界面上线了，不再只是代码可调用。左侧拆成两个页签，两个主按钮都在首屏：
+
+| 页签 | 内容 |
+|---|---|
+| **轨迹生成** | 原有点云/工艺参数/生成按钮 + 显示控制（新增「标记风险点」「显示修正后轨迹」） |
+| **机器人安全** | 基座位姿（自动假设 / 手填标定值）、工具长、安全间隙、工艺喷角上限、倾角搜索上限、关节余量；「机器人安全评估」与「导出修正后轨迹 (CSV)」两个按钮；本页内嵌一份结论 |
+
+右侧 3D 视图右上角固定一张结论卡：结论（PASS / PASS WITH WARNINGS / REJECT）、耗时、
+可达率、最小表面距离、喷角均值/p95/最大、喷距守恒偏差、平滑回退点数、逐规则违规计数、基座位姿（并标明是否为假设值）。
+
+**风险点分三层画**，否则几千个喷角超限点会把工件糊成一片、反而看不出真正的坑：
+
+| 颜色 | 含义 | 画法 |
+|---|---|---|
+| 红（大点） | P0 碰撞 / 不可达 / 自碰撞 | 逐点全画 |
+| 橙（中点） | 间隙不足 / 关节余量不足 | 逐点全画 |
+| 黄（小点） | 喷角 / 接近奇异 / 倾角跳变 | 抽稀到 ≤400 个，只指示区段 |
+
+青色叠加层是**倾斜修正后**的轨迹，默认关闭（多数样本与红色原轨迹重合，开着只会遮挡）。
+连线判据用**原轨迹**相邻点距，不用修正后距离——倾斜会让点整体挪开 2·standoff·sin(θ/2)，
+按修正后距离判会把每一行都判成断开。
+
+命令行（无人值守验收 / 截图取证）：
+
+```bash
+SprayTrajViewer.exe --ply xxx.ply --auto --safety 1 --tab 1 --view iso \
+    --shot 3d.png --shot-win win.png --export-fixed safe.csv --exit
+```
+
+`--safety` 不给就完全不调安全层，行为与以前一模一样（实测日志里 0 条 `SAFETY`）。
+`--shot` 只截 3D 视图，`--shot-win` 截整窗（含结论卡）。
+
+**已验证**（`E:/tmp_build/wpf_*.png`，日志见 `%TEMP%\SprayTrajViewer.log`）：
+
+| 样本 | 结论 | 关键数字 | 耗时 |
+|---|---|---|---|
+| `tray` | PASS | 1323/1323 可达 · 最小间隙 54.87mm · 喷角 2.9/20/20° | 50 ms |
+| `complex` | PASS WITH WARNINGS | 4989/4989 · 最小间隙 19.87mm · 喷角 11.9/45/60° · 回退 116 点 | 883 ms |
+| `longstripe` | REJECT | 11497/11558 · 最小间隙 **−20.86mm** · P0=82 | 13.4 s（22 万点） |
+
+三组读数与 `spray_safety.exe` 命令行版逐项一致；界面导出的 CSV 与命令行输出逐点对比，
+间隙最大差 0.01mm、倾角 0°、TCP 0.0024mm（都是 CSV 小数位舍入）。
+
+**踩到的坑（会再犯）**：`robot_safety_free` 会把 `res->count` 清 0，若在 free 之后再用
+`count`/遍历点数，就会得到"可达 1323/0"这种自相矛盾的结论。要么先复制标量，要么先读完再 free。
 
 ---
 

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -61,6 +62,25 @@ namespace SprayTrajViewer
             App.Log("SHOT", null, $"{path} ({rtb.PixelWidth}x{rtb.PixelHeight})");
         }
 
+        /// <summary>
+        /// 整窗截图：包含左侧参数面板与右上角安全结论卡。
+        /// Viewport 截图只含 3D 内容，验收「卡片显示了什么」必须用这个。
+        /// </summary>
+        void SaveWindowShot(string path)
+        {
+            UpdateLayout();
+            double w = ActualWidth, h = ActualHeight;
+            if (w < 2 || h < 2) { App.Log("SHOT-WIN/FAIL", null, $"窗口尺寸异常 {w}x{h}"); return; }
+
+            var rtb = new RenderTargetBitmap((int)w, (int)h, 96, 96, PixelFormats.Pbgra32);
+            rtb.Render(this);
+
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(rtb));
+            using (var fs = System.IO.File.Create(path)) enc.Save(fs);
+            App.Log("SHOT-WIN", null, $"{path} ({rtb.PixelWidth}x{rtb.PixelHeight})");
+        }
+
         // ── 命令行自运行模式 ────────────────────────────────────────────────
         // 目的：让"界面渲染是否正确"的验证不依赖 UI 自动化点击（此前被 WPS 对话框抢焦点搞错过），
         // 一条命令即可复现指定样本 + 指定参数 + 指定显示项，再用截图取证。
@@ -104,6 +124,8 @@ namespace SprayTrajViewer
             if (o.TryGetValue("fill", out v)) TxtFillHole.Text = v;
             if (o.TryGetValue("dir", out v)) CmbScanDir.SelectedIndex = Math.Clamp(int.TryParse(v, out var di) ? di : 0, 0, 2);
             if (o.TryGetValue("flip", out v)) CmbNormalFlip.SelectedIndex = Math.Clamp(int.TryParse(v, out var fi) ? fi : 0, 0, 1);
+            // --tab 1：启动就停在「机器人安全」页（UI 探针截图用）
+            if (o.TryGetValue("tab", out v)) Tabs.SelectedIndex = Math.Clamp(int.TryParse(v, out var ti) ? ti : 0, 0, 1);
 
             // 显示项（显式给值时才改，避免把用户默认勾选状态打乱）
             if (o.TryGetValue("show-cloud", out v)) ChkShowCloud.IsChecked = v != "0";
@@ -129,13 +151,30 @@ namespace SprayTrajViewer
 
             if (hadArgs && o.ContainsKey("auto"))
             {
+                // CLI 模式由这里控制时序（生成 → 可选安全评估 → 视角 → 截图），
+                // 关掉「生成后自动评估」，避免它和截图抢时序。
+                _suppressAutoSafety = true;
                 // 让窗口先完成一次布局/绘制，再跑算法与渲染，避免在 Loaded 里做重活把首帧拖成黑屏
-                Dispatcher.BeginInvoke(new Action(() =>
+                Dispatcher.BeginInvoke(new Action(async () =>
                 {
                     try
                     {
                         BtnGenerate_Click(this, new RoutedEventArgs());
                         App.Log("CLI", null, "auto-generate 完成");
+
+                        // --safety：跑一次安全评估，结论会打到日志，便于无人值守验收
+                        if (o.ContainsKey("safety") && _lastTraj.Count > 0)
+                        {
+                            await RunSafetyCheckAsync(true);
+                            App.Log("CLI", null, "auto-safety 完成");
+
+                            // --export-fixed：把倾斜修正后的轨迹落盘（等同界面上的导出按钮）
+                            if (o.TryGetValue("export-fixed", out var fx) && _safetyPts.Length > 0)
+                            {
+                                WriteFixedCsv(fx);
+                                App.Log("CLI", null, $"export-fixed -> {fx}（{_safetyPts.Length} 点）");
+                            }
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -144,7 +183,8 @@ namespace SprayTrajViewer
 
                     if (o.TryGetValue("view", out var vm)) ApplyViewPreset(vm);
 
-                    if (o.TryGetValue("shot", out var shotPath))
+                    bool wantShot = o.ContainsKey("shot") || o.ContainsKey("shot-win");
+                    if (wantShot)
                     {
                         // 等一帧稳定（相机/布局/3D 绘制都完成）再截，避免抓到半成品
                         var timer = new System.Windows.Threading.DispatcherTimer
@@ -154,8 +194,11 @@ namespace SprayTrajViewer
                         timer.Tick += (_, _) =>
                         {
                             timer.Stop();
-                            try { SaveViewportShot(shotPath); }
-                            catch (Exception ex) { App.Log("SHOT/FAIL", ex); }
+                            // shot = 只截 3D 视图（看几何）；shot-win = 整窗（看界面与结论卡）
+                            if (o.TryGetValue("shot", out var shotPath))
+                                try { SaveViewportShot(shotPath); } catch (Exception ex) { App.Log("SHOT/FAIL", ex); }
+                            if (o.TryGetValue("shot-win", out var winPath))
+                                try { SaveWindowShot(winPath); } catch (Exception ex) { App.Log("SHOT-WIN/FAIL", ex); }
                             if (o.ContainsKey("exit"))
                             {
                                 App.Log("CLI", null, "shot 完成，退出");
@@ -305,6 +348,8 @@ namespace SprayTrajViewer
             }
 
             RenderTrajectory(traj);
+            // 留一份给安全评估用：res.points 马上就要被 spray_traj_free 释放
+            _lastTraj = traj;
 
             // 保存所有分割平面参数，供"显示重建平面"使用
             _planes.Clear();
@@ -356,6 +401,11 @@ namespace SprayTrajViewer
 
             // 同时写出 CSV 供外部使用
             try { ExportCsv(traj); } catch { }
+
+            // 生成完顺手做一次安全评估：轨迹能生成 ≠ 机器人做得到，
+            // 少了这一步，用户看到的漂亮轨迹可能是不可达或撞工件的。
+            if (ChkAutoSafety.IsChecked == true && !_suppressAutoSafety)
+                _ = RunSafetyCheckAsync(true);
         }
 
         void RenderTrajectory(List<SprayTrajPoint> traj)
@@ -571,6 +621,396 @@ namespace SprayTrajViewer
         static double ParseDouble(string s, double def)
         {
             return double.TryParse(s, out var v) ? v : def;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        //  机器人执行安全
+        //
+        //  职责分离：spray_traj 只管「喷得对不对」，这一段只管「机器人能不能
+        //  安全做到」——可达、关节限位、枪体/连杆与工件碰撞、连杆自碰撞、喷角。
+        //
+        //  生成结果一个字不改：先按原样画轨迹，再把安全层的修正轨迹用青色叠
+        //  上去。哪个点被倾斜了、倾斜后间隙变大还是变小，界面上直接看得见。
+        // ══════════════════════════════════════════════════════════════════
+
+        private List<SprayTrajPoint> _lastTraj = new();
+        private RobotSafetyPoint[] _safetyPts = Array.Empty<RobotSafetyPoint>();
+        private readonly List<Visual3D> _riskVisuals = new();
+        private LinesVisual3D? _fixedVisual;
+        private bool _suppressAutoSafety;
+
+        // 严重度分组，与 C++ 侧 RS_VIOL_* 的 P0/P1/P2 划分一致
+        const uint MaskP0 = RobotSafetyRule.IkFail | RobotSafetyRule.Collision | RobotSafetyRule.SelfCollision;
+        const uint MaskP1 = RobotSafetyRule.Clearance | RobotSafetyRule.JointLimit | RobotSafetyRule.SprayAngle;
+        const uint MaskP2 = RobotSafetyRule.NearSingular | RobotSafetyRule.TiltJump;
+
+        async void BtnSafety_Click(object sender, RoutedEventArgs e)
+        {
+            try { await RunSafetyCheckAsync(false); }
+            catch (Exception ex)
+            {
+                App.Log("SAFETY/FAIL", ex);
+                MessageBox.Show($"安全评估失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        void CmbBaseMode_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+        {
+            if (PanelBaseManual == null) return;
+            PanelBaseManual.Visibility = CmbBaseMode.SelectedIndex == 1
+                ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>
+        /// 手输基座位姿 → T_base_in_cloud（4x4 行主序）。
+        /// 约定：基座 +Z 竖直向上；+X 默认指向工件质心，再用「朝向偏转」绕 Z 微调。
+        /// 自动模式返回 null，交给核心库按工件质心假设（报告里会明确标注是猜的）。
+        /// </summary>
+        double[]? BuildBasePose()
+        {
+            if (CmbBaseMode.SelectedIndex != 1) return null;
+
+            double x = ParseDouble(TxtBaseX.Text, 0);
+            double y = ParseDouble(TxtBaseY.Text, 0);
+            double z = ParseDouble(TxtBaseZ.Text, 0);
+            double yaw = ParseDouble(TxtBaseYaw.Text, 0) * Math.PI / 180.0;
+
+            // 质心（水平投影）；大点云等距抽样，够用且不卡界面
+            double cx = 0, cy = 0;
+            int step = Math.Max(1, _cloud.Count / 4000);
+            int cnt = 0;
+            for (int i = 0; i < _cloud.Count; i += step) { cx += _cloud[i].x; cy += _cloud[i].y; cnt++; }
+            if (cnt > 0) { cx /= cnt; cy /= cnt; }
+
+            double dx = cx - x, dy = cy - y;
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1e-6) { dx = 1; dy = 0; } else { dx /= len; dy /= len; }
+
+            double c = Math.Cos(yaw), s = Math.Sin(yaw);
+            double ax = c * dx - s * dy;      // 基座 +X（绕 Z 转 yaw 后）
+            double ay = s * dx + c * dy;
+            // +Y = +Z × +X = (-ay, ax, 0)
+            return new double[]
+            {
+                ax, -ay, 0, x,
+                ay,  ax, 0, y,
+                 0,   0, 1, z,
+                 0,   0, 0, 1,
+            };
+        }
+
+        async Task RunSafetyCheckAsync(bool auto)
+        {
+            if (_lastTraj.Count == 0)
+            {
+                if (!auto)
+                    MessageBox.Show("请先生成轨迹，再做安全评估。", "提示",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (_cloud.Count == 0)
+            {
+                if (!auto) MessageBox.Show("请先加载点云。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            var p = Native.robot_safety_default_params();
+            // 喷距必须与生成时一致 —— 倾斜是绕面点的球面旋转，喷距错了球心就错，
+            // 后面「可达 / 碰撞」的结论全部不成立，所以这里强制取界面上的生成值。
+            p.standoff = ParseDouble(TxtStandoff.Text, p.standoff);
+            p.safety = ParseDouble(TxtSafetyGap.Text, p.safety);
+            p.toolLen = ParseDouble(TxtToolLen.Text, p.toolLen);
+            p.tiltMaxDeg = ParseDouble(TxtTiltMax.Text, p.tiltMaxDeg);
+            p.maxSprayAngleDeg = ParseDouble(TxtMaxSprayAngle.Text, p.maxSprayAngleDeg);
+            p.jointMarginMin = ParseDouble(TxtJointMargin.Text, p.jointMarginMin);
+
+            double[]? basePose = BuildBasePose();
+            var pts = _lastTraj.ToArray();
+            var cloudXyz = new double[_cloud.Count * 3];
+            for (int i = 0; i < _cloud.Count; i++)
+            {
+                cloudXyz[i * 3] = _cloud[i].x;
+                cloudXyz[i * 3 + 1] = _cloud[i].y;
+                cloudXyz[i * 3 + 2] = _cloud[i].z;
+            }
+
+            BtnSafety.IsEnabled = false;
+            TxtHint.Text = $"机器人安全评估中…（轨迹 {pts.Length} 点 / 点云 {_cloud.Count} 点）";
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            RobotSafetyPoint[] got = Array.Empty<RobotSafetyPoint>();
+            RobotSafetyResult st = default;
+            RobotSafetyResult sum = default;   // free 会把 st.count 清 0，标量先留一份副本
+            string? err = null;
+            try
+            {
+                st = await Task.Run(() =>
+                    Native.robot_safety_check(pts, pts.Length, cloudXyz, _cloud.Count, basePose, ref p));
+                sw.Stop();
+
+                if (st.error != IntPtr.Zero)
+                {
+                    err = Marshal.PtrToStringAnsi(st.error) ?? "未知错误";
+                }
+                else
+                {
+                    sum = st;
+                    got = new RobotSafetyPoint[st.count];
+                    int sz = Marshal.SizeOf<RobotSafetyPoint>();
+                    for (int i = 0; i < st.count; i++)
+                        got[i] = Marshal.PtrToStructure<RobotSafetyPoint>(IntPtr.Add(st.points, i * sz));
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                err = "当前 SprayTraj.dll 不含安全层导出（robot_safety_check）。请重新编译 C++ 核心库并复制到程序目录。";
+            }
+            finally
+            {
+                try { Native.robot_safety_free(ref st); } catch { }
+                BtnSafety.IsEnabled = true;
+            }
+
+            if (err != null)
+            {
+                TxtHint.Text = "安全评估失败：" + err;
+                ShowSafetyCard("ERROR", Color.FromRgb(248, 113, 113), "", err);
+                App.Log("SAFETY/FAIL", null, err);
+                return;
+            }
+
+            // 按最高严重度归类（一个点可能同时命中多条规则）
+            int nP0 = 0, nP1 = 0, nP2 = 0;
+            foreach (var q in got)
+            {
+                if ((q.violation & MaskP0) != 0) nP0++;
+                else if ((q.violation & MaskP1) != 0) nP1++;
+                else if ((q.violation & MaskP2) != 0) nP2++;
+            }
+
+            string verdict = nP0 > 0 ? "REJECT" : (nP1 > 0 ? "PASS WITH WARNINGS" : "PASS");
+            Color vColor = nP0 > 0 ? Color.FromRgb(248, 113, 113)
+                         : nP1 > 0 ? Color.FromRgb(251, 191, 36)
+                                   : Color.FromRgb(74, 222, 128);
+
+            int[] b = sum.byRule ?? new int[8];
+            string Rule(int bit) => b.Length > bit ? b[bit].ToString() : "0";
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"可达 {sum.reachable}/{sum.count}" +
+                          $"（{(sum.count > 0 ? 100.0 * sum.reachable / sum.count : 0):F1}%）");
+            sb.AppendLine($"最小表面距离 {sum.minClearanceMm:F2} mm" +
+                          (sum.minClearanceMm < 0 ? "  ← 穿透" : ""));
+            sb.AppendLine($"喷角 均值 {sum.tiltMeanDeg:F1}° · p95 {sum.tiltP95Deg:F1}° · 最大 {sum.tiltMaxDeg:F1}°");
+            sb.AppendLine($"喷距守恒偏差 {sum.standoffMaxErrMm:E2} mm");
+            if (sum.poseReverted > 0)
+                sb.AppendLine($"平滑回退 {sum.poseReverted} 点（碰撞优先于姿态连续）");
+            sb.AppendLine($"违规：不可达 {Rule(0)} · 碰撞 {Rule(1)} · 间隙 {Rule(2)} · 自碰撞 {Rule(3)}");
+            sb.AppendLine($"　　　关节 {Rule(4)} · 喷角 {Rule(5)} · 奇异 {Rule(6)} · 跳变 {Rule(7)}");
+            sb.AppendLine(sum.baseAuto != 0
+                ? $"基座：自动假设 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0}) —— 未标定，可达率仅作预判"
+                : $"基座：手动 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0})");
+
+            ShowSafetyCard(verdict, vColor, $"耗时 {sw.ElapsedMilliseconds} ms", sb.ToString().TrimEnd());
+
+            _safetyPts = got;
+            RenderSafetyOverlay(got, sum.tiltedPoints > 0);
+
+            TxtHint.Text = $"安全评估：{verdict} · 可达 {sum.reachable}/{sum.count} · 最小间隙 {sum.minClearanceMm:F1}mm";
+            App.Log("SAFETY", null,
+                $"verdict={verdict} p0={nP0} p1={nP1} p2={nP2} count={sum.count} reachable={sum.reachable} " +
+                $"minClr={sum.minClearanceMm:F2} tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
+                $"tilted={sum.tiltedPoints} reverted={sum.poseReverted} standoffErr={sum.standoffMaxErrMm:E2} " +
+                $"baseAuto={sum.baseAuto} cloudPts={sum.cloudPoints} l0={sum.l0Issues} elapsed={sw.ElapsedMilliseconds}ms");
+        }
+
+        void ShowSafetyCard(string verdict, Color color, string cost, string body)
+        {
+            CardSafety.Visibility = Visibility.Visible;
+            TxtSafetyVerdict.Text = verdict;
+            TxtSafetyVerdict.Foreground = new SolidColorBrush(color);
+            TxtSafetyCost.Text = cost;
+            TxtSafetyBody.Text = body;
+            // 「机器人安全」页签里放一份同样的文字：3D 视图被相机拖动时卡片仍可见，
+            // 但用户也可能就待在参数页，不该为了看结论切回去。
+            TxtSafetyInline.Text = string.IsNullOrEmpty(cost)
+                ? $"{verdict}\n{body}"
+                : $"{verdict}（{cost}）\n{body}";
+        }
+
+        /// <summary>
+        /// 把风险点分三层画，否则会糊成一片看不出重点：
+        ///   红（大）   P0 碰撞 / 不可达 / 自碰撞 —— 这里必须停线
+        ///   橙（中）   间隙不足 / 关节余量不足 —— 局部风险，位置有意义
+        ///   黄（小）   喷角 / 奇异 / 倾角跳变 —— 趋势性指标，成百上千个点，
+        ///              抽稀到 ≤400 个只为"告诉你在哪一段"，具体数量看结论卡
+        /// </summary>
+        void RenderSafetyOverlay(RobotSafetyPoint[] arr, bool showFixed)
+        {
+            foreach (var v in _riskVisuals) Viewport.Children.Remove(v);
+            _riskVisuals.Clear();
+            if (_fixedVisual != null)
+            {
+                Viewport.Children.Remove(_fixedVisual);
+                _fixedVisual = null;
+            }
+            if (arr.Length == 0) return;
+
+            const uint MaskLocal = RobotSafetyRule.Clearance | RobotSafetyRule.JointLimit;
+
+            var red = new Point3DCollection();
+            var orange = new Point3DCollection();
+            var yellowAll = new List<Point3D>();
+
+            foreach (var q in arr)
+            {
+                if (q.violation == 0) continue;
+                var pt = new Point3D(q.x, q.y, q.z);
+                if ((q.violation & MaskP0) != 0) red.Add(pt);
+                else if ((q.violation & MaskLocal) != 0) orange.Add(pt);
+                else yellowAll.Add(pt);
+            }
+
+            void AddRisk(System.Windows.Media.Media3D.Point3DCollection c, Color col, double size)
+            {
+                if (c.Count == 0) return;
+                var v = new PointsVisual3D { Points = c, Color = col, Size = size };
+                _riskVisuals.Add(v);
+                Viewport.Children.Add(v);
+            }
+            AddRisk(red, Color.FromRgb(255, 48, 32), 13);
+            AddRisk(orange, Color.FromRgb(251, 146, 60), 8);
+
+            // 趋势性风险点多到几千个，全画出来只会盖住工件，抽稀保留分布位置
+            int nYellowDraw = 0;
+            if (yellowAll.Count > 0)
+            {
+                int step = Math.Max(1, yellowAll.Count / 400);
+                var y = new Point3DCollection(yellowAll.Count / step + 2);
+                for (int i = 0; i < yellowAll.Count; i += step) { y.Add(yellowAll[i]); nYellowDraw++; }
+                AddRisk(y, Color.FromRgb(250, 204, 21), 4);
+            }
+
+            // 修正后轨迹：是否连线看**原轨迹**相邻点距（>15mm 即跨行/空移，不连），
+            // 不能用修正后的距离——倾斜会把点整体挪开，按修正后距离判断会把每行都判成断开。
+            if (showFixed && _lastTraj.Count == arr.Length)
+            {
+                var pts = new Point3DCollection(arr.Length * 2);
+                for (int i = 1; i < arr.Length; i++)
+                {
+                    var o0 = _lastTraj[i - 1];
+                    var o1 = _lastTraj[i];
+                    double dx = o1.x - o0.x, dy = o1.y - o0.y, dz = o1.z - o0.z;
+                    if (Math.Sqrt(dx * dx + dy * dy + dz * dz) > 15.0) continue;
+                    pts.Add(new Point3D(arr[i - 1].x, arr[i - 1].y, arr[i - 1].z));
+                    pts.Add(new Point3D(arr[i].x, arr[i].y, arr[i].z));
+                }
+                if (pts.Count > 0)
+                {
+                    _fixedVisual = new LinesVisual3D
+                    {
+                        Points = pts,
+                        Color = Color.FromArgb(205, 34, 211, 238),
+                        Thickness = 1.1
+                    };
+                    Viewport.Children.Add(_fixedVisual);
+                }
+            }
+
+            ApplyRiskVisibility();
+            ApplyFixedVisibility();
+            App.Log("SAFETY/DRAW", null,
+                $"风险点 红={red.Count} 橙={orange.Count} 黄={nYellowDraw}/{yellowAll.Count}（抽稀）；" +
+                $"修正轨迹线段={(_fixedVisual?.Points.Count ?? 0) / 2}");
+        }
+
+        void ChkShowRisk_Changed(object sender, RoutedEventArgs e) => ApplyRiskVisibility();
+        void ChkShowFixed_Changed(object sender, RoutedEventArgs e) => ApplyFixedVisibility();
+
+        void ApplyRiskVisibility()
+        {
+            if (Viewport == null) return;
+            bool show = ChkShowRisk.IsChecked.GetValueOrDefault(true);
+            foreach (var v in _riskVisuals)
+            {
+                bool inTree = Viewport.Children.Contains(v);
+                if (show && !inTree) Viewport.Children.Add(v);
+                else if (!show && inTree) Viewport.Children.Remove(v);
+            }
+        }
+
+        void ApplyFixedVisibility()
+        {
+            if (Viewport == null || _fixedVisual == null) return;
+            bool show = ChkShowFixed.IsChecked.GetValueOrDefault(true);
+            bool inTree = Viewport.Children.Contains(_fixedVisual);
+            if (show && !inTree) Viewport.Children.Add(_fixedVisual);
+            else if (!show && inTree) Viewport.Children.Remove(_fixedVisual);
+        }
+
+        /// <summary>
+        /// 导出修正后的轨迹。列序与命令行版 spray_safety.exe 完全一致，
+        /// 下游（机器人程序 / 离线校验脚本）不区分数据来源。
+        /// </summary>
+        void BtnExportFixed_Click(object sender, RoutedEventArgs e)
+        {
+            if (_safetyPts.Length == 0)
+            {
+                MessageBox.Show("请先做一次安全评估。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var dlg = new SaveFileDialog
+            {
+                Filter = "CSV 轨迹|*.csv|所有文件|*.*",
+                FileName = "trajectory_safe.csv",
+            };
+            if (dlg.ShowDialog() != true) return;
+
+            try
+            {
+                WriteFixedCsv(dlg.FileName);
+                TxtHint.Text = $"修正后轨迹已导出：{dlg.FileName}（{_safetyPts.Length} 点）";
+                App.Log("SAFETY/EXPORT", null, $"{dlg.FileName} {_safetyPts.Length} 点");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"导出失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>写修正后轨迹 CSV（无对话框版本，供命令行验收复用）。</summary>
+        void WriteFixedCsv(string path)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("X,Y,Z,I,J,K,speed,spray,tilt_deg,clearance_mm,self_gap_mm,margin_deg,")
+              .Append("standoff_err_mm,lifted_mm,cond,reverted,J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation\n");
+            foreach (var q in _safetyPts)
+            {
+                sb.Append($"{q.x:F3},{q.y:F3},{q.z:F3},{q.i:F4},{q.j:F4},{q.k:F4},{q.speed:F1},{q.spray},");
+                sb.Append($"{q.tiltDeg:F2},{q.clearanceMm:F2},{q.selfGapMm:F2},{q.marginDeg:F2},");
+                sb.Append($"{q.standoffErrMm:E6},{q.liftedMm:F1},{q.cond:F1},{q.reverted}");
+                var th = q.theta ?? new double[6];
+                for (int k = 0; k < 6; k++)
+                    sb.Append($",{(k < th.Length ? th[k] : 0.0):F3}");
+                sb.Append($",{RuleText(q.violation)}\n");
+            }
+            System.IO.File.WriteAllText(path, sb.ToString(), new System.Text.UTF8Encoding(true));
+        }
+
+        static string RuleText(uint v)
+        {
+            if (v == 0) return "";
+            var parts = new List<string>(4);
+            if ((v & RobotSafetyRule.IkFail) != 0) parts.Add("IK_FAIL");
+            if ((v & RobotSafetyRule.Collision) != 0) parts.Add("COLLISION");
+            if ((v & RobotSafetyRule.Clearance) != 0) parts.Add("CLEARANCE");
+            if ((v & RobotSafetyRule.SelfCollision) != 0) parts.Add("SELF_COLLISION");
+            if ((v & RobotSafetyRule.JointLimit) != 0) parts.Add("JOINT_LIMIT");
+            if ((v & RobotSafetyRule.SprayAngle) != 0) parts.Add("SPRAY_ANGLE");
+            if ((v & RobotSafetyRule.NearSingular) != 0) parts.Add("NEAR_SINGULAR");
+            if ((v & RobotSafetyRule.TiltJump) != 0) parts.Add("TILT_JUMP");
+            return string.Join("|", parts);
         }
 
         static string FmtLen(MeshGeometry3D m)

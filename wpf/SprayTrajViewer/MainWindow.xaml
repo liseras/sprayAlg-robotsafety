@@ -6,106 +6,246 @@
         WindowStartupLocation="CenterScreen">
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="360"/>
+            <ColumnDefinition Width="380"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
-        <!-- 左侧：参数面板 -->
+        <!-- 左侧：参数面板
+             分两页签而不是一路往下堆：1080 高的屏幕上，单页滚动会把「生成轨迹」和
+             「安全评估」两个主按钮之一挤出首屏，用户找不到按钮比参数难找更糟。 -->
         <Border Grid.Column="0" Background="#F7F8FA" BorderBrush="#DDD" BorderThickness="0,0,1,0">
-            <ScrollViewer VerticalScrollBarVisibility="Auto">
-                <StackPanel Margin="16">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Margin="16,16,16,4">
                     <TextBlock Text="喷涂轨迹生成器" FontSize="20" FontWeight="Bold" Foreground="#1F2937"/>
-                    <TextBlock Text="C++ 算法核心 · 参数可调" FontSize="12" Foreground="#6B7280" Margin="0,4,0,16"/>
-
-                    <TextBlock Text="点云文件 (PLY)" FontWeight="SemiBold" Margin="0,8,0,4"/>
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBox x:Name="TxtPath" Text="C:\Users\DYF\Desktop\点云\喷涂点云\面板.ply" Padding="6" VerticalContentAlignment="Center"/>
-                        <Button Grid.Column="1" Content="浏览" Margin="8,0,0,0" Padding="12,4" Click="BtnBrowse_Click"/>
-                    </Grid>
-
-                    <TextBlock Text="工艺参数" FontWeight="SemiBold" Margin="0,20,0,4" Foreground="#2563EB"/>
-
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="扫描行距 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtRowSpacing" Text="12" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="轨迹点距 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtPointSpacing" Text="4" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="离面距离 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtStandoff" Text="100" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="折返半径系数" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtTurnFactor" Text="0.5" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="平面拟合阈值 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtFlatness" Text="40" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="曲面升级阈值 (mm)" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtCurvature" Text="5" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="SOR 近邻数" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtSorK" Text="20" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="SOR Z 倍数" Width="150" VerticalAlignment="Center"/>
-                        <TextBox x:Name="TxtSorZ" Text="2.5" Padding="4"/>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="法向翻转" Width="150" VerticalAlignment="Center"/>
-                        <ComboBox x:Name="CmbNormalFlip" Padding="4" SelectedIndex="0">
-                            <ComboBoxItem Content="自动判向"/>
-                            <ComboBoxItem Content="强制翻转"/>
-                        </ComboBox>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="喷涂方向" Width="150" VerticalAlignment="Center"
-                                   ToolTip="轨迹行沿工件长边还是短边走"/>
-                        <ComboBox x:Name="CmbScanDir" Padding="4" SelectedIndex="0">
-                            <ComboBoxItem Content="自动（最平滑）"/>
-                            <ComboBoxItem Content="沿长边喷（换行少）"/>
-                            <ComboBoxItem Content="沿短边喷（行短密）"/>
-                        </ComboBox>
-                    </DockPanel>
-                    <DockPanel Margin="0,4">
-                        <TextBlock Text="孔洞填补阈值 (mm)" Width="150" VerticalAlignment="Center"
-                                   ToolTip="点云间隙/小洞跨距小于此值时覆盖重建：轨迹连续跨越、重建面补洞；大于此值视为真实孔/槽保留"/>
-                        <TextBox x:Name="TxtFillHole" Text="300" Padding="4"/>
-                    </DockPanel>
-
-                    <Button x:Name="BtnGenerate" Content="生成轨迹" FontSize="15" FontWeight="Bold"
-                            Background="#2563EB" Foreground="White" Padding="0,10" Margin="0,20,0,0"
-                            Click="BtnGenerate_Click"/>
-
-                    <TextBlock Text="显示控制" FontWeight="SemiBold" Margin="0,20,0,4" Foreground="#2563EB"/>
-
-                    <CheckBox x:Name="ChkShowCloud" Content="显示原始点云"
-                              Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
-                              Checked="ChkShowCloud_Changed" Unchecked="ChkShowCloud_Changed"/>
-                    <CheckBox x:Name="ChkShowTraj" Content="显示轨迹"
-                              Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
-                              Checked="ChkShowTraj_Changed" Unchecked="ChkShowTraj_Changed"/>
-                    <CheckBox x:Name="ChkShowPlane" Content="显示重建平面（半透明）"
-                              Margin="0,4,0,0" VerticalContentAlignment="Center"
-                              Checked="ChkShowPlane_Changed" Unchecked="ChkShowPlane_Changed"/>
-
-                    <TextBlock x:Name="TxtResult" Text="" Margin="0,16,0,0" TextWrapping="Wrap" FontSize="12" Foreground="#1F2937"/>
+                    <TextBlock Text="C++ 算法核心 · 参数可调" FontSize="12" Foreground="#6B7280" Margin="0,4,0,0"/>
                 </StackPanel>
-            </ScrollViewer>
+
+                <TabControl x:Name="Tabs" Grid.Row="1" Margin="8,0,8,8" Background="Transparent"
+                            BorderThickness="0" Padding="0">
+                    <TabControl.Resources>
+                        <Style TargetType="TabItem">
+                            <Setter Property="FontSize" Value="13"/>
+                            <Setter Property="Padding" Value="14,6"/>
+                        </Style>
+                    </TabControl.Resources>
+                    <TabItem Header="轨迹生成">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel Margin="10,10,10,12">
+                                <TextBlock Text="点云文件 (PLY)" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="TxtPath" Text="C:\Users\DYF\Desktop\点云\喷涂点云\面板.ply" Padding="6" VerticalContentAlignment="Center"/>
+                                    <Button Grid.Column="1" Content="浏览" Margin="8,0,0,0" Padding="12,4" Click="BtnBrowse_Click"/>
+                                </Grid>
+
+                                <TextBlock Text="工艺参数" FontWeight="SemiBold" Margin="0,18,0,4" Foreground="#2563EB"/>
+
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="扫描行距 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtRowSpacing" Text="12" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="轨迹点距 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtPointSpacing" Text="4" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="离面距离 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtStandoff" Text="100" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="折返半径系数" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtTurnFactor" Text="0.5" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="平面拟合阈值 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtFlatness" Text="40" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="曲面升级阈值 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtCurvature" Text="5" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="SOR 近邻数" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtSorK" Text="20" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="SOR Z 倍数" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtSorZ" Text="2.5" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="法向翻转" Width="150" VerticalAlignment="Center"/>
+                                    <ComboBox x:Name="CmbNormalFlip" Padding="4" SelectedIndex="0">
+                                        <ComboBoxItem Content="自动判向"/>
+                                        <ComboBoxItem Content="强制翻转"/>
+                                    </ComboBox>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="喷涂方向" Width="150" VerticalAlignment="Center"
+                                               ToolTip="轨迹行沿工件长边还是短边走"/>
+                                    <ComboBox x:Name="CmbScanDir" Padding="4" SelectedIndex="0">
+                                        <ComboBoxItem Content="自动（最平滑）"/>
+                                        <ComboBoxItem Content="沿长边喷（换行少）"/>
+                                        <ComboBoxItem Content="沿短边喷（行短密）"/>
+                                    </ComboBox>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="孔洞填补阈值 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="点云间隙/小洞跨距小于此值时覆盖重建：轨迹连续跨越、重建面补洞；大于此值视为真实孔/槽保留"/>
+                                    <TextBox x:Name="TxtFillHole" Text="300" Padding="4"/>
+                                </DockPanel>
+
+                                <Button x:Name="BtnGenerate" Content="生成轨迹" FontSize="15" FontWeight="Bold"
+                                        Background="#2563EB" Foreground="White" Padding="0,10" Margin="0,18,0,0"
+                                        Click="BtnGenerate_Click"/>
+
+                                <TextBlock Text="显示控制" FontWeight="SemiBold" Margin="0,16,0,4" Foreground="#2563EB"/>
+
+                                <CheckBox x:Name="ChkShowCloud" Content="显示原始点云"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          Checked="ChkShowCloud_Changed" Unchecked="ChkShowCloud_Changed"/>
+                                <CheckBox x:Name="ChkShowTraj" Content="显示轨迹"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          Checked="ChkShowTraj_Changed" Unchecked="ChkShowTraj_Changed"/>
+                                <CheckBox x:Name="ChkShowPlane" Content="显示重建平面（半透明）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center"
+                                          Checked="ChkShowPlane_Changed" Unchecked="ChkShowPlane_Changed"/>
+                                <CheckBox x:Name="ChkShowRisk" Content="标记风险点（红=碰撞/不可达，橙=间隙/关节，黄=喷角等）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          Checked="ChkShowRisk_Changed" Unchecked="ChkShowRisk_Changed"/>
+                                <CheckBox x:Name="ChkShowFixed" Content="显示修正后轨迹（青，倾斜后）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center"
+                                          ToolTip="大多数时候与红色原轨迹重合；想看「哪些点被倾斜了」再打开"
+                                          Checked="ChkShowFixed_Changed" Unchecked="ChkShowFixed_Changed"/>
+
+                                <TextBlock x:Name="TxtResult" Text="" Margin="0,14,0,0" TextWrapping="Wrap"
+                                           FontSize="12" Foreground="#1F2937"/>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <TabItem Header="机器人安全">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel Margin="10,10,10,12">
+                                <TextBlock Text="VS-087 可执行性校验" FontWeight="Bold" FontSize="14" Foreground="#EA580C"/>
+                                <TextBlock Text="可达 · 关节限位 · 枪体/连杆与工件碰撞 · 连杆自碰撞 · 喷角"
+                                           FontSize="11" Foreground="#9CA3AF" Margin="0,2,0,0" TextWrapping="Wrap"/>
+
+                                <DockPanel Margin="0,14,0,0">
+                                    <TextBlock Text="基座位姿" Width="150" VerticalAlignment="Center"
+                                               ToolTip="点云坐标系 → 机器人基座坐标系。标定值请手输，自动假设仅用于可行性预判"/>
+                                    <ComboBox x:Name="CmbBaseMode" Padding="4" SelectedIndex="0"
+                                              SelectionChanged="CmbBaseMode_Changed">
+                                        <ComboBoxItem Content="自动假设（按工件质心）"/>
+                                        <ComboBoxItem Content="手动输入（标定值）"/>
+                                    </ComboBox>
+                                </DockPanel>
+
+                                <StackPanel x:Name="PanelBaseManual" Visibility="Collapsed" Margin="0,4,0,0">
+                                    <Grid Margin="0,2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="TxtBaseX" Text="0" Padding="4" Margin="0,0,4,0" ToolTip="基座原点 X（点云坐标系，mm）"/>
+                                        <TextBox x:Name="TxtBaseY" Grid.Column="1" Text="0" Padding="4" Margin="0,0,4,0" ToolTip="基座原点 Y（mm）"/>
+                                        <TextBox x:Name="TxtBaseZ" Grid.Column="2" Text="0" Padding="4" ToolTip="基座原点 Z（mm）"/>
+                                    </Grid>
+                                    <DockPanel Margin="0,4,0,0">
+                                        <TextBlock Text="朝向偏转 (deg)" Width="150" VerticalAlignment="Center"
+                                                   ToolTip="基座 +X 默认指向工件质心；此值在其基础上绕 Z 再转"/>
+                                        <TextBox x:Name="TxtBaseYaw" Text="0" Padding="4"/>
+                                    </DockPanel>
+                                </StackPanel>
+
+                                <TextBlock Text="机器人参数" FontWeight="SemiBold" Margin="0,16,0,0" Foreground="#2563EB"/>
+
+                                <!-- 两列并排：一列会让本页也滚起来 -->
+                                <Grid Margin="0,6,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="8"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition/>
+                                        <RowDefinition/>
+                                        <RowDefinition/>
+                                    </Grid.RowDefinitions>
+
+                                    <StackPanel Grid.Row="0" Grid.Column="0">
+                                        <TextBlock Text="工具长 法兰→喷嘴 (mm)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBox x:Name="TxtToolLen" Text="150" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Row="0" Grid.Column="2">
+                                        <TextBlock Text="安全间隙 (mm)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBox x:Name="TxtSafetyGap" Text="20" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Row="1" Grid.Column="0" Margin="0,8,0,0">
+                                        <TextBlock Text="工艺喷角上限 (deg)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="超出只报工艺告警（膜厚会变薄），不是碰撞"/>
+                                        <TextBox x:Name="TxtMaxSprayAngle" Text="30" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,8,0,0">
+                                        <TextBlock Text="倾角搜索上限 (deg)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBox x:Name="TxtTiltMax" Text="60" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+
+                                    <StackPanel Grid.Row="2" Grid.Column="0" Margin="0,8,0,0">
+                                        <TextBlock Text="关节余量下限 (deg)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBox x:Name="TxtJointMargin" Text="1" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <CheckBox x:Name="ChkAutoSafety" Content="生成轨迹后自动评估"
+                                          Margin="0,14,0,0" VerticalContentAlignment="Center" IsChecked="True"/>
+
+                                <Button x:Name="BtnSafety" Content="机器人安全评估" FontSize="15" FontWeight="Bold"
+                                        Background="#EA580C" Foreground="White" Padding="0,10" Margin="0,10,0,0"
+                                        Click="BtnSafety_Click"/>
+                                <Button x:Name="BtnExportFixed" Content="导出修正后轨迹 (CSV)" Padding="0,7"
+                                        Margin="0,8,0,0" Background="#F3F4F6" BorderBrush="#D1D5DB"
+                                        ToolTip="含倾斜后的 TCP、枪轴、关节角与逐点间隙，可直接给机器人执行"
+                                        Click="BtnExportFixed_Click"/>
+
+                                <TextBlock Text="结论" FontWeight="SemiBold" Margin="0,16,0,4" Foreground="#2563EB"/>
+                                <Border Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1"
+                                        CornerRadius="6" Padding="10">
+                                    <TextBlock x:Name="TxtSafetyInline" Text="尚未评估"
+                                               FontSize="12" Foreground="#374151" TextWrapping="Wrap" LineHeight="19"/>
+                                </Border>
+
+                                <TextBlock Text="说明" FontWeight="SemiBold" Margin="0,16,0,4" Foreground="#2563EB"/>
+                                <TextBlock FontSize="11" Foreground="#6B7280" TextWrapping="Wrap" LineHeight="18">
+                                    <Run Text="P0（碰撞 / 不可达 / 自碰撞）必须处理，否则机器人走不了。"/>
+                                    <LineBreak/>
+                                    <Run Text="P1（间隙不足 / 关节余量不足 / 喷角超工艺上限）可执行但有代价。"/>
+                                    <LineBreak/>
+                                    <Run Text="P2（接近奇异 / 倾角跳变）只影响节拍与平顺性。"/>
+                                    <LineBreak/>
+                                    <LineBreak/>
+                                    <Run Text="倾斜是绕面点的球面旋转：只改喷角，喷距严格不变，逐点偏差会打在结论里。"/>
+                                    <LineBreak/>
+                                    <Run Text="基座填「自动假设」时，可达率只作预判；要出正式结论请填标定值。"/>
+                                </TextBlock>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+                </TabControl>
+            </Grid>
         </Border>
 
         <!-- 右侧：3D 视图 -->
@@ -117,6 +257,25 @@
             </hx:HelixViewport3D>
             <Border Background="#66000000" Padding="10" VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="12" CornerRadius="6">
                 <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
+            </Border>
+
+            <!-- 安全评估结论：贴在视图右上角，结论一眼可见 -->
+            <Border x:Name="CardSafety" Visibility="Collapsed"
+                    Background="#F21B1F2A" BorderBrush="#3A4250" BorderThickness="1"
+                    Padding="14,12" VerticalAlignment="Top" HorizontalAlignment="Right"
+                    Margin="12" CornerRadius="8" MinWidth="320" MaxWidth="400">
+                <StackPanel>
+                    <DockPanel>
+                        <TextBlock x:Name="TxtSafetyVerdict" Text="—" FontSize="17" FontWeight="Bold"
+                                   Foreground="#4ADE80" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="TxtSafetyCost" Text="" FontSize="11" Foreground="#9CA3AF"
+                                   VerticalAlignment="Center" HorizontalAlignment="Right"/>
+                    </DockPanel>
+                    <TextBlock x:Name="TxtSafetyBody" Text="" FontSize="12" Foreground="#E5E7EB"
+                               TextWrapping="Wrap" Margin="0,8,0,0" LineHeight="19"/>
+                    <TextBlock Text="红=碰撞/不可达　橙=间隙/关节　黄=喷角等趋势项（抽稀）"
+                               FontSize="10" Foreground="#6B7280" Margin="0,7,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
             </Border>
         </Grid>
     </Grid>
