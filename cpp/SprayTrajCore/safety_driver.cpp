@@ -301,6 +301,21 @@ bool readTraj(const char* path, TrajCsv& out) {
     return true;
 }
 
+// 最近碰撞部位名（与控制台/CSV 共用；robot_safety.cpp 内部同名函数不对外）
+std::string segName(int kind, int j0, int j1) {
+    char b[48];
+    switch (kind) {
+        case RS_SEG_GRIP: return "工具握把";
+        case RS_SEG_PIPE: return "工具细管";
+        case RS_SEG_NOZZLE: return "喷嘴";
+        case RS_SEG_BASE_COL: return "底座立柱";
+        case RS_SEG_BASE_NECK: return "底座颈";
+        case RS_SEG_JOINT: snprintf(b, sizeof(b), "关节J%d", j0); return b;
+        case RS_SEG_LINK: snprintf(b, sizeof(b), "连杆J%d-J%d", j0, j1); return b;
+        default: return "—";
+    }
+}
+
 const char* violText(unsigned int v, std::string& buf) {
     buf.clear();
     for (int i = 0; i < RS_VIOL_COUNT; ++i) {
@@ -425,7 +440,8 @@ int main(int argc, char** argv) {
     int nCols = (int)traj.header.size();
     fprintf(fc, "X,Y,Z,I,J,K,speed,spray");
     for (int c = 8; c < nCols; ++c) fprintf(fc, ",%s", traj.header[c].c_str());
-    fprintf(fc, ",tilt_deg,clearance_mm,self_gap_mm,margin_deg,standoff_err_mm,lifted_mm,cond,reverted,"
+    fprintf(fc, ",tilt_deg,clearance_mm,clearance_tool_mm,clearance_link_mm,worst_part,link_part,"
+                "self_gap_mm,margin_deg,standoff_err_mm,lifted_mm,cond,reverted,"
                 "J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation\n");
     std::string vbuf;
     for (int i = 0; i < r.count; ++i) {
@@ -442,9 +458,12 @@ int main(int argc, char** argv) {
             else snprintf(buf, n, "%.*f", prec, v);
             return buf;
         };
-        char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
-        fprintf(fc, ",%s,%s,%s,%s,%s,%s,%s,%d,", num(q.tiltDeg, 2, b1, sizeof(b1)),
-                num(q.clearanceMm, 2, b2, sizeof(b2)), num(q.selfGapMm, 2, b3, sizeof(b3)),
+        char b1[32], b2[32], b3[32], b4[32], b5[32], b6[32], b7[32], b8[32], b9[32];
+        fprintf(fc, ",%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%d,", num(q.tiltDeg, 2, b1, sizeof(b1)),
+                num(q.clearanceMm, 2, b2, sizeof(b2)), num(q.clearanceToolMm, 2, b9, sizeof(b9)),
+                num(q.clearanceLinkMm, 2, b8, sizeof(b8)), segName(q.worstKind, q.worstJ0, q.worstJ1).c_str(),
+                segName(q.linkKind, q.linkJ0, q.linkJ1).c_str(),
+                num(q.selfGapMm, 2, b3, sizeof(b3)),
                 num(q.marginDeg, 2, b4, sizeof(b4)), num(q.standoffErrMm, 6, b5, sizeof(b5)),
                 num(q.liftedMm, 1, b6, sizeof(b6)), num(q.cond, 1, b7, sizeof(b7)), q.reverted);
         for (int k = 0; k < 6; ++k) fprintf(fc, "%.3f,", q.theta[k]);
@@ -474,7 +493,9 @@ int main(int argc, char** argv) {
     int p0 = 0;
     for (int b = 0; b < RS_VIOL_COUNT; ++b) {
         const char* nm = robot_safety_rule_name(1u << b);
-        bool isP0 = (b == 0 || b == 1 || b == 3);   // IK_FAIL / COLLISION / SELF_COLLISION
+        // P0：不可达 / 自碰撞 / 连杆撞 / 枪体撞。COLLISION(1) 已被 LINK_HIT/TOOL_HIT 细分，
+        // 本层不再置位，所以这里不把它算进 P0（否则 byRule[1] 恒为 0，算了也没意义）。
+        bool isP0 = (b == 0 || b == 3 || b == 8 || b == 9);
         if (isP0) p0 += r.byRule[b];
         if (r.byRule[b] > 0 && !quiet) {
             printf("  %-15s %7d  [%s]\n", nm ? nm : "?", r.byRule[b], isP0 ? "P0" : "P1/P2");
@@ -490,6 +511,29 @@ int main(int argc, char** argv) {
                r.standoffMaxErrMm);
     else
         printf("  最小表面距离 —（全部点都不可达）· 平滑回退 %d 点\n", r.poseReverted);
+
+    // 枪体 / 连杆分开报：这两类撞车的处置完全不同（枪体撞→改喷距/角度；
+    // 连杆撞→改站位或整条轨迹的姿态），混成一个数字现场没法判断。
+    {
+        char ct[32], cl[32];
+        if (std::isfinite(r.minClearanceToolMm)) snprintf(ct, sizeof(ct), "%.2fmm", r.minClearanceToolMm);
+        else snprintf(ct, sizeof(ct), "—");
+        if (std::isfinite(r.minClearanceLinkMm)) snprintf(cl, sizeof(cl), "%.2fmm", r.minClearanceLinkMm);
+        else snprintf(cl, sizeof(cl), "—");
+        printf("  枪体最小表面距离 %s · 连杆最小表面距离 %s\n", ct, cl);
+    }
+    // 最危险连杆段（现场最关心：哪一段连杆几乎蹭到工件）
+    {
+        double worst = 1e300;
+        int wk = -1, wj0 = -1, wj1 = -1, wi = -1;
+        for (int i = 0; i < r.count; ++i) {
+            const RobotSafetyPoint& q = r.points[i];
+            if (!std::isfinite(q.clearanceLinkMm)) continue;
+            if (q.clearanceLinkMm < worst) { worst = q.clearanceLinkMm; wk = q.linkKind; wj0 = q.linkJ0; wj1 = q.linkJ1; wi = i; }
+        }
+        if (wi >= 0)
+            printf("  连杆/关节最近：%s  %+.2fmm（idx %d）\n", segName(wk, wj0, wj1).c_str(), worst, wi);
+    }
     if (r.baseAuto) printf("  ⚠ 基座位姿为自动假设（未给 -base），可达率与连杆碰撞结论依赖它\n");
     if (r.l0Issues) printf("  ⚠ L0 输入层自检有 %d 项问题（详见 -standoff / 臂展），结论需谨慎\n", r.l0Issues);
     if (r.standoffMedianMm > 0) printf("  反推喷距中位数 %.2fmm（沿枪轴投影）\n", r.standoffMedianMm);

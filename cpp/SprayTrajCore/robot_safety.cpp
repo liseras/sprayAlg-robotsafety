@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -600,21 +601,22 @@ struct Seg {
     int group;
     int j0, j1;    // 关联关节号（自碰撞排除用；-1 表示无）
     const char* part;
+    int kind;      // RS_SEG_*，用于把「最近部位」报成人能看懂的名字
 };
 
 void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vector<Seg>& out) {
     out.clear();
     if (includeBase) {
         double baseH = std::max(4.0, f.origins[1].z * 0.55);
-        out.push_back({V3(0, 0, 0), V3(0, 0, baseH), sz.baseColumnR, SG_BASE, -1, -1, "底座立柱"});
-        out.push_back({V3(0, 0, baseH), f.origins[1], sz.baseNeckR, SG_BASE, -1, -1, "底座颈"});
+        out.push_back({V3(0, 0, 0), V3(0, 0, baseH), sz.baseColumnR, SG_BASE, -1, -1, "底座立柱", RS_SEG_BASE_COL});
+        out.push_back({V3(0, 0, baseH), f.origins[1], sz.baseNeckR, SG_BASE, -1, -1, "底座颈", RS_SEG_BASE_NECK});
     }
     for (int i = 1; i <= 6; ++i) {
         double jr = (i == 1) ? sz.joint1R : sz.jointR;
-        out.push_back({f.origins[i], f.origins[i], jr, SG_JOINT, i, i, "关节"});
+        out.push_back({f.origins[i], f.origins[i], jr, SG_JOINT, i, i, "关节", RS_SEG_JOINT});
         if (i + 1 < 7) {
             double rr = (i >= 4) ? sz.wristLinkR : sz.linkR;
-            out.push_back({f.origins[i], f.origins[i + 1], rr, SG_LINK, i, i + 1, "连杆"});
+            out.push_back({f.origins[i], f.origins[i + 1], rr, SG_LINK, i, i + 1, "连杆", RS_SEG_LINK});
         }
     }
     V3 flange = f.flange.t, tcp = f.tcp.t;
@@ -624,9 +626,28 @@ void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vect
         V3 u = d * (1.0 / L);
         V3 neck = flange + u * (L * kGripFraction);
         V3 tip = tcp + u * (L * kNozzleFraction);
-        out.push_back({flange, neck, sz.gripR, SG_TOOL, -1, -1, "工具握把"});
-        out.push_back({neck, tcp, sz.toolPipeR, SG_TOOL, -1, -1, "工具细管"});
-        out.push_back({tcp, tip, sz.nozzleR, SG_TOOL, -1, -1, "喷嘴"});
+        out.push_back({flange, neck, sz.gripR, SG_TOOL, -1, -1, "工具握把", RS_SEG_GRIP});
+        out.push_back({neck, tcp, sz.toolPipeR, SG_TOOL, -1, -1, "工具细管", RS_SEG_PIPE});
+        out.push_back({tcp, tip, sz.nozzleR, SG_TOOL, -1, -1, "喷嘴", RS_SEG_NOZZLE});
+    }
+}
+
+// 部位名（含关节号），给控制台/CSV/界面用
+std::string segName(int kind, int j0, int j1) {
+    char buf[48];
+    switch (kind) {
+        case RS_SEG_GRIP:      return "工具握把";
+        case RS_SEG_PIPE:      return "工具细管";
+        case RS_SEG_NOZZLE:    return "喷嘴";
+        case RS_SEG_BASE_COL:  return "底座立柱";
+        case RS_SEG_BASE_NECK: return "底座颈";
+        case RS_SEG_JOINT:
+            std::snprintf(buf, sizeof(buf), "关节J%d", j0);
+            return buf;
+        case RS_SEG_LINK:
+            std::snprintf(buf, sizeof(buf), "连杆J%d-J%d", j0, j1);
+            return buf;
+        default: return "—";
     }
 }
 
@@ -879,7 +900,9 @@ struct PR {
     int idx = -1;
     double tiltDeg = 0.0;
     double azDeg = 0.0;
-    double clearance = 0.0;
+    double clearance = 0.0;   // min(clrTool, clrLink)
+    double clrTool = 1e300;   // 仅枪体
+    double clrLink = 1e300;   // 仅连杆/关节/底座
     double selfGap = 1e300;
     double margin = 0.0;
     double cond = 0.0;
@@ -893,6 +916,8 @@ struct PR {
     bool reverted = false;
     unsigned int viol = 0;
     const char* part = "";
+    int partKind = -1, partJ0 = -1, partJ1 = -1;   // 全局最近部位（RS_SEG_*）
+    int linkKind = -1, linkJ0 = -1, linkJ1 = -1;   // 连杆/关节里最近的那一段
 };
 
 // 位姿优劣（越大越好）：自碰撞通过 > 间隙大 > 关节余量大。
@@ -952,19 +977,25 @@ public:
         std::vector<Seg> segs;
         buildSegments(f, sz_, p_.includeBase, segs);
 
-        double worst = 1e300;
-        const char* worstPart = "";
+        double worstTool = 1e300, worstLink = 1e300;
+        const Seg* segTool = nullptr;
+        const Seg* segLink = nullptr;
         for (const Seg& s : segs) {
             if (!checkLinks && s.group != SG_TOOL) continue;
-            V3 a = toCloudP(s.a), b = toCloudP(s.b);
-            double dist = cloud_.segmentDist(a, b, p_.search);
+            bool isTool = (s.group == SG_TOOL);
+            double cur = isTool ? worstTool : worstLink;
+            // 剪枝上限：若这一段连「当前最差表面距离」都够不着，它不可能更新最差值。
+            // 不这么做就只能靠抽样（原来每 3 点才判一次连杆），那等于漏判 2/3 的点。
+            double limit = std::min(p_.search, (cur < 1e299) ? cur + s.r : p_.search);
+            double dist = cloud_.segmentDist(toCloudP(s.a), toCloudP(s.b), limit);
             double surface = dist - s.r;
-            if (surface < worst) {
-                worst = surface;
-                worstPart = s.part;
+            if (surface < cur) {
+                if (isTool) { worstTool = surface; segTool = &s; }
+                else { worstLink = surface; segLink = &s; }
             }
         }
-
+        const Seg* worstSeg = (worstTool <= worstLink) ? segTool : segLink;
+        double worst = std::min(worstTool, worstLink);
         double selfGap = 1e300;
         for (const auto& pr : pairs_) {
             const Seg& sa = segs[pr.first];
@@ -977,7 +1008,15 @@ public:
         out.tiltDeg = tiltDeg;
         out.azDeg = azDeg;
         out.clearance = worst;
-        out.part = worstPart;
+        out.clrTool = worstTool;
+        out.clrLink = worstLink;
+        out.part = worstSeg ? worstSeg->part : "";
+        out.partKind = worstSeg ? worstSeg->kind : -1;
+        out.partJ0 = worstSeg ? worstSeg->j0 : -1;
+        out.partJ1 = worstSeg ? worstSeg->j1 : -1;
+        out.linkKind = segLink ? segLink->kind : -1;
+        out.linkJ0 = segLink ? segLink->j0 : -1;
+        out.linkJ1 = segLink ? segLink->j1 : -1;
         out.ikOk = true;
         out.over = sol.over;
         out.margin = sol.margin;
@@ -1216,7 +1255,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.safety = 20.0;
     p.search = 120.0;
     p.toolLen = kDefaultToolLen;
-    p.tiltNonUpDeg = 20.0;
+    p.tiltNonUpDeg = 30.0;   // α=90°（竖直侧壁）时的倾角 = 工艺上限。见 needTilt 的说明
     p.upThresholdDeg = 45.0;
     p.tiltMaxDeg = 60.0;
     p.tiltStepDeg = 5.0;
@@ -1225,7 +1264,9 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.jointMarginMin = 1.0;
     p.condMax = 30.0;
     p.transitLiftMax = 400.0;
-    p.linkStride = 3;
+    // 默认逐点全判连杆。原来的 3 点抽 1 点是为省时间加的，代价是 2/3 的点根本没查连杆，
+    // 而"连杆会不会撞工件"恰恰是现场最关心的一条。eval 里已用剪枝上限把开销压回来。
+    p.linkStride = 1;
     p.includeBase = 0;
     p.fixTransit = 1;
     p.azFallback = 1;
@@ -1243,6 +1284,8 @@ const char* robot_safety_rule_name(unsigned int bit) {
         case RS_VIOL_SPRAY_ANGLE: return "SPRAY_ANGLE";
         case RS_VIOL_NEAR_SINGULAR: return "NEAR_SINGULAR";
         case RS_VIOL_TILT_JUMP: return "TILT_JUMP";
+        case RS_VIOL_LINK_HIT: return "LINK_HIT";
+        case RS_VIOL_TOOL_HIT: return "TOOL_HIT";
         default: return nullptr;
     }
 }
@@ -1265,6 +1308,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     RobotSafetyResult R;
     std::memset(&R, 0, sizeof(R));
     R.minClearanceMm = std::numeric_limits<double>::infinity();
+    R.minClearanceToolMm = std::numeric_limits<double>::infinity();
+    R.minClearanceLinkMm = std::numeric_limits<double>::infinity();
     R.count = 0;
 
     auto fail = [&](const char* msg) -> RobotSafetyResult {
@@ -1493,8 +1538,12 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
         standoffMaxErr = std::max(standoffMaxErr, pr.standoffErr);
 
-        if (pr.clearance < 0.0) pr.viol |= RS_VIOL_COLLISION;
-        else if (pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
+        // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
+        // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
+        // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
+        if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
+        if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
+        if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
         if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
         if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
         if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
@@ -1522,7 +1571,11 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             pr.pos = pr.pos + V3(0, 0, lift);
             pr.lifted = lift;
             pr.clearance += lift;
-            pr.viol &= ~(RS_VIOL_COLLISION | RS_VIOL_CLEARANCE);
+            // 分组距离必须同步抬升，否则总结论（已避开）与"连杆最小距离"（还是抬升前）
+            // 会自相矛盾 —— curved 上就出现过 clearance=20.02 而 clrTool=11.39。
+            if (pr.clrTool < 1e299) pr.clrTool += lift;
+            if (pr.clrLink < 1e299) pr.clrLink += lift;
+            pr.viol &= ~(RS_VIOL_COLLISION | RS_VIOL_CLEARANCE | RS_VIOL_LINK_HIT | RS_VIOL_TOOL_HIT);
             ++lifted;
         }
     }
@@ -1574,6 +1627,13 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     angles.reserve(n);
     double minClr = std::numeric_limits<double>::infinity();
     int tilted = 0;
+    double minClrTool = std::numeric_limits<double>::infinity();
+    double minClrLink = std::numeric_limits<double>::infinity();
+    // 未测到（IK 失败 / 本点没查连杆）统一写 nan：写 0 会被读成"贴脸 0mm"，
+    // 那比"没测"更误导。
+    auto measured = [](double v) {
+        return (std::isfinite(v) && v < 1e299) ? v : std::numeric_limits<double>::quiet_NaN();
+    };
     vc.total = 0;
     std::memset(vc.byRule, 0, sizeof(vc.byRule));
 
@@ -1599,6 +1659,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         q.ikOk = pr.ikOk ? 1 : 0;
         q.reverted = pr.reverted ? 1 : 0;
         q.violation = pr.viol;
+        q.clearanceToolMm = measured(pr.clrTool);
+        q.clearanceLinkMm = measured(pr.clrLink);
+        q.worstKind = pr.ikOk ? pr.partKind : -1;
+        q.worstJ0 = pr.ikOk ? pr.partJ0 : -1;
+        q.worstJ1 = pr.ikOk ? pr.partJ1 : -1;
+        q.linkKind = pr.ikOk ? pr.linkKind : -1;
+        q.linkJ0 = pr.ikOk ? pr.linkJ0 : -1;
+        q.linkJ1 = pr.ikOk ? pr.linkJ1 : -1;
         if (pr.viol) {
             for (int b = 0; b < RS_VIOL_COUNT; ++b)
                 if (pr.viol & (1u << b)) ++vc.byRule[b];
@@ -1608,6 +1676,9 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         // 只统计**有限**的间隙：IK 失败的点 clearance 是 -inf，混进来会让
         // "最小表面距离" 变成一个没有意义的 -inf（真正要看的是不可达率）。
         if (std::isfinite(pr.clearance) && pr.clearance < minClr) minClr = pr.clearance;
+        double ct = measured(pr.clrTool), cl = measured(pr.clrLink);
+        if (ct < minClrTool) minClrTool = ct;
+        if (cl < minClrLink) minClrLink = cl;
         if (pr.sprayAngle > 0.5) ++tilted;
     }
 
@@ -1622,6 +1693,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     R.violations = vc.total;
     for (int b = 0; b < RS_VIOL_COUNT; ++b) R.byRule[b] = vc.byRule[b];
     R.minClearanceMm = minClr;
+    R.minClearanceToolMm = minClrTool;
+    R.minClearanceLinkMm = minClrLink;
     R.tiltMeanDeg = n ? sum / n : 0.0;
     R.tiltP95Deg = percentile(angles, 0.95);
     R.tiltMaxDeg = angles.empty() ? 0.0 : *std::max_element(angles.begin(), angles.end());

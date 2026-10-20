@@ -50,7 +50,7 @@ class Params:
     # 报告里只剩一排"≥40"，等于什么都没测到。这是 DensoArmKine CloudCheck 的同一口径
     # （EffectiveSearchMm = max(120, safety*4)）。
     search: float = 120.0              # 判定带（mm）：超过它就报下界，不当实测值
-    tilt_nonup_deg: float = 20.0       # α=90°（竖直侧壁）时的倾角；实际 = 它 × α/90°
+    tilt_nonup_deg: float = 30.0       # α=90°（竖直侧壁）时的倾角；实际 = 它 × α/90°
     up_threshold_deg: float = 45.0     # 已不参与倾角决策（倾角改线性），保留以对齐 C++ ABI
     tilt_max_deg: float = 60.0         # 倾角上限
     tilt_step_deg: float = 5.0
@@ -60,7 +60,7 @@ class Params:
     include_base: bool = False         # 点云里若有地面/底座，打开它
     joint_margin_min: float = 1.0      # 关节限位余量下限（度）
     cond_max: float = 30.0             # 归一化雅可比条件数上限（奇异判定，只告警不阻断）
-    link_stride: int = 3               # 连杆碰撞每隔几个点查一次（工具段每点都查）
+    link_stride: int = 1               # 连杆碰撞抽样步长（1=逐点全判，产品版默认）
     fix_transit: bool = True           # 过渡点（spray=0）碰撞时允许沿 +Z 抬升
     transit_lift_max: float = 400.0    # 过渡点最大抬升量（mm）
     az_fallback: bool = True           # 允许把「上翻方向」左右各偏 30/60° 作为兜底

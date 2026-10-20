@@ -51,7 +51,19 @@ typedef struct RobotSafetyParams {
 #define RS_VIOL_SPRAY_ANGLE    (1u << 5)   // P1 喷角超工艺上限
 #define RS_VIOL_NEAR_SINGULAR  (1u << 6)   // P2 接近奇异
 #define RS_VIOL_TILT_JUMP      (1u << 7)   // P2 倾角相对上一点跳变过大
-#define RS_VIOL_COUNT          8
+#define RS_VIOL_LINK_HIT       (1u << 8)   // P0 连杆/关节/底座撞点云（不含枪体）
+#define RS_VIOL_TOOL_HIT       (1u << 9)   // P0 枪体/细管/喷嘴撞点云
+#define RS_VIOL_COUNT          10
+
+// 最近碰撞部位编码（Point.worstKind）。工具段报 kind 0/1/2，
+// 连杆段报 kind 3 并用 j0/j1 标出两端关节号（如 3 + (2,3) = 「连杆 J2-J3」）。
+#define RS_SEG_GRIP     0   // 工具握把（法兰→0.72 工具长）
+#define RS_SEG_PIPE     1   // 工具细管（0.72→1.0 工具长）
+#define RS_SEG_NOZZLE   2   // 喷嘴（超出 TCP 的 0.18 工具长）
+#define RS_SEG_LINK     3   // 连杆 J{j0}-J{j1}
+#define RS_SEG_JOINT    4   // 关节球 J{j0}
+#define RS_SEG_BASE_COL 5
+#define RS_SEG_BASE_NECK 6
 
 // 单个点：既有输入（修正后），也有结论
 // 布局刻意「doubles 在前、ints 在后」：P/Invoke 的 LayoutKind.Sequential 按 8 字节对齐，
@@ -68,12 +80,18 @@ typedef struct RobotSafetyPoint {
     double standoffErrMm;    // |TCP-面点| 与 standoff 的偏差（球面旋转的守恒大验证）
     double liftedMm;         // 过渡点抬升量
     double cond;             // 归一化雅可比条件数
+    double clearanceToolMm;  // 仅枪体（握把+细管+喷嘴）的最小表面距离，负=穿透
+    double clearanceLinkMm;  // 仅连杆+关节+底座的最小表面距离，负=穿透
     double theta[6];         // 关节角（度）；ikOk=0 时为 0
 
     int    spray;            // 1=喷涂
     int    ikOk;
     int    reverted;         // 1 = 平滑位姿更差，已退回本点最优（碰撞优先于姿态连续）
     unsigned int violation;  // RS_VIOL_* 位或
+    int    worstKind;        // 全局最近部位（RS_SEG_*）；-1 = 无位姿
+    int    worstJ0, worstJ1; // 该部位两端关节号（连杆用；其余为 -1）
+    int    linkKind;         // 连杆/关节/底座里最近的那一段（-1 = 没查连杆）
+    int    linkJ0, linkJ1;
 } RobotSafetyPoint;
 
 // 整体结果
@@ -87,7 +105,9 @@ typedef struct RobotSafetyResult {
     int    violations;       // 违规条目总数
     int    byRule[RS_VIOL_COUNT];
 
-    double minClearanceMm;
+    double minClearanceMm;      // 全部碰撞体（枪体 + 连杆）的最小表面距离
+    double minClearanceToolMm;  // 仅枪体的最小表面距离（喷嘴/细管/握把）
+    double minClearanceLinkMm;  // 仅连杆/关节/底座的最小表面距离
     double tiltMeanDeg;
     double tiltP95Deg;
     double tiltMaxDeg;

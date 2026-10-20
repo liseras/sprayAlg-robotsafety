@@ -108,6 +108,27 @@ namespace SprayTrajViewer
         public const uint SprayAngle = 1u << 5;
         public const uint NearSingular = 1u << 6;
         public const uint TiltJump = 1u << 7;
+        public const uint LinkHit = 1u << 8;    // 连杆/关节/底座撞点云
+        public const uint ToolHit = 1u << 9;    // 枪体/细管/喷嘴撞点云
+        // Collision 是旧版汇总位，本层已由 LinkHit/ToolHit 细分，不再置位（保留位序不破坏兼容）
+    }
+
+    // 最近碰撞部位编码（与 RS_SEG_* 一致）
+    public static class SegKind
+    {
+        public const int Grip = 0, Pipe = 1, Nozzle = 2, Link = 3, Joint = 4, BaseCol = 5, BaseNeck = 6;
+
+        public static string Name(int kind, int j0, int j1) => kind switch
+        {
+            Grip => "工具握把",
+            Pipe => "工具细管",
+            Nozzle => "喷嘴",
+            Link => $"连杆J{j0}-J{j1}",
+            Joint => $"关节J{j0}",
+            BaseCol => "底座立柱",
+            BaseNeck => "底座颈",
+            _ => "—",
+        };
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -123,12 +144,18 @@ namespace SprayTrajViewer
         public double standoffErrMm; // 喷距守恒偏差
         public double liftedMm;      // 过渡点抬升量
         public double cond;          // 归一化雅可比条件数
+        public double clearanceToolMm;   // 仅枪体（握把/细管/喷嘴）的最小表面距离
+        public double clearanceLinkMm;   // 仅连杆/关节/底座的最小表面距离
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
         public double[] theta;       // 关节角（度）
         public int    spray;
         public int    ikOk;
         public int    reverted;
         public uint   violation;
+        public int    worstKind;     // 全局最近部位（RS_SEG_*），-1 = 无位姿
+        public int    worstJ0, worstJ1;
+        public int    linkKind;      // 连杆/关节里最近的那一段
+        public int    linkJ0, linkJ1;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -140,9 +167,11 @@ namespace SprayTrajViewer
         public int    tiltedPoints;
         public int    poseReverted;
         public int    violations;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 10)]
         public int[]  byRule;
-        public double minClearanceMm;
+        public double minClearanceMm;      // 全部碰撞体
+        public double minClearanceToolMm;  // 仅枪体
+        public double minClearanceLinkMm;  // 仅连杆/关节/底座
         public double tiltMeanDeg;
         public double tiltP95Deg;
         public double tiltMaxDeg;

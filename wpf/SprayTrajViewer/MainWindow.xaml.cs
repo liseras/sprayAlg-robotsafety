@@ -640,7 +640,8 @@ namespace SprayTrajViewer
         private bool _suppressAutoSafety;
 
         // 严重度分组，与 C++ 侧 RS_VIOL_* 的 P0/P1/P2 划分一致
-        const uint MaskP0 = RobotSafetyRule.IkFail | RobotSafetyRule.Collision | RobotSafetyRule.SelfCollision;
+        const uint MaskP0 = RobotSafetyRule.IkFail | RobotSafetyRule.LinkHit | RobotSafetyRule.ToolHit
+                          | RobotSafetyRule.SelfCollision;
         const uint MaskP1 = RobotSafetyRule.Clearance | RobotSafetyRule.JointLimit | RobotSafetyRule.SprayAngle;
         const uint MaskP2 = RobotSafetyRule.NearSingular | RobotSafetyRule.TiltJump;
 
@@ -793,20 +794,37 @@ namespace SprayTrajViewer
                          : nP1 > 0 ? Color.FromRgb(251, 191, 36)
                                    : Color.FromRgb(74, 222, 128);
 
-            int[] b = sum.byRule ?? new int[8];
+            int[] b = sum.byRule ?? new int[10];
             string Rule(int bit) => b.Length > bit ? b[bit].ToString() : "0";
+
+            // 最危险的连杆段与枪体段：现场最想知道的不是"最小距离是多少"，
+            // 而是"哪一段撞了"——枪体撞改喷距/角度，连杆撞要改站位或整条姿态。
+            int linkIdx = -1, toolIdx = -1;
+            double linkMin = double.PositiveInfinity, toolMin = double.PositiveInfinity;
+            for (int i = 0; i < got.Length; i++)
+            {
+                if (got[i].clearanceLinkMm < linkMin) { linkMin = got[i].clearanceLinkMm; linkIdx = i; }
+                if (got[i].clearanceToolMm < toolMin) { toolMin = got[i].clearanceToolMm; toolIdx = i; }
+            }
+            string LinkDesc() => linkIdx >= 0 && double.IsFinite(linkMin)
+                ? $"{SegKind.Name(got[linkIdx].linkKind, got[linkIdx].linkJ0, got[linkIdx].linkJ1)} {linkMin:F2}mm"
+                : "—";
+            string ToolDesc() => toolIdx >= 0 && double.IsFinite(toolMin)
+                ? $"{SegKind.Name(got[toolIdx].worstKind, got[toolIdx].worstJ0, got[toolIdx].worstJ1)} {toolMin:F2}mm"
+                : "—";
 
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"可达 {sum.reachable}/{sum.count}" +
                           $"（{(sum.count > 0 ? 100.0 * sum.reachable / sum.count : 0):F1}%）");
             sb.AppendLine($"最小表面距离 {sum.minClearanceMm:F2} mm" +
                           (sum.minClearanceMm < 0 ? "  ← 穿透" : ""));
+            sb.AppendLine($"　枪体 {ToolDesc()}　连杆 {LinkDesc()}");
             sb.AppendLine($"喷角 均值 {sum.tiltMeanDeg:F1}° · p95 {sum.tiltP95Deg:F1}° · 最大 {sum.tiltMaxDeg:F1}°");
             sb.AppendLine($"喷距守恒偏差 {sum.standoffMaxErrMm:E2} mm");
             if (sum.poseReverted > 0)
                 sb.AppendLine($"平滑回退 {sum.poseReverted} 点（碰撞优先于姿态连续）");
-            sb.AppendLine($"违规：不可达 {Rule(0)} · 碰撞 {Rule(1)} · 间隙 {Rule(2)} · 自碰撞 {Rule(3)}");
-            sb.AppendLine($"　　　关节 {Rule(4)} · 喷角 {Rule(5)} · 奇异 {Rule(6)} · 跳变 {Rule(7)}");
+            sb.AppendLine($"违规：不可达 {Rule(0)} · 连杆撞 {Rule(8)} · 枪体撞 {Rule(9)} · 自碰撞 {Rule(3)}");
+            sb.AppendLine($"　　　间隙 {Rule(2)} · 关节 {Rule(4)} · 喷角 {Rule(5)} · 奇异 {Rule(6)} · 跳变 {Rule(7)}");
             sb.AppendLine(sum.baseAuto != 0
                 ? $"基座：自动假设 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0}) —— 未标定，可达率仅作预判"
                 : $"基座：手动 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0})");
@@ -819,7 +837,9 @@ namespace SprayTrajViewer
             TxtHint.Text = $"安全评估：{verdict} · 可达 {sum.reachable}/{sum.count} · 最小间隙 {sum.minClearanceMm:F1}mm";
             App.Log("SAFETY", null,
                 $"verdict={verdict} p0={nP0} p1={nP1} p2={nP2} count={sum.count} reachable={sum.reachable} " +
-                $"minClr={sum.minClearanceMm:F2} tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
+                $"minClr={sum.minClearanceMm:F2} tool={sum.minClearanceToolMm:F2} link={sum.minClearanceLinkMm:F2} " +
+                $"linkSeg={LinkDesc()} " +
+                $"tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
                 $"tilted={sum.tiltedPoints} reverted={sum.poseReverted} standoffErr={sum.standoffMaxErrMm:E2} " +
                 $"baseAuto={sum.baseAuto} cloudPts={sum.cloudPoints} l0={sum.l0Issues} elapsed={sw.ElapsedMilliseconds}ms");
         }
@@ -1003,7 +1023,8 @@ namespace SprayTrajViewer
             if (v == 0) return "";
             var parts = new List<string>(4);
             if ((v & RobotSafetyRule.IkFail) != 0) parts.Add("IK_FAIL");
-            if ((v & RobotSafetyRule.Collision) != 0) parts.Add("COLLISION");
+            if ((v & RobotSafetyRule.LinkHit) != 0) parts.Add("LINK_HIT");
+            if ((v & RobotSafetyRule.ToolHit) != 0) parts.Add("TOOL_HIT");
             if ((v & RobotSafetyRule.Clearance) != 0) parts.Add("CLEARANCE");
             if ((v & RobotSafetyRule.SelfCollision) != 0) parts.Add("SELF_COLLISION");
             if ((v & RobotSafetyRule.JointLimit) != 0) parts.Add("JOINT_LIMIT");
