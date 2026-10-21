@@ -47,6 +47,11 @@
                         <TextBox x:Name="TxtGunClear" Text="20" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
+                        <TextBlock Text="行端点外扩 (mm)" Width="150" VerticalAlignment="Center"
+                                   ToolTip="布行边界外扩：每条行两端沿行方向各外扩此值，补点云边缘缺一截造成的漏喷。负值=自动(1×行距)，0=不外扩。外扩会逐毫米查枪位，朝相邻壁的方向自动停住"/>
+                        <TextBox x:Name="TxtEdgeExtend" Text="-1" Padding="4"/>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
                         <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
                         <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
                     </DockPanel>

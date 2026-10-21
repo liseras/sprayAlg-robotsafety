@@ -19,6 +19,7 @@ namespace SprayTrajViewer
         public double fillHoleSize;     // 孔洞填补阈值 mm（间隙<此值覆盖重建，行连续跨越）
         public int    scanDirMode;      // 轨迹方向：0=自动，1=沿长边喷，2=沿短边喷
         public double gunClear;         // 枪体安全半径 mm（喷头外径/2 + 安全余量）
+        public double edgeExtend;       // 行端点外扩 mm（<0=自动 1×行距，0=不外扩）
     }
 
     [StructLayout(LayoutKind.Sequential)]

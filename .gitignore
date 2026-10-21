@@ -32,3 +32,4 @@ cpp/*.png
 # SPRAYTRAJ_DUMP 倒出的调试图（在仓库根目录跑 driver 时会生成）
 /mask_*.pgm
 /uv_plane*.csv
+cpp/_regress/thinbox*.ply

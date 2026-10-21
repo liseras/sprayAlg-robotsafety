@@ -79,6 +79,7 @@ int main(int argc, char** argv){
     //           -fill <孔洞填补阈值mm>  -dir <0自动/1长边/2短边>
     //           -row <行距mm>  -pt <点距mm>  -so <离面距离mm>  -sp <速度mm/s>
     //           -gc <枪体安全半径mm>（= 喷头外径/2 + 安全余量，内壁角落让枪用）
+    //           -ee <行端点外扩mm>（布行边界外扩；-1=自动 1×行距，0=不外扩）
     for(int i=4;i+1<argc;++i){
         if(!strcmp(argv[i],"-flat"))  p.flatnessTol  = atof(argv[i+1]);
         if(!strcmp(argv[i],"-curve")) p.curvatureTol = atof(argv[i+1]);
@@ -89,10 +90,11 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"-so"))    p.standoff       = atof(argv[i+1]);
         if(!strcmp(argv[i],"-sp"))    p.speed          = atof(argv[i+1]);
         if(!strcmp(argv[i],"-gc"))    p.gunClear       = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-ee"))    p.edgeExtend     = atof(argv[i+1]);
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f\n",
+    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f\n",
         p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
-        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear);
+        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend);
     // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
     printf("[abi] sizeof Plane=%zu Point=%zu Result=%zu\n",
         sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));

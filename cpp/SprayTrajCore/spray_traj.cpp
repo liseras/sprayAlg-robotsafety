@@ -3443,6 +3443,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     p.fillHoleSize   = 300.0;
     p.scanDirMode    = 0;
     p.gunClear       = 20.0;   // 枪帽 Ø32 半径16 + 余量4；大枪/旋杯按实际改
+    p.edgeExtend     = -1.0;   // 行端点外扩：-1 = 自动(1×行距)，0 = 不外扩
     return p;
 }
 
@@ -4076,6 +4077,18 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 上面第一种情形都会漏判（231.9 比 zPartMax+0.5·standoff=241.1 只低 9mm）。
     KdTree partTree; partTree.init(Pf);
     const double moveClear = std::max(6.0, 0.25*params->standoff);
+    // 枪体安全半径：内壁/内底布行 + 行端点外扩两处共用同一个口径
+    const double gunClearEff = params->gunClear > 0.0
+                             ? params->gunClear
+                             : std::max(12.0, 0.2*params->standoff);
+    // 某点的枪位（沿该面法向抬 standoff）到工件点云的最小距离
+    auto gunClearAt = [&](const Vec3& surfPt, const Vec3& n)->double{
+        Vec3 g = surfPt + n*params->standoff;
+        KnnBuf kb; partTree.knn(g, 1, kb);
+        double d = 1e30;
+        for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d = std::min(d, len(Pf[kb.id[t]]-g));
+        return d;
+    };
     auto segClearOK = [&](const Vec3& a, const Vec3& b)->bool{
         const double d = len(b-a);
         if(d < 1e-6) return true;
@@ -4196,9 +4209,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 只对内壁/内底生效：外壁枪位在件外 standoff 处，最近点距离必然 >= standoff，
         // 不会误删。
         if(seg.fo.isInner > 0 && !inl.empty()){
-            const double gunClear = params->gunClear > 0.0
-                                  ? params->gunClear
-                                  : std::max(12.0, 0.2*params->standoff);
+            const double gunClear = gunClearEff;
             std::vector<int> keep; keep.reserve(inl.size());
             int drop = 0;
             for(int i : inl){
@@ -4367,6 +4378,42 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
         double ca=std::cos(theta), sa=std::sin(theta);
         auto rotInv=[&](Vec2 p)->Vec2{ return {ca*p.x - sa*p.y, sa*p.x + ca*p.y}; };
+
+        // ---- 行端点外扩（布行边界外扩策略，可配置）----
+        // 病灶：点云在面边沿常常"缺一截"——扫描遮挡，或者边缘点被判给了相邻面——
+        // 于是行端点落在比真实边沿更靠里的位置，边沿那一条带就漏喷。实测薄壁开口盒
+        // 内壁顶部漏 9mm，就是行端点比 z=300 的顶沿短了一截。这和枪体安全半径
+        // （gunClear）是两个独立机制：gunClear 管"这里该不该布行"，这里管"行该走多长"。
+        // 做法：每条行的两端沿行方向各外扩 extRow mm，1mm 一步试探，每步都查枪位——
+        // 外扩点抬 standoff 后若距件 < gunClear（再往外枪头就顶进相邻壁了）就地停住。
+        // 于是"往空处外扩"照扩（开口盒内壁顶部朝空，扩满），"往实体里外扩"自动拦住
+        // （内壁底部朝内底，扩一两毫米就停），不需要事先知道面的真实边界在哪。
+        // 配置：params->edgeExtend，<0 = 自动 = 1×行距，0 = 不外扩。
+        const double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : params->scanRowSpacing;
+        if(!ringMode && extRow > 1e-9 && !bestRows.empty()){
+            int nExt=0, nBlk=0; double extSum=0.0, extMax=0.0;
+            for(auto& r : bestRows){
+                for(int side=0; side<2; ++side){
+                    const double sgn = (side==0) ? +1.0 : -1.0;   // +1 = xe 端，-1 = xs 端
+                    double add = 0.0;
+                    for(double d=1.0; d<=extRow+1e-9; d+=1.0){
+                        Vec2 q2{ (sgn>0 ? r.xe : r.xs) + sgn*d, r.yc };
+                        Vec2 w = rotInv(q2);
+                        Vec3 X = pl.c + u*w.x + v*w.y;
+                        if(gunClearAt(X, pl.n) < gunClearEff){ ++nBlk; break; }
+                        add = d;
+                    }
+                    if(add > 0.0){
+                        if(sgn>0) r.xe += add; else r.xs -= add;
+                        ++nExt; extSum += add; extMax = std::max(extMax, add);
+                    }
+                }
+            }
+            if(nExt || nBlk)
+                fprintf(stderr, "[traj] 面%zu 行端点外扩: %d 端成功(均值 %.1fmm / 最大 %.1fmm)，"
+                                "%d 端起扩即被枪位拦停（上限 %.1fmm）\n",
+                        si, nExt, nExt? extSum/nExt : 0.0, extMax, nBlk, extRow);
+        }
 
         // 生成该平面的 2D 轨迹（每个点带 spray 标记：1=喷涂，0=空移）
         std::vector<std::pair<Vec2,int>> traj2;
