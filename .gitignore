@@ -33,3 +33,7 @@ cpp/*.png
 /mask_*.pgm
 /uv_plane*.csv
 cpp/_regress/thinbox*.ply
+
+# 回归测试脚本的运行产物（基线文件入库，输出不入库）
+cpp/_regress/regress_out/
+cpp/_regress/regress_old/

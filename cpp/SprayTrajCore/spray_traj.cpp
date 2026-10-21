@@ -276,23 +276,15 @@ std::vector<Vec3> sor_filter(const std::vector<Vec3>& P, int k, double z){
     double mu=sum/P.size();
     double var=0; for(double v:md) var+=(v-mu)*(v-mu); var/=P.size();
     double sd=std::sqrt(var);
-    // 阈值下限：中位数 × 1.6。纯"mean+z·σ"在干净点云上会失灵——σ 极小时阈值
-    // 贴着均值，把**棱边/顶沿的边界点整圈删掉**（实测开口盒 343 个被删点 100%
-    // 落在 z>290 的壁顶一圈：边界点邻域只有半边有支撑，meanKNN 比内部高 28%，
-    // 而 σ=0.32 时 2.5σ 只放行 +0.8mm）。顶沿一丢，枪位净空检查对壁顶"失明"，
-    // 顶行外扩直接冲出板边、蛇形连接段横穿相邻壁（实测枪位距壁 0.8mm）。
-    // 真正的离群噪声 meanKNN 通常是中位数的 2~10 倍，1.6 倍的下限不会放走它们；
-    // 点云真有噪声时 σ 大，mean+z·σ 本来就高于下限，行为不变。
-    std::vector<double> mds(md);
-    double med = 0.0;
-    if(!mds.empty()){
-        size_t km = mds.size()/2;
-        std::nth_element(mds.begin(), mds.begin()+km, mds.end());
-        med = mds[km];
-    }
-    const double thr = std::max(mu + z*sd, med*1.6);
+    // 阈值就是经典的 mean + z·σ。
+    // 曾试过加下限"中位数×1.6"去保住棱边点（边界点邻域只有半边支撑，meanKNN
+    // 比内部高 28%，干净点云 σ 小时会被整圈删掉）。方向是对的，但改在这里
+    // 代价太大：保住的边界点/重复点改变了后续法向聚类与拆层，实测薄壁盒
+    // g_norim 从 10 面塌成 1 面、曲面件 curved 从 2 面变 3 面并冒出 0.05mm
+    // 的贴件轨迹。棱边看不见的问题改在"枪位净空"里解决——那里有解析平面，
+    // 不依赖点云是否把棱边采到（见 buildBlkFaces / gunClearAt）。
     std::vector<Vec3> out;
-    for(size_t i=0;i<P.size();++i) if(md[i] < thr) out.push_back(P[i]);
+    for(size_t i=0;i<P.size();++i) if(md[i] < mu + z*sd) out.push_back(P[i]);
     return out;
 }
 
@@ -4315,12 +4307,88 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     const double gunClearEff = params->gunClear > 0.0
                              ? params->gunClear
                              : std::max(12.0, 0.2*params->standoff);
-    // 某点的枪位（沿该面法向抬 standoff）到工件点云的最小距离
-    auto gunClearAt = [&](const Vec3& surfPt, const Vec3& n)->double{
+
+    // ---- 面几何"挡板"清单 ----
+    // 只拿点云测距会看漏两种地方：
+    //   ① 去噪把棱边/顶沿点删掉（边界点邻域只有半边支撑），壁顶一圈没有点，
+    //      枪位压在壁面上仍测出"还有 20mm"，顶行外扩就会冲出板边、连接段穿壁；
+    //   ② 单层点云、稀疏采样，面对面之间的空隙没有点可测。
+    // 面本身是解析的（平面法向 n + 面内 2D 包围盒），点到面的距离可以直接算：
+    // 枪位投影落在面范围内时，|带符号距离| 就是该面对枪位的净空。
+    // 顶行外扩越过壁顶时投影落到包围盒之外，判定自动失效——正好是"从棱边上方
+    // 越过去"应有的行为，不会把正常的越顶外扩拦掉。
+    struct BlkFace { Vec3 n, c, u, v; double u0, u1, v0, v1; int si; };
+    std::vector<BlkFace> blkFaces;
+    for(size_t k=0;k<segs.size();++k){
+        const auto& s = segs[k];
+        if(s.inl.size() < 20) continue;
+        const Vec3 n = s.pl.n;
+        Vec3 ax = (std::fabs(n.x) < 0.9) ? Vec3{1.0,0.0,0.0} : Vec3{0.0,1.0,0.0};
+        Vec3 u = norm(cross(ax, n));
+        Vec3 v = cross(n, u);
+        BlkFace bf{n, s.pl.c, u, v, 1e30, -1e30, 1e30, -1e30, (int)k};
+        // 必须用全部内点求范围：抽样会漏掉面最外侧那一圈，包围盒比真实面小
+        // 1~2mm，恰好把"枪位压在棱边内侧"这种最该拦的情形放过去。
+        for(size_t q=0;q<s.inl.size();++q){
+            const Vec3 w = Pf[s.inl[q]] - s.pl.c;
+            const double a = dot(w,u), b = dot(w,v);
+            bf.u0 = std::min(bf.u0,a); bf.u1 = std::max(bf.u1,a);
+            bf.v0 = std::min(bf.v0,b); bf.v1 = std::max(bf.v1,b);
+        }
+        if(bf.u1 < bf.u0) continue;
+        blkFaces.push_back(bf);
+    }
+    // 点到各面几何的最小净空（投影在面内才算）
+    auto planeClearAt = [&](const Vec3& g, int skipSi)->double{
+        double best = 1e30;
+        for(const auto& f : blkFaces){
+            if(f.si == skipSi) continue;
+            const Vec3 w = g - f.c;
+            const double sd = std::fabs(dot(w, f.n));
+            if(sd >= best) continue;                 // 已经不可能更近
+            const double a = dot(w, f.u), b = dot(w, f.v);
+            if(a < f.u0 || a > f.u1 || b < f.v0 || b > f.v1) continue;
+            best = sd;
+        }
+        return best;
+    };
+    // 点到各面**边界线**的最小净空。
+    // 平面判据管"枪压在面上"，管不了"枪贴着棱边擦过去"——开口盒的壁顶就是一条
+    // 棱边，去噪往往正好把这条棱边上的点删光（边界点邻域只有半边支撑），于是
+    // 枪位离壁顶只有 16mm 也测出"离得很远"，顶行外扩会把枪甩出板外再横扫回来。
+    // 面的边界用面内 2D 包围盒的 4 条边代表（矩形壁面是精确的；异形面是保守过
+    // 近似，只会让外扩更早收敛，不会放宽）。棱边距离不依赖点云是否采到棱边。
+    auto ptSegD = [](const Vec3& p, const Vec3& a, const Vec3& b)->double{
+        const Vec3 ab = b - a;
+        const double L2 = dot(ab, ab);
+        if(L2 < 1e-12) return len(p - a);
+        double t = dot(p - a, ab)/L2;
+        t = std::max(0.0, std::min(1.0, t));
+        return len(p - (a + ab*t));
+    };
+    auto edgeClearAt = [&](const Vec3& g, int skipSi)->double{
+        double best = 1e30;
+        for(const auto& f : blkFaces){
+            if(f.si == skipSi) continue;
+            const Vec3 C[4] = { f.c + f.u*f.u0 + f.v*f.v0,
+                                f.c + f.u*f.u1 + f.v*f.v0,
+                                f.c + f.u*f.u1 + f.v*f.v1,
+                                f.c + f.u*f.u0 + f.v*f.v1 };
+            for(int e=0;e<4;++e){
+                const double d = ptSegD(g, C[e], C[(e+1)&3]);
+                if(d < best) best = d;
+            }
+        }
+        return best;
+    };
+    // 某点的枪位（沿该面法向抬 standoff）到工件的净空：点云、面、棱边三者取小
+    auto gunClearAt = [&](const Vec3& surfPt, const Vec3& n, int skipSi = -1)->double{
         Vec3 g = surfPt + n*params->standoff;
         KnnBuf kb; partTree.knn(g, 1, kb);
         double d = 1e30;
         for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d = std::min(d, len(Pf[kb.id[t]]-g));
+        d = std::min(d, planeClearAt(g, skipSi));
+        d = std::min(d, edgeClearAt(g, skipSi));
         return d;
     };
     auto segClearOK = [&](const Vec3& a, const Vec3& b)->bool{
@@ -4439,10 +4507,14 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 的边缘时，枪位已经嵌进那块壁里——实测开口盒内壁轨迹两端各约 4mm 宽、
         // 最深 2mm 侵入；更糟的是内壁首点贴着壁时，面间过渡的"从安全高度垂直
         // 下降"会整整穿过 300mm 高的壁（实测一段 423mm 的直线穿墙）。
-        // 判据：面点沿法向抬到枪位，查枪位到工件点云的最近距离，太近就不布行。
-        // 只对内壁/内底生效：外壁枪位在件外 standoff 处，最近点距离必然 >= standoff，
-        // 不会误删。
-        if(seg.fo.isInner > 0 && !inl.empty()){
+        // 判据：面点沿法向抬到枪位，查枪位到工件的净空（点云 + 面 + 棱边），太近就不布行。
+        // 原来只对内壁/内底生效，理由是"外壁枪位在件外 standoff 处，最近点必然
+        // >= standoff"。这个理由在**拐角/棱边处不成立**：外壁那段行一直铺到壁的
+        // 边缘，枪位虽然离本面 100mm，离相邻的垂直壁只有几毫米（实测薄壁盒
+        // g_norim 枪位距邻壁 0.1mm，轨迹整条贴着壁走）。现在几何判据不依赖
+        // 点云是否采到棱边，对所有面统一执行——单独一块平板没有邻居面，
+        // 判据自然放行，不会误删。
+        if(!inl.empty()){
             const double gunClear = gunClearEff;
             std::vector<int> keep; keep.reserve(inl.size());
             int drop = 0;
@@ -4451,14 +4523,16 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 KnnBuf kb; partTree.knn(q, 1, kb);
                 double d = 1e30;
                 for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d = std::min(d, len(Pf[kb.id[t]]-q));
+                d = std::min(d, planeClearAt(q, (int)si));   // 面几何（棱边点可能被去噪删掉）
+                d = std::min(d, edgeClearAt(q, (int)si));    // 棱边/边界线
                 if(d < gunClear){ ++drop; continue; }
                 keep.push_back(i);
             }
             if(drop > 0 && keep.size() >= 20){
                 seg.inl.swap(keep);        // inl 是 seg.inl 的引用，内容随之更新
                 if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                    fprintf(stderr, "[gun] 面%zu 内壁: 枪位距件 <%.0fmm，剔除 %d 点，剩 %zu\n",
-                            si, gunClear, drop, seg.inl.size());
+                    fprintf(stderr, "[gun] 面%zu%s: 枪位距件 <%.0fmm，剔除 %d 点，剩 %zu\n",
+                            si, seg.fo.isInner > 0 ? " 内壁" : "", gunClear, drop, seg.inl.size());
             }
         }
 
@@ -4626,7 +4700,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 for(int t=0;t<3;++t){
                     Vec2 w = rotInv(Vec2{xs3[t], r.yc});
                     Vec3 X = pl.c + u*w.x + v*w.y;
-                    if(gunClearAt(X, pl.n) < gunClearEff) return false;
+                    if(gunClearAt(X, pl.n, (int)si) < gunClearEff) return false;
                 }
                 return true;
             };
@@ -4674,7 +4748,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         Vec2 q2{ (sgn>0 ? r.xe : r.xs) + sgn*d, r.yc };
                         Vec2 w = rotInv(q2);
                         Vec3 X = pl.c + u*w.x + v*w.y;
-                        const double clr = gunClearAt(X, pl.n);
+                        const double clr = gunClearAt(X, pl.n, (int)si);
                         if(extDbg && (d<=3 || clr < gunClearEff+5))
                             fprintf(stderr, "[ext] 面%zu row yc=%.1f side=%d d=%.0f X=(%.1f,%.1f,%.1f) clr=%.1f\n",
                                     si, r.yc, side, d, X.x, X.y, X.z, clr);
