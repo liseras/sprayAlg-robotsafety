@@ -115,7 +115,54 @@
                 <hx:DefaultLights/>
                 <hx:GridLinesVisual3D Width="600" Length="600" MajorDistance="100" MinorDistance="10" Thickness="0.02"/>
             </hx:HelixViewport3D>
-            <Border Background="#66000000" Padding="10" VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="12" CornerRadius="6">
+
+            <!-- 面级法向清单：上排=真实法向（射线判定），"内外反"提示喷距方向与该面真实可喷侧相反 -->
+            <StackPanel VerticalAlignment="Bottom" Margin="12,0,12,12">
+                <Border Background="#E6FFFFFF" BorderBrush="#33000000" BorderThickness="1,1,1,0"
+                        Padding="8,4" CornerRadius="4,4,0,0">
+                    <TextBlock x:Name="TxtFaceStat" FontSize="11" Foreground="#4B5563"
+                               Text="面级法向清单：运行后显示与 +Z 夹角 ≤130° 的全部面（含内壁、外壁）"/>
+                </Border>
+                <DataGrid x:Name="GridFaces" Height="182"
+                          HorizontalAlignment="Stretch"
+                          AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+                          HeadersVisibility="Column" RowHeight="22" FontSize="12"
+                          Background="#F5FFFFFF" RowBackground="#F5FFFFFF"
+                          AlternatingRowBackground="#F0F3F6F9"
+                          GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#22000000"
+                          BorderBrush="#33000000" BorderThickness="1,0,1,1">
+                    <DataGrid.CellStyle>
+                        <Style TargetType="DataGridCell">
+                            <Setter Property="Foreground" Value="#1F2937"/>
+                            <Setter Property="BorderThickness" Value="0"/>
+                            <Setter Property="Padding" Value="4,0"/>
+                        </Style>
+                    </DataGrid.CellStyle>
+                    <DataGrid.ColumnHeaderStyle>
+                        <Style TargetType="DataGridColumnHeader">
+                            <Setter Property="Foreground" Value="#4B5563"/>
+                            <Setter Property="Background" Value="#F0FFFFFF"/>
+                            <Setter Property="FontSize" Value="11"/>
+                            <Setter Property="Padding" Value="4,4"/>
+                            <Setter Property="BorderThickness" Value="0,0,0,1"/>
+                            <Setter Property="BorderBrush" Value="#33000000"/>
+                        </Style>
+                    </DataGrid.ColumnHeaderStyle>
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="面" Binding="{Binding Face}" Width="34"/>
+                        <DataGridTextColumn Header="真实法向 (n0)" Binding="{Binding Normal}" Width="156"/>
+                        <DataGridTextColumn Header="与+Z°" Binding="{Binding AngZ}" Width="56"/>
+                        <DataGridTextColumn Header="tilt°" Binding="{Binding Tilt}" Width="52"/>
+                        <DataGridTextColumn Header="分类" Binding="{Binding Kind}" Width="52"/>
+                        <DataGridTextColumn Header="内壁" Binding="{Binding Inner}" Width="48"/>
+                        <DataGridTextColumn Header="依据" Binding="{Binding Src}" Width="52"/>
+                        <DataGridTextColumn Header="自由 +/- (mm)" Binding="{Binding Free}" Width="118"/>
+                        <DataGridTextColumn Header="提示" Binding="{Binding Note}" Width="*"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </StackPanel>
+
+            <Border Background="#66000000" Padding="10" VerticalAlignment="Bottom" HorizontalAlignment="Left" Margin="12,0,0,220" CornerRadius="6">
                 <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
             </Border>
         </Grid>

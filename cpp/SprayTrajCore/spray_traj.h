@@ -43,6 +43,12 @@ typedef struct SprayTrajPoint {
     int    spray;      // 1=喷涂（全程恒为1）
 } SprayTrajPoint;
 
+// 可喷面角度窗口：面法向与 +Z 的夹角（0~180°）≤ 此值才列入可喷清单。
+// 130° 的物理含义：朝上（0°）、侧向（90°）、以及最多向下倾 40° 的面都算可喷；
+// 开口盒的底面（180°，整体朝下）被排除。
+// 注意：这是"可喷侧朝向"的窗口，不是内外壁判据——内外壁由 isInner 单独给出。
+#define SPRAYTRAJ_NORMAL_WIN_DEG 130.0
+
 // 单个重建平面（供显示/调试）
 #define SPRAYTRAJ_PLANE_MAX_POLY_VERTS 384
 #define SPRAYTRAJ_PLANE_MAX_POLY_TRIS  768
@@ -50,6 +56,20 @@ typedef struct SprayTrajPlane {
     double nx, ny, nz;   // 法向（定向后）
     double cx, cy, cz;   // 质心
     int    count;        // 该面内点数
+    // ---- 面级法向诊断（内壁 / 外壁）----
+    // nx,ny,nz      = 喷距法向：沿用原有"|nz|>0.05 归 +Z 半球 / 近竖直背离质心"的定向，
+    //                 轨迹沿它抬升；
+    // n0x,n0y,n0z   = 真实法向：射线自由空间判出的可喷侧（材料侧的反面）。
+    // 两者点积为负说明该面是内壁（或单层壳二义），界面需要提示。
+    // 本组字段只上报，不参与轨迹生成。
+    double n0x, n0y, n0z;   // 射线判定后的真实法向（指向可喷侧）
+    double angZ;            // 与 +Z 夹角，0~180°
+    double tiltDeg;         // 相对水平面仰角 = 90-angZ，-90~90（0=竖直，+90=朝上，-90=朝下）
+    double freePlus;        // 沿 +n 侧自由距离 mm（-1 = 量程内无命中）
+    double freeMinus;       // 沿 -n 侧自由距离 mm（-1 = 量程内无命中）
+    int    side;            // 角度分类：+1 正向(angZ<87°) / -1 反向(angZ>93°) / 0 竖直
+    int    isInner;         // 1 = 内壁（可喷侧朝工件内部/腔体）/ 0 = 外壁 / -1 = 薄壁双层未拆
+    int    sideSrc;         // 1=射线 2=两侧都自由(兜底) 3=强制翻转 4=薄壁双层(已按层拆行)
     // 该面在自身局部基(u,v)下的轴对齐包围盒
     double ux, uy, uz;   // 局部基 u（主轴方向，单位向量）
     double vx, vy, vz;   // 局部基 v
@@ -65,6 +85,9 @@ typedef struct SprayTrajPlane {
 } SprayTrajPlane;
 
 // 调用结果
+// 槽位数从 8 提到 16：薄壁件一个面块要拆成"内壁 + 外壁"两行，
+// 6 个面块拆完是 12 行，8 个槽会截断掉一半内壁。
+#define SPRAYTRAJ_PLANE_SLOTS 16
 typedef struct SprayTrajResult {
     SprayTrajPoint* points;   // 轨迹点数组（调用方用 spray_traj_free 释放）
     int             count;    // 点数
@@ -79,7 +102,7 @@ typedef struct SprayTrajResult {
     int             removed_points; // 去噪剔除点数
     int             inlier_points;  // 平面内点数量（重建平面覆盖的点）
     int             plane_count;    // 分割出的平面数
-    SprayTrajPlane  planes[8];      // 各分割平面（最多 8 个）
+    SprayTrajPlane  planes[SPRAYTRAJ_PLANE_SLOTS];  // 各分割平面 / 拆层后的面
     const char*     error;          // 失败原因（成功为 NULL）
 } SprayTrajResult;
 

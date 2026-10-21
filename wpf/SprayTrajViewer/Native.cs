@@ -32,9 +32,18 @@ namespace SprayTrajViewer
     [StructLayout(LayoutKind.Sequential)]
     public struct SprayTrajPlane
     {
-        public double nx, ny, nz;
+        public double nx, ny, nz;   // 喷距法向（轨迹按它抬升）
         public double cx, cy, cz;
         public int count;
+        // 面级法向诊断：与 C++ SprayTrajPlane 逐字段对应，顺序不能改
+        public double n0x, n0y, n0z;   // 射线自由空间判出的真实法向（可喷侧）
+        public double angZ;            // 与 +Z 夹角 0~180
+        public double tiltDeg;         // 仰角 90-angZ，-90~90
+        public double freePlus;        // +n 侧自由距离 mm（-1 = 量程内无命中）
+        public double freeMinus;       // -n 侧自由距离 mm
+        public int side;               // +1 正向 / -1 反向 / 0 竖直
+        public int isInner;            // 1 = 内壁
+        public int sideSrc;            // 1=射线 2=兜底 3=强制
         public double ux, uy, uz;
         public double vx, vy, vz;
         public double minU, maxU;
@@ -63,7 +72,7 @@ namespace SprayTrajViewer
         public int removed_points;
         public int inlier_points;
         public int plane_count;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
         public SprayTrajPlane[] planes;
         public IntPtr error;    // const char*
     }

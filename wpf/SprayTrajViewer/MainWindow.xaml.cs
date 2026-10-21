@@ -17,6 +17,11 @@ namespace SprayTrajViewer
         private string? _currentFile;
         // 最近一次分割出的所有重建平面（含法向/质心/局部基/包围盒），用于"显示重建平面"
         private List<SprayTrajPlane> _planes = new();
+
+        // 可喷面角度窗口，必须与 C++ 的 SPRAYTRAJ_NORMAL_WIN_DEG 保持一致：
+        // 法向与 +Z 夹角 ≤ 此值才列入清单。130° = 朝上、侧向、最多向下倾 40° 都算可喷，
+        // 开口盒底板外侧（180°）被排除。
+        private const double NormalWinDeg = 130.0;
         // 当前重建平面的视觉元素列表（精确引用，用于增删）
         private readonly List<Visual3D> _planeVisuals = new();
         // 点云与轨迹的视觉元素引用（用于独立显隐）
@@ -28,6 +33,15 @@ namespace SprayTrajViewer
         public MainWindow()
         {
             InitializeComponent();
+            // ABI 自检：与 C++ driver 打印的 sizeof 对齐（Plane=18648 Point=64 Result=149304）
+            try
+            {
+                App.Log("ABI", null,
+                    $"Plane={Marshal.SizeOf<SprayTrajPlane>()} " +
+                    $"Point={Marshal.SizeOf<SprayTrajPoint>()} " +
+                    $"Result={Marshal.SizeOf<SprayTrajResult>()}");
+            }
+            catch (Exception ex) { App.Log("ABI/FAIL", ex); }
             Loaded += (_, _) =>
             {
                 // 窗口布局完成后再加载与取景，避免相机没对准
@@ -307,8 +321,10 @@ namespace SprayTrajViewer
             RenderTrajectory(traj);
 
             // 保存所有分割平面参数，供"显示重建平面"使用
+            // 上限取数组槽位数，不能写死 8：薄壁件拆层后面数会超过 8（10 面很常见），
+            // 写死会让后几个面既不渲染也不进清单，看上去像"内壁丢了"。
             _planes.Clear();
-            for (int i = 0; i < res.plane_count && i < 8; i++)
+            for (int i = 0; i < res.plane_count && i < res.planes.Length; i++)
                 _planes.Add(res.planes[i]);
             // 兼容：若 plane_count 未填充（旧 DLL），回退用主平面
             if (_planes.Count == 0)
@@ -329,6 +345,7 @@ namespace SprayTrajViewer
             LogPlaneSummary();
 
             RenderPlane();
+            FillFaceTable();
 
             TxtResult.Text =
                 $"✓ 生成成功\n" +
@@ -340,7 +357,8 @@ namespace SprayTrajViewer
                 $"  内点：{res.inlier_points}（占去噪后 {(double)res.inlier_points / Math.Max(1, res.input_points - res.removed_points) * 100:F1}%）\n" +
                 $"  点距：均值 {res.seg_len_mean:F3} / 最大 {res.seg_len_max:F3} mm\n" +
                 $"  输入点：{res.input_points}，去噪剔除：{res.removed_points}\n" +
-                $"  红色=喷涂行，灰色=空移（面间抬枪绕行）";
+                $"  红色=喷涂行，灰色=空移（面间抬枪绕行）\n" +
+                $"  蓝色面=外壁，橙色面=内壁";
 
             TxtHint.Text = $"轨迹已生成：{res.count} 点，{res.rows} 行";
 
@@ -447,8 +465,74 @@ namespace SprayTrajViewer
                 App.Log("PLANE", null,
                     $"#{i} 顶点={p.polyVertCount} 三角={p.polyTriCount} {size} " +
                     $"内点={p.count} 与Z夹角={angZ:F1}° 质心=({p.cx:F1},{p.cy:F1},{p.cz:F1}) " +
-                    $"法向=({nx:F3},{ny:F3},{nz:F3})");
+                    $"法向=({nx:F3},{ny:F3},{nz:F3}) 真实=({p.n0x:F3},{p.n0y:F3},{p.n0z:F3}) " +
+                    $"分类={p.side} 内壁={(p.isInner > 0 ? "是" : (p.isInner < 0 ? "未分" : "否"))} 依据={p.sideSrc}");
             }
+        }
+
+        // ---- 面级法向清单（内壁/外壁）----
+        // 数据全部来自 C++ 侧：nx,ny,nz 是喷距法向（轨迹沿它抬升），
+        // n0 是射线自由空间判出的真实可喷侧法向。两者点积为负 = 该面喷距方向反了。
+        private sealed class FaceRow
+        {
+            public int Face { get; set; }
+            public string Normal { get; set; } = "";
+            public string AngZ { get; set; } = "";
+            public string Tilt { get; set; } = "";
+            public string Kind { get; set; } = "";
+            public string Inner { get; set; } = "";
+            public string Src { get; set; } = "";
+            public string Free { get; set; } = "";
+            public string Note { get; set; } = "";
+        }
+
+        void FillFaceTable()
+        {
+            var rows = new List<FaceRow>();
+            int skipped = 0, nInner = 0, nOuter = 0;
+            for (int i = 0; i < _planes.Count; i++)
+            {
+                var p = _planes[i];
+                // 口径与 C++ 一致：与 +Z 夹角 ≤ NormalWinDeg 的面全部列出（内壁、外壁一起），
+                // 完全朝下的面（开口盒底板外侧，180°）不列入。
+                if (p.angZ > NormalWinDeg) { skipped++; continue; }
+                if (p.isInner > 0) nInner++; else if (p.isInner == 0) nOuter++;
+                bool hasDiag = !(p.n0x == 0 && p.n0y == 0 && p.n0z == 0);
+                double flip = p.nx * p.n0x + p.ny * p.n0y + p.nz * p.n0z;
+                string kind = p.side > 0 ? "正向" : (p.side < 0 ? "反向" : "竖直");
+                string src = p.sideSrc == 1 ? "射线" : (p.sideSrc == 3 ? "强制"
+                           : (p.sideSrc == 4 ? "薄壁" : "兜底"));
+                string fp = p.freePlus < 0 ? "∞" : p.freePlus.ToString("F0");
+                string fm = p.freeMinus < 0 ? "∞" : p.freeMinus.ToString("F0");
+
+                string note;
+                if (!hasDiag) note = "无诊断数据（旧 DLL）";
+                else if (p.sideSrc == 4) note = p.isInner > 0
+                    ? "薄壁拆层：内壁（法向朝腔体）"
+                    : "薄壁拆层：外壁（法向朝外）";
+                else if (p.sideSrc == 2) note = "两侧都自由（单层壳），待人工确认";
+                else if (flip < 0) note = "内外反：喷距方向与真实可喷侧相反";
+                else note = "喷距方向一致";
+
+                rows.Add(new FaceRow
+                {
+                    Face = i,
+                    Normal = $"({p.n0x:F3}, {p.n0y:F3}, {p.n0z:F3})",
+                    AngZ = $"{p.angZ:F1}",
+                    Tilt = $"{p.tiltDeg:F1}",
+                    Kind = kind,
+                    Inner = p.isInner > 0 ? "是" : (p.isInner < 0 ? "未分" : "否"),
+                    Src = src,
+                    Free = $"{fp} / {fm}",
+                    Note = note
+                });
+            }
+            GridFaces.ItemsSource = rows;
+            string stat = $"面级法向清单：窗口内 {rows.Count} 面（内壁 {nInner} / 外壁 {nOuter}）" +
+                          $"，分割共 {_planes.Count} 面";
+            if (skipped > 0) stat += $"，滤除 {skipped} 面（与 +Z 夹角 >{NormalWinDeg:F0}°，朝下）";
+            if (TxtFaceStat != null) TxtFaceStat.Text = stat;
+            App.Log("FACES", null, stat);
         }
 
         // 渲染重建平面（半透明网格面片）
@@ -513,7 +597,12 @@ namespace SprayTrajViewer
             }
             if (mesh.Positions.Count == 0 || mesh.TriangleIndices.Count == 0) return;
 
-            var mat = new DiffuseMaterial(new SolidColorBrush(Color.FromArgb(78, 64, 156, 255)));
+            // 内壁/外壁用不同颜色：薄壁件拆层后内外两面几乎重合，
+            // 同色半透明叠在一起看不出是两块，容易被当成"只画了外壁"。
+            Color fill = p.isInner > 0 ? Color.FromArgb(88, 255, 148, 52)
+                       : p.isInner < 0 ? Color.FromArgb(88, 170, 170, 170)
+                                       : Color.FromArgb(78, 64, 156, 255);
+            var mat = new DiffuseMaterial(new SolidColorBrush(fill));
             var model = new GeometryModel3D(mesh, mat) { BackMaterial = mat };
             var visual = new ModelVisual3D { Content = model };
             _planeVisuals.Add(visual);
@@ -543,7 +632,7 @@ namespace SprayTrajViewer
                 var lines = new LinesVisual3D
                 {
                     Points = pts,
-                    Color = Color.FromRgb(32, 82, 150),
+                    Color = p.isInner > 0 ? Color.FromRgb(176, 88, 16) : Color.FromRgb(32, 82, 150),
                     Thickness = 1.6
                 };
                 _planeVisuals.Add(lines);

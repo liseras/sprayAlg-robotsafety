@@ -91,6 +91,9 @@ int main(int argc, char** argv){
     printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f\n",
         p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
         p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed);
+    // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
+    printf("[abi] sizeof Plane=%zu Point=%zu Result=%zu\n",
+        sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
     SprayTrajResult r = spray_traj_generate(xyz.data(), n, &p);
     if(r.error){ printf("失败: %s\n", r.error); spray_traj_free(&r); return 1; }
     printf("OK: rows=%d points=%d rms=%.3f seg_mean=%.3f seg_max=%.3f\n",
@@ -100,8 +103,52 @@ int main(int argc, char** argv){
         r.input_points - r.removed_points,
         (double)r.inlier_points / std::max(1, r.input_points - r.removed_points) * 100.0,
         r.plane_cx, r.plane_cy, r.plane_cz);
+
+    // 面级法向清单：nx,ny,nz = 喷距法向（轨迹按它抬升）；n0 = 射线自由空间判出的真实法向。
+    // 两者点积为负 → 该面是内壁，喷距方向与真实可喷侧相反。
+    // 口径：与 +Z 夹角 ≤ SPRAYTRAJ_NORMAL_WIN_DEG 的面全部列出（含内壁、外壁），
+    //       完全朝下的面（如开口盒底板外侧）不列入。
+    printf("\n---- 面级法向（+Z = 0°，列出与 +Z 夹角 ≤ %.0f° 的全部面：内壁+外壁）----\n",
+           SPRAYTRAJ_NORMAL_WIN_DEG);
+    printf("面  点数   喷距法向              真实法向              与+Z   tilt  分类 内壁 依据  自由+/-(mm)  质心\n");
+    int nWin = 0, nSkip = 0;
+    for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
+        const SprayTrajPlane& q = r.planes[i];
+        if(q.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){ ++nSkip; continue; }   // 朝下的面不进清单
+        ++nWin;
+        const char* cls = q.side>0 ? "正向" : (q.side<0 ? "反向" : "竖直");
+        const char* src = q.sideSrc==1 ? "射线" : (q.sideSrc==3 ? "强制"
+                        : (q.sideSrc==4 ? "薄壁" : "兜底"));
+        const char* inn = q.isInner>0 ? "内 " : (q.isInner<0 ? "未分" : "外 ");
+        double flip = q.nx*q.n0x + q.ny*q.n0y + q.nz*q.n0z;
+        printf("%2d %6d  (% .3f,% .3f,% .3f) (% .3f,% .3f,% .3f) %5.1f %6.1f  %s  %s  %s %5.1f/%-5.1f (%.1f,%.1f,%.1f)%s\n",
+            i, q.count, q.nx,q.ny,q.nz, q.n0x,q.n0y,q.n0z, q.angZ, q.tiltDeg,
+            cls, inn, src, q.freePlus, q.freeMinus,
+            q.cx,q.cy,q.cz, flip<0 ? "  <== 内外反" : "");
+    }
+    printf("窗口内 %d 面 / 分割共 %d 面", nWin, r.plane_count);
+    if(nSkip) printf("，滤除 %d 面（与 +Z 夹角 > %.0f°，朝下）", nSkip, SPRAYTRAJ_NORMAL_WIN_DEG);
+    printf("\n");
+
+    // 面级清单落盘（Excel 可直接看）
+    {
+        char buf[512]; snprintf(buf,sizeof(buf),"%s.faces.csv",outcsv);
+        FILE* ff=fopen(buf,"w");
+        if(ff){
+            fprintf(ff,"face,count,nx,ny,nz,n0x,n0y,n0z,angZ,tiltDeg,side,isInner(1内/0外/-1未分),sideSrc(1射线/2兜底/3强制/4薄壁),freePlus,freeMinus,cx,cy,cz,inWin(1=夹角<=%.0f)\n", SPRAYTRAJ_NORMAL_WIN_DEG);
+            for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
+                const SprayTrajPlane& q=r.planes[i];
+                fprintf(ff,"%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%d\n",
+                    i,q.count,q.nx,q.ny,q.nz,q.n0x,q.n0y,q.n0z,q.angZ,q.tiltDeg,
+                    q.side,q.isInner,q.sideSrc,q.freePlus,q.freeMinus,q.cx,q.cy,q.cz,
+                    q.angZ <= SPRAYTRAJ_NORMAL_WIN_DEG ? 1 : 0);
+            }
+            fclose(ff);
+        }
+    }
     // CSV
     FILE* fc=fopen(outcsv,"w");
+    if(!fc){ printf("无法写出 CSV: %s\n", outcsv); return 1; }
     fprintf(fc,"X,Y,Z,I,J,K,speed,spray\n");
     for(int i=0;i<r.count;++i){
         SprayTrajPoint& q=r.points[i];
@@ -118,7 +165,8 @@ int main(int argc, char** argv){
     for(int i=0;i<r.count;++i){ fprintf(fp,"%.3f %.3f %.3f 255 48 32\n",r.points[i].x,r.points[i].y,r.points[i].z); }
     fclose(fp);
     // 重建面片网格导出（供离线检查：每个分割面一个 PLY，序号对应分面顺序）
-    for(int i=0;i<r.plane_count && i<8;++i){
+    // 上限必须是槽位数，不能写死 8：薄壁件拆层后面数会超过 8，写死会静默丢掉后几个面。
+    for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
         int nv=r.planes[i].polyVertCount, nt=r.planes[i].polyTriCount;
         if(nv<=0||nt<=0) continue;
         char buf[512]; snprintf(buf,sizeof(buf),"%s.plane%d.ply",outply,i);
