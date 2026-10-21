@@ -3636,13 +3636,62 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 轨迹（之前就是这样——清单里有内壁、橙色面片上一根线都没有）。拆成两个
     // 独立 seg 后，内壁和普通平面一样走 2D 布行，区别只是法向朝腔内。
     //
-    // 判据用"沿块法向投影的最大间隙"，不用射线结论：射线是从两层混合的块里
-    // 采样的，取点位置不同结论就会变（实测 5 块只命中 1 块）。间隙是几何事实。
+    // 判据一（主）：沿块法向投影的最大间隙，不用射线结论——射线是从两层混合的块里
+    //   采样的，取点位置不同结论就会变（实测 5 块只命中 1 块）。间隙是几何事实。
+    // 判据二（补充）：投影直方图的两个密度峰。
+    //   现场扫描的开口盒几乎都有 4mm 顶沿，沿口把内外壁连成**一张连续面**，投影后
+    //   两层之间被沿口点填满 → 最大间隙只剩 1.88mm（实测），判据一必然失效，内外壁
+    //   被当成一块、只出外壁一条轨迹。但"两个壁面各自很密"这件事没有变，密度峰还在，
+    //   所以判据一失败时退回找双峰，两峰之间的谷就是分界。
+    //   双峰路径额外要求"两片各自薄而平、且互相平行"，否则会把厚实块/斜杂面误拆。
     {
         std::vector<PlaneSeg> outerSegs, innerSegs;
         outerSegs.reserve(segs.size());
         innerSegs.reserve(segs.size());
-        int nSplit = 0;
+        int nSplit = 0, nSplitPeak = 0;
+
+        // 直方图双峰检测：返回分界位置（沿法向，相对块质心）。
+        auto twoPeaks = [](const std::vector<double>& h, double& mid)->bool{
+            if(h.size() < 120) return false;
+            const double lo = h.front(), hi = h.back();
+            const double span = hi - lo;
+            if(span < 2.0) return false;                  // 跨度连 2mm 都不到，不可能两层
+            int nb = (int)std::floor(span/0.5) + 1;       // 0.5mm 一桶
+            if(nb < 5) return false;
+            if(nb > 240) nb = 240;
+            const double w = span/(double)nb;
+            std::vector<double> d(nb, 0.0);
+            for(double v : h){
+                int k = (int)((v-lo)/w);
+                if(k < 0) k = 0; else if(k >= nb) k = nb-1;
+                d[k] += 1.0;
+            }
+            // [1,2,1]/4 平滑：压掉采样网格造成的碎峰（不平滑时一块面能有十几个小峰）
+            std::vector<double> m(nb, 0.0);
+            for(int i=0;i<nb;++i){
+                const double a = d[i];
+                const double l = (i>0 ? d[i-1] : d[i]);
+                const double r = (i+1<nb ? d[i+1] : d[i]);
+                m[i] = 0.25*l + 0.5*a + 0.25*r;
+            }
+            int p1=-1, p2=-1; double v1=-1.0, v2=-1.0;
+            for(int i=1;i<nb-1;++i){
+                if(m[i] >= m[i-1] && m[i] > m[i+1]){
+                    if(m[i] > v1){ p2=p1; v2=v1; p1=i; v1=m[i]; }
+                    else if(m[i] > v2){ p2=i; v2=m[i]; }
+                }
+            }
+            if(p1<0 || p2<0) return false;
+            if(p1>p2){ std::swap(p1,p2); std::swap(v1,v2); }
+            if((p2-p1)*w < 2.0) return false;             // 两峰太近 = 同一层的厚尾
+            if(v2 < 0.35*v1)    return false;             // 次峰太弱 = 长尾/离群
+            int g=p1; double gv=m[p1];
+            for(int i=p1;i<=p2;++i) if(m[i] < gv){ gv=m[i]; g=i; }
+            if(gv > 0.70*std::min(v1,v2)) return false;   // 谷不够深 = 一整团，不是两片
+            mid = lo + ((double)g + 0.5)*w;
+            return true;
+        };
+
         for(size_t si2=0; si2<segs.size(); ++si2){
             PlaneSeg& s = segs[si2];
             if(s.curved || s.inl.size() < 60){ outerSegs.push_back(std::move(s)); continue; }
@@ -3659,12 +3708,51 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             }
             // 单层平面的 h 散布只有噪声量级（~0.5mm），1.5mm 门限不会误切
             s.layerThick = hh[(size_t)((hh.size()-1)*0.98)] - hh[(size_t)((hh.size()-1)*0.02)];
-            if(gapAt < 0 || maxGap < 1.5){ s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue; }
-            const double hMid = 0.5*(hh[gapAt-1]+hh[gapAt]);
+
+            double hMid = 0.0; bool viaPeak = false;
+            if(gapAt >= 0 && maxGap >= 1.5){
+                hMid = 0.5*(hh[gapAt-1]+hh[gapAt]);
+            } else if(twoPeaks(hh, hMid)){
+                viaPeak = true;
+            } else {
+                s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue;
+            }
+
             std::vector<int> lo, hi;
             lo.reserve(s.inl.size()); hi.reserve(s.inl.size());
             for(int k : s.inl) (dot(Pf[k]-c0, n) < hMid ? lo : hi).push_back(k);
             if(lo.size() < 30 || hi.size() < 30){ s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue; }
+
+            // 双峰路径的防误拆校验：两片必须各自薄而平，且互相平行。
+            // 判据一拆出来的不加这道校验（原来能拆的一律保持原样，避免回归漂移）。
+            if(viaPeak){
+                Vec3 n1,c1,n2,c2;
+                bool okFit = ls_plane(Pf, lo, n1, c1) && ls_plane(Pf, hi, n2, c2);
+                double thk = 0.0, r1 = 1e9, r2 = 1e9, angLR = 0.0;
+                if(okFit){
+                    const double R2D = 180.0/3.141592653589793;
+                    angLR = std::acos(std::max(-1.0,std::min(1.0,std::fabs(dot(n1,n2)))))*R2D;
+                    Vec3 nu = norm(n1);
+                    thk = std::fabs(dot(c2-c1, nu));
+                    auto rmsA=[&](const std::vector<int>& v, const Vec3& nn, const Vec3& cc){
+                        double s2=0.0;
+                        for(int k : v){ const double dd = dot(Pf[k]-cc, nn); s2 += dd*dd; }
+                        return (v.empty()? 1e9 : std::sqrt(s2/(double)v.size()));
+                    };
+                    r1 = rmsA(lo, n1, c1); r2 = rmsA(hi, n2, c2);
+                }
+                // 25°：超过就不是同一个薄壁的两面了（该由区域生长分开）；
+                // 每片厚度上限 max(1.5, 0.35×间距)：壁厚 4mm 时允许 1.5mm 起伏，
+                // 现场点云噪声 1mm 级也过得去，但"厚实块"会被挡下来。
+                const double tolR = std::max(1.5, 0.35*thk);
+                if(!okFit || angLR > 25.0 || thk < 1.5 || r1 > tolR || r2 > tolR){
+                    if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                        fprintf(stderr,"[split] 块%zu 双峰但否决: 夹角=%.1f° 间距=%.2f r1=%.2f r2=%.2f tol=%.2f\n",
+                                si2, angLR, thk, r1, r2, tolR);
+                    s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue;
+                }
+                ++nSplitPeak;
+            }
 
             auto cen=[&](const std::vector<int>& v){
                 Vec3 t{0,0,0};
@@ -3722,8 +3810,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         segs.reserve(outerSegs.size()+innerSegs.size());
         for(auto& s : outerSegs) segs.push_back(std::move(s));
         for(auto& s : innerSegs) segs.push_back(std::move(s));
-        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（含内壁 %d 面）\n",
-                           nSplit, segs.size(), nSplit);
+        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（含内壁 %d 面，其中双峰判据 %d 块）\n",
+                           nSplit, segs.size(), nSplit, nSplitPeak);
     }
 
     // 输出所有分割平面（供 WPF 显示重建面）
