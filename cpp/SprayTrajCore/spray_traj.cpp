@@ -452,7 +452,7 @@ struct PlaneSeg {
     // 曲面块标记：true 时 pl 只是"平均平面"（用于定向/统计），真正的轨迹
     // 生成走曲面行追踪（gen_surface_rows），不是平面 2D 布行。
     bool curved = false;
-    FaceOrient fo;        // 面级朝向诊断（不参与轨迹生成，只上报）
+    FaceOrient fo;        // 面级朝向诊断；angZ 参与轨迹生成（朝下超窗口不喷），其余只上报
 };
 
 // ---------------- 规则化轮廓重建（2D） ----------------
@@ -3735,7 +3735,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         res.planes[wi].cz = P.c.z;
         res.planes[wi].count = (int)segs[i].inl.size();
         {
-            // 面级法向诊断（只上报，不参与轨迹）
+            // 面级法向诊断（angZ 同时决定是否喷：朝下超窗口的面不生成轨迹）
             const FaceOrient& fo = segs[i].fo;
             res.planes[wi].n0x = fo.n.x; res.planes[wi].n0y = fo.n.y; res.planes[wi].n0z = fo.n.z;
             res.planes[wi].angZ      = fo.angZ;
@@ -4044,6 +4044,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
     std::vector<SprayTrajPoint> allPts;
     int totalRows = 0;
+    int nDownSkip = 0;      // 朝下超出角度窗口、不喷的面数
     ProfStage psTraj("4.轨迹生成", &tTraj);
 
     // ---- 面间过渡的安全高度 ----
@@ -4094,6 +4095,18 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         Plane& pl = seg.pl;
         const auto& inl = seg.inl;
         if(inl.size() < 20) continue;
+
+        // ---- 可喷角度窗口：法向朝下的面不生成轨迹 ----
+        // 与面级清单用同一条判据（SPRAYTRAJ_NORMAL_WIN_DEG = 130°）。以前窗口只在
+        // driver 打印清单时执行，轨迹照喷，于是开口盒的"外底面"（法向 180°、朝下、
+        // 贴地面）也有轨迹——清单里已经滤掉，这里必须同口径滤掉。
+        // 注意用 fo.angZ（真实可喷侧法向），不是 pl.n：内底朝上（0°）在这条之外，照喷。
+        if(seg.fo.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){
+            ++nDownSkip;
+            fprintf(stderr, "[skip] 面%zu 可喷侧朝下 %.1f° > %.0f°，不喷（内点数 %zu）\n",
+                    si, seg.fo.angZ, SPRAYTRAJ_NORMAL_WIN_DEG, inl.size());
+            continue;
+        }
 
         // ================= 曲面块：曲面上的行追踪 =================
         // 不走平面的 2D 布行——曲面投影成 2D 会在陡峭段挤压，行距失控。
@@ -4644,7 +4657,10 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         allPts.swap(q);
     }
 
-    if(allPts.empty()){ err="无有效扫描行"; res.error=_strdup(err.c_str()); return res; }
+    if(allPts.empty()){
+        err = nDownSkip>0 ? "无有效扫描行（所有面可喷侧朝下，超出角度窗口被滤除）" : "无有效扫描行";
+        res.error=_strdup(err.c_str()); return res;
+    }
     res.rows = totalRows;
 
     // 曲面件：把"平面残差"换成"行到曲面的贴合残差"（行追踪跑完才有的值）
