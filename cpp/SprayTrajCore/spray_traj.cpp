@@ -3444,6 +3444,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     p.scanDirMode    = 0;
     p.gunClear       = 20.0;   // 枪帽 Ø32 半径16 + 余量4；大枪/旋杯按实际改
     p.edgeExtend     = -1.0;   // 行端点外扩：-1 = 自动(1×行距)，0 = 不外扩
+    p.edgeExtendAcross = -1.0; // 跨行方向外扩：-1 = 自动(0.25×行距)，0 = 首末行压边界
     return p;
 }
 
@@ -3951,6 +3952,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 3. 对每个分割出的平面段，分别生成 S 形轨迹并拼接
     struct Row { double xs, xe, yc; int segIdx; };  // segIdx: 该行是扫描线与面交集的第几段（环形面会产生多段）
     double L=params->scanRowSpacing, pstep=params->pointSpacing;
+    // 跨行方向外扩：首末行相对点云边界各向外多少（mm）。<0 = 自动 = 0.25×行距，
+    // 与行端点外扩 edgeExtend 是两个方向、两套默认值：
+    //   · edgeExtend（行方向）默认 1×行距——点云在行端缺的那一截通常较大；
+    //   · 跨行方向只差"网格截断 + 点云边缘薄薄一层"，0.25×行距已能覆盖。
+    const double acrossExt = (params->edgeExtendAcross >= 0.0)
+                           ? params->edgeExtendAcross
+                           : 0.25*params->scanRowSpacing;
     double turnR = params->turnRadiusFactor * L;
 
     // 主方向选择 + 行端点计算：对给定 2D 点集，穷举角度(每5°)选最平滑方向
@@ -3961,7 +3969,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         std::nth_element(v.begin(), v.begin()+k, v.end());
         return v[k];
     };
-    auto genRows=[&](const std::vector<Vec2>& pts, double ang, double L, double fillHole)->std::vector<Row>{
+    auto genRows=[&](const std::vector<Vec2>& pts, double ang, double L, double fillHole, double acrossExt)->std::vector<Row>{
         double c=std::cos(ang), s=std::sin(ang);
         std::vector<Vec2> R(pts.size());
         std::vector<double> rx(pts.size()), ry(pts.size());
@@ -3976,16 +3984,33 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 大平面用绝对阈值防噪声孤点。
         int supMin = (int)std::max(3, (int)(pts.size()*0.001));
         supMin = std::min(supMin, 20);
-        // 首行从 mny+L*0.25 起、末行到 mxy+L*0.25，让轨迹两端外扩覆盖边缘，
-        // 避免"首尾各损失半行距"导致窄侧面轨迹短一截。
+        // ---- 首末行位置（跨行方向的外扩策略）----
+        // 从点云边界 mny/mxy 各向外跨 acrossExt，行数按行距推算，行距在两个端点
+        // 之间等分——首末行严格落在外扩后的边界上。
+        // 原实现是"从 mny+0.25L 起、每 L 一步、直到超过 mxy+0.25L"：末行位置由固定
+        // 网格决定，最多少掉将近一整个行距（实测薄壁盒内壁顶部末行停在 z=281，真实
+        // 边沿 z=300，漏 19mm；补行端点没用，因为漏的方向是跨行方向不是行方向）。
+        // 等分后行距偏差 = (跨度/行数) - L，几十行时 < 1%，肉眼与工艺上都无差别。
         // 行端按"该行带内点的 x 聚类分段"：实心面 → 一整行（全长走刀）；
         // 环形/框形面（如槽型盘凸边环）→ 每行分成左右两段，中央空区不喷。
         // 点云缺陷覆盖重建：间隙 < fillHole 的小洞/缺口视为可填补——直接
         // 跨越生成连续行（重建面已把该洞补齐，行应贴重建面连续无断点）；
         // 间隙 >= fillHole 的真实孔/槽才断开为两段。
         const double gapSeg = std::max(fillHole, L*0.5);   // x 间隙超过此值视为两段；以下则跨越填补
+        const double y0 = mny - acrossExt, y1 = mxy + acrossExt;
+        int nRow = 1; double stepA = L;
+        if(y1 - y0 > 1e-9){
+            // 行数按跨度/行距四舍五入（行距允许比设定值大 20% 以内——喷涂本来有
+            // 20~30% 搭接余量）；超过 20% 才补一条，防止窄面上两条行被拉得太开。
+            // 不能用 floor 起算的老写法：那样末行由固定网格决定，最多少掉近一个行距。
+            int nIv = std::max(1, (int)std::floor((y1-y0)/L + 0.5));
+            if((y1-y0)/(double)nIv > 1.2*L) ++nIv;
+            nRow  = nIv + 1;
+            stepA = (y1-y0)/(double)nIv;
+        }
         std::vector<Row> raw;
-        for(double yc=mny+L*0.25; yc <= mxy+L*0.25+1e-9; yc+=L){
+        for(int ri=0; ri<nRow; ++ri){
+            const double yc = (nRow>1) ? (y0 + stepA*(double)ri) : 0.5*(y0+y1);
             // 收集该行带内的 x 值
             std::vector<double> bx; bx.reserve(R.size()/4);
             int sup=0;
@@ -4008,6 +4033,25 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 segPrev=bx[i]; segCnt++;
             }
             flushSeg();
+        }
+        // 极端行补回：跨行外扩把首/末行推到点云之外时，那条行带的支撑点太少
+        // （带有一半落在空处），会被上面的支撑点/段长过滤掉——恰恰是最该保留的
+        // "补边沿"那条行被删了，表现为"ea 调大反而少一行"。这里按最近的已有行
+        // 克隆一条到目标位置（长度沿用邻居），后面还有枪位兜底会把它退回来。
+        if(nRow > 1 && acrossExt > 1e-9 && !raw.empty()){
+            auto cloneAt=[&](double yTarget){
+                double best = 1e18;
+                for(auto& r : raw) best = std::min(best, std::fabs(r.yc - yTarget));
+                if(best < 1e-6) return;                 // 该行本来就在
+                std::vector<Row> add;
+                for(auto& r : raw)
+                    if(std::fabs(std::fabs(r.yc - yTarget) - best) < 1e-6){
+                        Row q = r; q.yc = yTarget; add.push_back(q);
+                    }
+                for(auto& q : add) raw.push_back(q);
+            };
+            cloneAt(y0);
+            cloneAt(y1);
         }
         // 按段分组排序：先喷完所有第0段行（子蛇形），再第1段……
         // 避免左右段按行交替导致蛇形在环两端来回斜穿。
@@ -4039,6 +4083,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             raw.swap(filled);
         }
         rs = std::move(raw);
+        if(std::getenv("SPRAYTRAJ_ROW_DBG"))
+            fprintf(stderr, "[rows] ang=%.1f° 跨行 %.1f..%.1f 跨度=%.1f 行数=%d 间距=%.2f 出行=%zu\n",
+                    ang*180.0/3.141592653589793, mny, mxy, mxy-mny, nRow, stepA, rs.size());
         if(rs.empty()) return rs;
         return rs;
     };
@@ -4309,7 +4356,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             // scanDirMode=2（沿短边喷）时转 90°。
             theta = normAng((params->scanDirMode == 2)
                             ? forcedTheta + 1.5707963267948966 : forcedTheta);
-            bestRows = genRows(P2, theta, L, params->fillHoleSize);
+            bestRows = genRows(P2, theta, L, params->fillHoleSize, acrossExt);
         }
         else if(haveRectAng){
             // mode1/0 = 沿长边；mode2 = 沿短边（长边方向转 90°）
@@ -4320,7 +4367,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 theta = normAng(theta + 1.5707963267948966);
                 std::swap(e1,e2);
             }
-            bestRows = genRows(P2, theta, L, params->fillHoleSize);
+            bestRows = genRows(P2, theta, L, params->fillHoleSize, acrossExt);
             // 只有"面足够宽、却只排出不到 3 行"才说明方向选错了、需要重选；
             // 窄面（垂直行向的宽度撑不满 3 行）本来就只能铺 1~2 行，必须保留，
             // 否则会掉进下面的穷举搜索，选到沿窄边的方向 → 上百条 20mm 的碎行。
@@ -4330,7 +4377,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             double bestCost=1e18;
             for(int deg=0; deg<180; deg+=5){
                 double ang=deg*3.141592653589793/180.0;
-                auto rs=genRows(P2,ang,L,params->fillHoleSize);
+                auto rs=genRows(P2,ang,L,params->fillHoleSize, acrossExt);
                 if(rs.size()<2) continue;
                 double jag=0;
                 for(size_t i=1;i<rs.size();++i)
@@ -4378,6 +4425,45 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
         double ca=std::cos(theta), sa=std::sin(theta);
         auto rotInv=[&](Vec2 p)->Vec2{ return {ca*p.x - sa*p.y, sa*p.x + ca*p.y}; };
+
+        // ---- 跨行外扩的枪位兜底 ----
+        // 首/末行按 acrossExt 外扩出去后，还要过一遍 gunClear：内壁底部那条首行的
+        // 枪位本来就被 gunClear 卡在临界（内点已按 20mm 裁过），再往外 3mm 就侵入
+        // 安全余量。这里只把"外扩出来的那一条"按 1mm 往回退，退到安全为止，
+        // 最多退光 acrossExt（回到点云边界）；行距因此会有 ≤3mm 的不均匀，可接受。
+        if(!ringMode && acrossExt > 1e-9 && !bestRows.empty()){
+            const double rmn = [&]{ double m=1e18; for(auto& q:P2) m=std::min(m, ca*q.x+sa*q.y); return m; }();
+            const double rmx = [&]{ double m=-1e18; for(auto& q:P2) m=std::max(m, ca*q.x+sa*q.y); return m; }();
+            auto rowGunOK=[&](const Row& r)->bool{
+                const double xs3[3] = { r.xs, 0.5*(r.xs+r.xe), r.xe };
+                for(int t=0;t<3;++t){
+                    Vec2 w = rotInv(Vec2{xs3[t], r.yc});
+                    Vec3 X = pl.c + u*w.x + v*w.y;
+                    if(gunClearAt(X, pl.n) < gunClearEff) return false;
+                }
+                return true;
+            };
+            const int maxStep = (int)std::ceil(acrossExt);
+            int nAdj = 0;
+            size_t i = 0;
+            while(i < bestRows.size()){
+                size_t j = i;
+                while(j+1 < bestRows.size() && bestRows[j+1].segIdx == bestRows[i].segIdx) ++j;
+                for(int side=0; side<2; ++side){
+                    if(side==1 && j==i) break;
+                    Row& r = (side==0) ? bestRows[i] : bestRows[j];
+                    const double dir = (side==0) ? +1.0 : -1.0;   // 0=低边向内退，1=高边向内退
+                    int k=0;
+                    while(k < maxStep && !rowGunOK(r)){ r.yc += dir; ++k; }
+                    if(k) ++nAdj;
+                }
+                i = j+1;
+            }
+            if(nAdj)
+                fprintf(stderr, "[traj] 面%zu 跨行外扩: %d 条首/末行因枪位不足退回（点云边界 %.1f..%.1f）\n",
+                        si, nAdj, rmn, rmx);
+        }
+
 
         // ---- 行端点外扩（布行边界外扩策略，可配置）----
         // 病灶：点云在面边沿常常"缺一截"——扫描遮挡，或者边缘点被判给了相邻面——

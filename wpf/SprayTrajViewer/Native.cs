@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 
 namespace SprayTrajViewer
@@ -20,6 +20,7 @@ namespace SprayTrajViewer
         public int    scanDirMode;      // 轨迹方向：0=自动，1=沿长边喷，2=沿短边喷
         public double gunClear;         // 枪体安全半径 mm（喷头外径/2 + 安全余量）
         public double edgeExtend;       // 行端点外扩 mm（<0=自动 1×行距，0=不外扩）
+        public double edgeExtendAcross; // 跨行方向外扩 mm（<0=自动 0.25×行距，0=首末行压边界）
     }
 
     [StructLayout(LayoutKind.Sequential)]

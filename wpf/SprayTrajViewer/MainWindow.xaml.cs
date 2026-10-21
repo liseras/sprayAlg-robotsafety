@@ -112,6 +112,7 @@ namespace SprayTrajViewer
             if (o.TryGetValue("standoff", out v)) TxtStandoff.Text = v;
             if (o.TryGetValue("gc", out v)) TxtGunClear.Text = v;
             if (o.TryGetValue("ee", out v)) TxtEdgeExtend.Text = v;
+            if (o.TryGetValue("ea", out v)) TxtEdgeExtendAcross.Text = v;
             if (o.TryGetValue("speed", out v)) TxtSpeed.Text = v;
             if (o.TryGetValue("turn", out v)) TxtTurnFactor.Text = v;
             if (o.TryGetValue("flat", out v)) TxtFlatness.Text = v;
@@ -131,7 +132,7 @@ namespace SprayTrajViewer
             App.Log("CLI", null,
                 $"flat={TxtFlatness.Text} curv={TxtCurvature.Text} fill={TxtFillHole.Text} " +
                 $"row={TxtRowSpacing.Text} pt={TxtPointSpacing.Text} standoff={TxtStandoff.Text} " +
-                $"gc={TxtGunClear.Text} ee={TxtEdgeExtend.Text} " +
+                $"gc={TxtGunClear.Text} ee={TxtEdgeExtend.Text} ea={TxtEdgeExtendAcross.Text} " +
                 $"dir={CmbScanDir.SelectedIndex} flip={CmbNormalFlip.SelectedIndex}");
             App.Log("CLI", null,
                 $"show: cloud={ChkShowCloud.IsChecked} traj={ChkShowTraj.IsChecked} plane={ChkShowPlane.IsChecked}");
@@ -278,6 +279,7 @@ namespace SprayTrajViewer
                 scanDirMode    = CmbScanDir.SelectedIndex,
                 gunClear       = ParseDouble(TxtGunClear.Text, 20),
                 edgeExtend     = ParseDouble(TxtEdgeExtend.Text, -1),
+                edgeExtendAcross = ParseDouble(TxtEdgeExtendAcross.Text, -1),
             };
 
             // 组织 xyz 数组

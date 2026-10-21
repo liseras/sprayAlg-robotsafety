@@ -52,6 +52,11 @@
                         <TextBox x:Name="TxtEdgeExtend" Text="-1" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
+                        <TextBlock Text="跨行外扩 (mm)" Width="150" VerticalAlignment="Center"
+                                   ToolTip="首/末行相对点云边界各向外跨多少（跨行方向）。负值=自动(0.25×行距)，0=首末行压点云边界。点云在边沿缺一截导致顶部/底部漏一条时，把这个调到缺口尺寸"/>
+                        <TextBox x:Name="TxtEdgeExtendAcross" Text="-1" Padding="4"/>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
                         <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
                         <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
                     </DockPanel>

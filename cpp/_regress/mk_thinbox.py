@@ -3,7 +3,7 @@
 import sys, random
 
 W, D, H, T = 400.0, 300.0, 300.0, 4.0
-STEP = 2.0
+STEP = float(__import__("os").environ.get("THINBOX_STEP","2.0"))
 random.seed(7)
 
 
