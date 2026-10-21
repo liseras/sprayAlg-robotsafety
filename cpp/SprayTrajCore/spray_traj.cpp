@@ -3621,6 +3621,100 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         reportCurved = (segs[bi].curved && isCurved);
     }
 
+    // ---- 薄壁双层拆段：一块面里同时装着内壁和外壁 ----
+    // 根因：分割阶段用无向法向(|dot|)做区域生长，壁的两层法向相反却被判成同向，
+    // 于是并成一块、块质心落在两层中间；射线沿两侧各走一个壁厚就撞到对面层，
+    // 两侧自由距离都 ≈ 壁厚且对称，靠距离永远分不出内外。
+    //
+    // 必须在**这里**拆：轨迹是按 seg 生成的，只在输出层拆行的话内壁永远分不到
+    // 轨迹（之前就是这样——清单里有内壁、橙色面片上一根线都没有）。拆成两个
+    // 独立 seg 后，内壁和普通平面一样走 2D 布行，区别只是法向朝腔内。
+    //
+    // 判据用"沿块法向投影的最大间隙"，不用射线结论：射线是从两层混合的块里
+    // 采样的，取点位置不同结论就会变（实测 5 块只命中 1 块）。间隙是几何事实。
+    {
+        std::vector<PlaneSeg> outerSegs, innerSegs;
+        outerSegs.reserve(segs.size());
+        innerSegs.reserve(segs.size());
+        int nSplit = 0;
+        for(size_t si2=0; si2<segs.size(); ++si2){
+            PlaneSeg& s = segs[si2];
+            if(s.curved || s.inl.size() < 60){ outerSegs.push_back(std::move(s)); continue; }
+            const Vec3 n = s.pl.n, c0 = s.pl.c;
+            std::vector<double> hh; hh.reserve(s.inl.size());
+            for(int k : s.inl) hh.push_back(dot(Pf[k]-c0, n));
+            std::sort(hh.begin(), hh.end());
+            // 只在"两侧各至少 30 点"的候选里找最大间隙：边缘离群点的间隙往往比
+            // 真正的层间间隙还大（实测最大间隙会落在排序后第 2 个点上）。
+            int gapAt = -1; double maxGap = 0.0;
+            for(size_t t=30; t+30<=hh.size(); ++t){
+                const double g = hh[t]-hh[t-1];
+                if(g > maxGap){ maxGap = g; gapAt = (int)t; }
+            }
+            // 单层平面的 h 散布只有噪声量级（~0.5mm），1.5mm 门限不会误切
+            if(gapAt < 0 || maxGap < 1.5){ outerSegs.push_back(std::move(s)); continue; }
+            const double hMid = 0.5*(hh[gapAt-1]+hh[gapAt]);
+            std::vector<int> lo, hi;
+            lo.reserve(s.inl.size()); hi.reserve(s.inl.size());
+            for(int k : s.inl) (dot(Pf[k]-c0, n) < hMid ? lo : hi).push_back(k);
+            if(lo.size() < 30 || hi.size() < 30){ outerSegs.push_back(std::move(s)); continue; }
+
+            auto cen=[&](const std::vector<int>& v){
+                Vec3 t{0,0,0};
+                for(int k : v) t = t + Pf[k];
+                return t*(1.0/(double)v.size());
+            };
+            const Vec3 cLo = cen(lo), cHi = cen(hi);
+            const bool hiOuter = len(cHi-partC) >= len(cLo-partC);   // 离质心远的一片在外
+            const Vec3 nOut = hiOuter ? n : n*(-1.0);
+            const double D2R = 3.141592653589793/180.0;
+
+            PlaneSeg so;
+            so.curved = false;
+            so.pl.n = nOut;
+            so.pl.c = hiOuter ? cHi : cLo;
+            so.pl.d = -dot(nOut, so.pl.c);
+            so.inl  = hiOuter ? std::move(hi) : std::move(lo);
+            so.fo   = s.fo;
+            so.fo.n = nOut;
+            so.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,nOut.z)))/D2R;
+            so.fo.tilt = 90.0 - so.fo.angZ;
+            so.fo.side = (so.fo.angZ < 87.0) ? 1 : (so.fo.angZ > 93.0 ? -1 : 0);
+            so.fo.isInner = 0;
+            so.fo.src = 4;                                   // 4 = 薄壁拆层
+
+            PlaneSeg sn;
+            sn.curved = false;
+            sn.pl.n = nOut*(-1.0);                           // 内壁：可喷侧朝腔内
+            sn.pl.c = hiOuter ? cLo : cHi;
+            sn.pl.d = -dot(sn.pl.n, sn.pl.c);
+            sn.inl  = hiOuter ? std::move(lo) : std::move(hi);
+            sn.fo   = so.fo;
+            sn.fo.n = sn.pl.n;
+            sn.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,sn.pl.n.z)))/D2R;
+            sn.fo.tilt = 90.0 - sn.fo.angZ;
+            sn.fo.side = (sn.fo.angZ < 87.0) ? 1 : (sn.fo.angZ > 93.0 ? -1 : 0);
+            sn.fo.isInner = 1;
+            sn.fo.src = 4;
+            std::swap(sn.fo.freePlus, sn.fo.freeMinus);       // 自由距离随法向一起翻
+
+            if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                fprintf(stderr, "[split] seg%zu 双层: 间隙=%.2fmm 外壁点=%d 内壁点=%d 外法向=(%.2f,%.2f,%.2f)\n",
+                        si2, maxGap, (int)so.inl.size(), (int)sn.inl.size(), nOut.x,nOut.y,nOut.z);
+            ++nSplit;
+            outerSegs.push_back(std::move(so));
+            innerSegs.push_back(std::move(sn));
+        }
+        // 顺序：先喷完所有外壁，再进腔喷内壁。
+        // 若按"外/内/外/内"交替，枪会在工件内外来回穿，每次都要走一遍抬枪绕行。
+        segs.clear();
+        segs.reserve(outerSegs.size()+innerSegs.size());
+        for(auto& s : outerSegs) segs.push_back(std::move(s));
+        for(auto& s : innerSegs) segs.push_back(std::move(s));
+        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（含内壁 %d 面）\n",
+                           nSplit, segs.size(), nSplit);
+    }
+
     // 输出所有分割平面（供 WPF 显示重建面）
     // 为每个面计算局部基(u,v)主轴 + 内点包围盒，WPF 直接画矩形（不做 PCA 近似）
     res.plane_count = 0;
@@ -3851,151 +3945,6 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     }
     res.plane_count = (int)wi;
 
-    // ---- 薄壁双层拆行：一个面块里同时装着内壁和外壁 ----
-    // 根因：分割阶段用无向法向(|dot|)做区域生长，壁的两层法向相反却被判成同向，
-    // 于是被并成同一块，块质心正好落在两层中间。射线沿两侧各走一个壁厚就撞到
-    // 对面层，两侧自由距离都 ≈ 壁厚且对称，靠距离永远分不出内外。
-    // 这里按"沿块法向的投影 h"把点分成两片，各自算质心与朝向：
-    //   离工件质心更远的一片 = 外壁（法向背离质心），另一片 = 内壁（法向朝腔内）。
-    // 只改输出行、不动 segs，所以轨迹与拆行前逐字节一致。
-    {
-        const int baseCount = (int)wi;
-        for(int pi = 0; pi < baseCount; ++pi){
-            if(pi >= (int)planeSeg.size()) break;
-            const int si = planeSeg[pi];
-            if(si < 0 || si >= (int)segs.size()) continue;
-            const FaceOrient& fo = segs[si].fo;
-
-            const Vec3 n  = segs[si].pl.n;
-            const Vec3 c0 = segs[si].pl.c;
-            // 不依赖射线结论：直接把点沿块法向投影，排序后找最大间隙。
-            // 间隙 > 1.5mm = 该面块是两张平行面叠在一起（薄壁的内层 + 外层），
-            // 这是几何事实，比"两侧都近挡"这种由采样点位置决定的射线结论稳。
-            // 单层平面 h 的散布只有噪声量级（~0.5mm），不会被误切。
-            std::vector<double> hh;
-            hh.reserve(segs[si].inl.size());
-            for(int k : segs[si].inl) hh.push_back(dot(Pf[k] - c0, n));
-            std::sort(hh.begin(), hh.end());
-            int gapAt = -1; double maxGap = 0.0;
-            // 只在"两侧各至少 30 点"的候选里找：边缘那几个离群点的间隙往往比真正的
-            // 层间间隙还大（实测面0 的最大间隙落在排序后的第 2 个点上），会把判据带偏。
-            for(size_t t=30; t+30<=hh.size(); ++t){
-                const double g = hh[t] - hh[t-1];
-                if(g > maxGap){ maxGap = g; gapAt = (int)t; }
-            }
-            const bool twoLayer = (maxGap >= 1.5 && gapAt >= 30 && (int)hh.size()-gapAt >= 30);
-            if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                fprintf(stderr, "[layer] 面%d 点=%d maxGap=%.2f at=%d lo=%d hi=%d two=%d\n",
-                        pi, (int)hh.size(), maxGap, gapAt, gapAt,
-                        (int)hh.size()-gapAt, (int)twoLayer);
-            if(!twoLayer) continue;
-            const double hMid = 0.5 * (hh[gapAt-1] + hh[gapAt]);
-
-            std::vector<int> lo, hi;
-            lo.reserve(segs[si].inl.size());
-            hi.reserve(segs[si].inl.size());
-            for(int k : segs[si].inl)
-                (dot(Pf[k] - c0, n) < hMid ? lo : hi).push_back(k);
-            if(lo.size() < 30 || hi.size() < 30){
-                if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                    fprintf(stderr, "[split] 面%d 分不开: lo=%d hi=%d (gap=%.2f)\n",
-                            pi, (int)lo.size(), (int)hi.size(), maxGap);
-                continue;
-            }
-
-            auto cen = [&](const std::vector<int>& v){
-                Vec3 s{0,0,0};
-                for(int k : v) s = s + Pf[k];
-                return s * (1.0 / (double)v.size());
-            };
-            const Vec3 cHi = cen(hi), cLo = cen(lo);
-            // 离工件质心更远的一片是外壁
-            const bool hiIsOuter = len(cHi - partC) >= len(cLo - partC);
-            const Vec3 cOut = hiIsOuter ? cHi : cLo;
-            const Vec3 cIn  = hiIsOuter ? cLo : cHi;
-            const int  nOut = (int)(hiIsOuter ? hi.size() : lo.size());
-            const int  nIn  = (int)(hiIsOuter ? lo.size() : hi.size());
-            // 法向只能用面块自己的拟合法向 n（精确的轴向），符号由"哪一层在外"决定。
-            // 不能用 cOut-cIn：两层虽然平行，但点集在面内的分布不同（边缘点缺失、
-            // 残点归并不均），质心差里混着面内偏移量，归一化后会带出十几度假倾角。
-            const Vec3 nOutV = hiIsOuter ? n : n*(-1.0);   // 外壁：指向外层
-            const Vec3 nInV  = nOutV * (-1.0);             // 内壁：朝腔内
-
-            auto setRow = [&](int row, Vec3 c, Vec3 nn, Vec3 sprayDir, int cnt, int inner){
-                if(row < 0 || row >= SPRAYTRAJ_PLANE_SLOTS) return;
-                SprayTrajPlane& q = res.planes[row];
-                q.cx=c.x; q.cy=c.y; q.cz=c.z;
-                q.count=cnt;
-                q.nx=sprayDir.x; q.ny=sprayDir.y; q.nz=sprayDir.z;   // 该面应沿哪个方向抬枪
-                q.n0x=nn.x; q.n0y=nn.y; q.n0z=nn.z;
-                const double cc = std::max(-1.0, std::min(1.0, nn.z));
-                q.angZ = std::acos(cc) * 180.0 / 3.141592653589793;
-                q.tiltDeg = 90.0 - q.angZ;
-                q.side = (q.angZ < 87.0) ? 1 : (q.angZ > 93.0 ? -1 : 0);
-                q.isInner = inner;
-                q.sideSrc = 4;
-                q.freePlus  = fo.freePlus;
-                q.freeMinus = fo.freeMinus;
-            };
-
-            // 每一层各自出一块面片。
-            // 原来只保留整块的面片（两层合一、落在中面上），内壁行 polyVertCount 强制写 0，
-            // 结果 3D 里永远只看到一个面片，内外壁在视觉上根本分不开——清单有行、画面没面。
-            // 现在按层的点集单独重建轮廓，并把顶点沿块法向平移到该层真实高度
-            // （外层 +壁厚/2、内层 -壁厚/2），两层在 3D 里就各自独立可见。
-            const Vec3 u0{res.planes[pi].ux, res.planes[pi].uy, res.planes[pi].uz};
-            const Vec3 v0{res.planes[pi].vx, res.planes[pi].vy, res.planes[pi].vz};
-            auto buildLayer = [&](int row, const std::vector<int>& idx){
-                if(row < 0 || row >= SPRAYTRAJ_PLANE_SLOTS) return;
-                SprayTrajPlane& q = res.planes[row];
-                q.polyVertCount = 0; q.polyTriCount = 0;
-                if(idx.size() < 20 || len(u0) < 1e-6 || len(v0) < 1e-6) return;
-                std::vector<double> hlay; hlay.reserve(idx.size());
-                std::vector<Vec2> uv;     uv.reserve(idx.size());
-                for(int k : idx){
-                    Vec3 d = Pf[k] - c0;
-                    hlay.push_back(dot(d, n));
-                    uv.push_back(Vec2{ dot(d, u0), dot(d, v0) });
-                }
-                std::nth_element(hlay.begin(), hlay.begin()+hlay.size()/2, hlay.end());
-                const double hMed = hlay[hlay.size()/2];
-                std::vector<Vec2> verts; std::vector<int> tris;
-                const double cell = std::max(1.5, params->scanRowSpacing);
-                if(!build_plane_mesh(uv, cell, params->fillHoleSize, verts, tris,
-                                     SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
-                                     SPRAYTRAJ_PLANE_MAX_POLY_TRIS))
-                    return;
-                int nv = std::min((int)verts.size(), SPRAYTRAJ_PLANE_MAX_POLY_VERTS);
-                for(int v=0; v<nv; ++v){
-                    Vec3 pos = c0 + u0*verts[v].x + v0*verts[v].y + n*hMed;
-                    q.polyVerts[v*3+0]=pos.x; q.polyVerts[v*3+1]=pos.y; q.polyVerts[v*3+2]=pos.z;
-                }
-                int nt = std::min((int)(tris.size()/3), SPRAYTRAJ_PLANE_MAX_POLY_TRIS);
-                for(int t=0; t<nt; ++t){
-                    q.polyTris[t*3+0]=tris[t*3+0];
-                    q.polyTris[t*3+1]=tris[t*3+1];
-                    q.polyTris[t*3+2]=tris[t*3+2];
-                }
-                q.polyVertCount=nv; q.polyTriCount=nt;
-                if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                    fprintf(stderr, "[layer] 面%d 层几何: 点=%d 顶点=%d 三角=%d 层高=%+.2fmm\n",
-                            row, (int)idx.size(), nv, nt, hMed);
-            };
-
-            setRow(pi, cOut, nOutV, nOutV, nOut, 0);     // 原行改成外壁
-            buildLayer(pi, hiIsOuter ? hi : lo);
-            const int nr = (int)wi;                      // 追加内壁行
-            if(nr < SPRAYTRAJ_PLANE_SLOTS){
-                std::memset(&res.planes[nr], 0, sizeof(SprayTrajPlane));
-                res.planes[nr].polyVertCount = 0;
-                res.planes[nr].polyTriCount  = 0;
-                setRow(nr, cIn, nInV, nInV, nIn, 1);
-                buildLayer(nr, hiIsOuter ? lo : hi);
-                ++wi;
-            }
-        }
-        res.plane_count = (int)wi;
-    }
 
     // 3. 对每个分割出的平面段，分别生成 S 形轨迹并拼接
     struct Row { double xs, xe, yc; int segIdx; };  // segIdx: 该行是扫描线与面交集的第几段（环形面会产生多段）
@@ -4222,6 +4171,34 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         si, inl.size(), nr, angN, surf.rowGap, surf.cover*100.0);
             }
             continue;
+        }
+
+        // ---- 枪位可达性：内壁/内底在角落处，枪体会顶到相邻壁 ----
+        // 内壁的可喷侧朝腔内，枪得伸进腔里 standoff 才喷得到面。走到靠近相邻内壁
+        // 的边缘时，枪位已经嵌进那块壁里——实测开口盒内壁轨迹两端各约 4mm 宽、
+        // 最深 2mm 侵入；更糟的是内壁首点贴着壁时，面间过渡的"从安全高度垂直
+        // 下降"会整整穿过 300mm 高的壁（实测一段 423mm 的直线穿墙）。
+        // 判据：面点沿法向抬到枪位，查枪位到工件点云的最近距离，太近就不布行。
+        // 只对内壁/内底生效：外壁枪位在件外 standoff 处，最近点距离必然 >= standoff，
+        // 不会误删。
+        if(seg.fo.isInner > 0 && !inl.empty()){
+            const double gunClear = std::max(12.0, 0.2*params->standoff);
+            std::vector<int> keep; keep.reserve(inl.size());
+            int drop = 0;
+            for(int i : inl){
+                Vec3 q = Pf[i] + pl.n*params->standoff;
+                KnnBuf kb; partTree.knn(q, 1, kb);
+                double d = 1e30;
+                for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d = std::min(d, len(Pf[kb.id[t]]-q));
+                if(d < gunClear){ ++drop; continue; }
+                keep.push_back(i);
+            }
+            if(drop > 0 && keep.size() >= 20){
+                seg.inl.swap(keep);        // inl 是 seg.inl 的引用，内容随之更新
+                if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                    fprintf(stderr, "[gun] 面%zu 内壁: 枪位距件 <%.0fmm，剔除 %d 点，剩 %zu\n",
+                            si, gunClear, drop, seg.inl.size());
+            }
         }
 
         // 该平面的局部基
