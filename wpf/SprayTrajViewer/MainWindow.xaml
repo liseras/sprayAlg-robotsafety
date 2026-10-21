@@ -43,7 +43,7 @@
                     </DockPanel>
                     <DockPanel Margin="0,4">
                         <TextBlock Text="枪体安全半径 (mm)" Width="150" VerticalAlignment="Center"
-                                   ToolTip="喷头外径/2 + 安全余量。内壁角落枪位距件小于此值即不布行。0=按 0.2×离面距离 自动"/>
+                                   ToolTip="硬约束：轨迹任意一点（含换行转角）距工件都至少保持这么远。生成时先收缩布行范围与行端点来满足它，不会靠抬枪绕行绕过去；实在不可达的区域（枪体进不去的窄缝/深腔）宁可不布行也不贴件。喷头外径/2 + 安全余量。0=按 0.2×离面距离 自动"/>
                         <TextBox x:Name="TxtGunClear" Text="20" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
