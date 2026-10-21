@@ -539,20 +539,26 @@ namespace SprayTrajViewer
             public string Inner { get; set; } = "";
             public string Src { get; set; } = "";
             public string Free { get; set; } = "";
+            public string Layer { get; set; } = "";
             public string Note { get; set; } = "";
         }
 
         void FillFaceTable()
         {
             var rows = new List<FaceRow>();
-            int skipped = 0, nInner = 0, nOuter = 0;
+            int skipped = 0, nInner = 0, nOuter = 0, nSingle = 0;
             for (int i = 0; i < _planes.Count; i++)
             {
                 var p = _planes[i];
                 // 口径与 C++ 一致：与 +Z 夹角 ≤ NormalWinDeg 的面全部列出（内壁、外壁一起），
                 // 完全朝下的面（开口盒底板外侧，180°）不列入。
                 if (p.angZ > NormalWinDeg) { skipped++; continue; }
-                if (p.isInner > 0) nInner++; else if (p.isInner == 0) nOuter++;
+                // 单层壳（数据里这一面只有一层点、没有壁厚）：谈不上"有外壁"，
+                // 单独计数，否则"内壁 4 / 外壁 0"会被误读成算法漏了 4 个外壁。
+                bool single = p.layerCnt == 1;
+                if (single) nSingle++;
+                else if (p.isInner > 0) nInner++;
+                else if (p.isInner == 0) nOuter++;
                 bool hasDiag = !(p.n0x == 0 && p.n0y == 0 && p.n0z == 0);
                 double flip = p.nx * p.n0x + p.ny * p.n0y + p.nz * p.n0z;
                 string kind = p.side > 0 ? "正向" : (p.side < 0 ? "反向" : "竖直");
@@ -563,6 +569,7 @@ namespace SprayTrajViewer
 
                 string note;
                 if (!hasDiag) note = "无诊断数据（旧 DLL）";
+                else if (single) note = "单层壳：这一面在点云里只有一层点，没有壁厚";
                 else if (p.sideSrc == 4) note = p.isInner > 0
                     ? "薄壁拆层：内壁（法向朝腔体）"
                     : "薄壁拆层：外壁（法向朝外）";
@@ -577,15 +584,32 @@ namespace SprayTrajViewer
                     AngZ = $"{p.angZ:F1}",
                     Tilt = $"{p.tiltDeg:F1}",
                     Kind = kind,
-                    Inner = p.isInner > 0 ? "是" : (p.isInner < 0 ? "未分" : "否"),
+                    Inner = single ? "单层" : (p.isInner > 0 ? "是" : (p.isInner < 0 ? "未分" : "否")),
                     Src = src,
                     Free = $"{fp} / {fm}",
+                    // 层/跨度：单层 = 点云在这面只有一层点（跨度≈噪声/面起伏，没有壁厚）；
+                    // 2层 = 沿法向有两片点，跨度就是壁厚。未判 = 曲面块或旧 DLL。
+                    Layer = p.layerCnt == 2 ? $"2层 {p.layerThick:F1}"
+                          : (p.layerCnt == 1 ? $"单层 {p.layerThick:F1}" : "未判"),
                     Note = note
                 });
             }
             GridFaces.ItemsSource = rows;
-            string stat = $"面级法向清单：窗口内 {rows.Count} 面（内壁 {nInner} / 外壁 {nOuter}）" +
-                          $"，分割共 {_planes.Count} 面";
+            string stat;
+            if (rows.Count > 0 && nSingle == rows.Count)
+            {
+                // 全部是单层壳：这份点云每个面只有一层点，没有壁厚，也就没有"外壁"这种面。
+                // 直接说清楚，比"内壁 5 / 外壁 0"更容易看懂。
+                stat = $"面级法向清单：窗口内 {rows.Count} 面 —— 全部是单层壳" +
+                       $"（每个面只有一层点、没有壁厚，点云里不含第二层）；" +
+                       $"分割共 {_planes.Count} 面";
+            }
+            else
+            {
+                stat = $"面级法向清单：窗口内 {rows.Count} 面（内壁 {nInner} / 外壁 {nOuter}）" +
+                       $"，分割共 {_planes.Count} 面";
+                if (nSingle > 0) stat += $"；其中 {nSingle} 面为单层壳（无第二层点，内/外壁无依据）";
+            }
             if (skipped > 0) stat += $"，滤除 {skipped} 面（与 +Z 夹角 >{NormalWinDeg:F0}°，朝下）";
             if (TxtFaceStat != null) TxtFaceStat.Text = stat;
             App.Log("FACES", null, stat);

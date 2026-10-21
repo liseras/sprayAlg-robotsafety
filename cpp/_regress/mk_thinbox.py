@@ -32,11 +32,14 @@ P += grid(T, W - T, T, H, lambda x, z: (x, T, z))        # 内壁 y=T
 P += grid(T, W - T, T, H, lambda x, z: (x, D - T, z))    # 内壁 y=D-T
 P += grid(T, D - T, T, H, lambda y, z: (T, y, z))        # 内壁 x=T
 P += grid(T, D - T, T, H, lambda y, z: (W - T, y, z))    # 内壁 x=W-T
-# 顶沿（4mm 宽的环，z=H）
-P += grid(0, W, 0, T, lambda x, y: (x, y, H))
-P += grid(0, W, D - T, D, lambda x, y: (x, y, H))
-P += grid(0, T, T, D - T, lambda x, y: (x, y, H))
-P += grid(W - T, W, T, D - T, lambda x, y: (x, y, H))
+# 顶沿（4mm 宽的环，z=H）。--no-rim 可去掉：现场扫描的开口盒多半有沿口，
+# 沿口把内外壁连成一张连续面，"沿法向找间隙"的拆层判据就失效了（间隙被沿口填满）。
+# 需要验证"干净双层"时用 --no-rim。
+if "--no-rim" not in sys.argv:
+    P += grid(0, W, 0, T, lambda x, y: (x, y, H))
+    P += grid(0, W, D - T, D, lambda x, y: (x, y, H))
+    P += grid(0, T, T, D - T, lambda x, y: (x, y, H))
+    P += grid(W - T, W, T, D - T, lambda x, y: (x, y, H))
 
 out = sys.argv[1] if len(sys.argv) > 1 else "thinbox.ply"
 # --inner-gap <mm>：把内壁顶部这一截（模拟扫描遮挡/边缘点被判给顶沿）从云里去掉，

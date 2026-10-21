@@ -453,6 +453,9 @@ struct PlaneSeg {
     // 生成走曲面行追踪（gen_surface_rows），不是平面 2D 布行。
     bool curved = false;
     FaceOrient fo;        // 面级朝向诊断；angZ 参与轨迹生成（朝下超窗口不喷），其余只上报
+    // 单层壳 / 薄壁双层：1=单层 2=双层 0=未判定；layerThick 是沿法向的分位跨度
+    int    layerCnt = 0;
+    double layerThick = 0.0;
 };
 
 // ---------------- 规则化轮廓重建（2D） ----------------
@@ -3655,12 +3658,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 if(g > maxGap){ maxGap = g; gapAt = (int)t; }
             }
             // 单层平面的 h 散布只有噪声量级（~0.5mm），1.5mm 门限不会误切
-            if(gapAt < 0 || maxGap < 1.5){ outerSegs.push_back(std::move(s)); continue; }
+            s.layerThick = hh[(size_t)((hh.size()-1)*0.98)] - hh[(size_t)((hh.size()-1)*0.02)];
+            if(gapAt < 0 || maxGap < 1.5){ s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue; }
             const double hMid = 0.5*(hh[gapAt-1]+hh[gapAt]);
             std::vector<int> lo, hi;
             lo.reserve(s.inl.size()); hi.reserve(s.inl.size());
             for(int k : s.inl) (dot(Pf[k]-c0, n) < hMid ? lo : hi).push_back(k);
-            if(lo.size() < 30 || hi.size() < 30){ outerSegs.push_back(std::move(s)); continue; }
+            if(lo.size() < 30 || hi.size() < 30){ s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue; }
 
             auto cen=[&](const std::vector<int>& v){
                 Vec3 t{0,0,0};
@@ -3685,6 +3689,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             so.fo.side = (so.fo.angZ < 87.0) ? 1 : (so.fo.angZ > 93.0 ? -1 : 0);
             so.fo.isInner = 0;
             so.fo.src = 4;                                   // 4 = 薄壁拆层
+            so.layerCnt = 2;                                 // 来源块是双层（数据里内外壁都有）
+            so.layerThick = s.layerThick;
 
             PlaneSeg sn;
             sn.curved = false;
@@ -3699,6 +3705,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             sn.fo.side = (sn.fo.angZ < 87.0) ? 1 : (sn.fo.angZ > 93.0 ? -1 : 0);
             sn.fo.isInner = 1;
             sn.fo.src = 4;
+            sn.layerCnt = 2;
+            sn.layerThick = s.layerThick;
             std::swap(sn.fo.freePlus, sn.fo.freeMinus);       // 自由距离随法向一起翻
 
             if(std::getenv("SPRAYTRAJ_FACE_DBG"))
@@ -3747,6 +3755,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             res.planes[wi].side      = fo.side;
             res.planes[wi].isInner   = fo.isInner;
             res.planes[wi].sideSrc   = fo.src;
+            res.planes[wi].layerCnt  = segs[i].layerCnt;
+            res.planes[wi].layerThick= segs[i].layerThick;
         }
 
         // 局部基 u = cross(z, n)

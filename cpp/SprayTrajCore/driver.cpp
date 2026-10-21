@@ -1,4 +1,4 @@
-// driver.cpp —— 命令行测试：读 PLY -> 生成轨迹 -> 写 CSV + PLY
+﻿// driver.cpp —— 命令行测试：读 PLY -> 生成轨迹 -> 写 CSV + PLY
 #include "spray_traj.h"
 #include <cstdio>
 #include <cstdlib>
@@ -116,8 +116,8 @@ int main(int argc, char** argv){
     //       完全朝下的面（如开口盒底板外侧）不列入。
     printf("\n---- 面级法向（+Z = 0°，列出与 +Z 夹角 ≤ %.0f° 的全部面：内壁+外壁）----\n",
            SPRAYTRAJ_NORMAL_WIN_DEG);
-    printf("面  点数   喷距法向              真实法向              与+Z   tilt  分类 内壁 依据  自由+/-(mm)  质心\n");
-    int nWin = 0, nSkip = 0;
+    printf("面  点数   喷距法向              真实法向              与+Z   tilt  分类 内壁 依据  自由+/-(mm)  层/壁厚  质心\n");
+    int nWin = 0, nSkip = 0, nSingle = 0;
     for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
         const SprayTrajPlane& q = r.planes[i];
         if(q.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){ ++nSkip; continue; }   // 朝下的面不进清单
@@ -127,26 +127,37 @@ int main(int argc, char** argv){
                         : (q.sideSrc==4 ? "薄壁" : "兜底"));
         const char* inn = q.isInner>0 ? "内 " : (q.isInner<0 ? "未分" : "外 ");
         double flip = q.nx*q.n0x + q.ny*q.n0y + q.nz*q.n0z;
-        printf("%2d %6d  (% .3f,% .3f,% .3f) (% .3f,% .3f,% .3f) %5.1f %6.1f  %s  %s  %s %5.1f/%-5.1f (%.1f,%.1f,%.1f)%s\n",
+        // 层/壁厚：单层壳 = 这一面在点云里只有一层点、没有壁厚。这种面谈不上
+        // "有外壁"，清单里统计成"内壁 N / 外壁 0"会让人以为漏了 N 个外壁。
+        if(q.layerCnt == 1) ++nSingle;
+        char ly[32];
+        if(q.layerCnt == 2)      snprintf(ly,sizeof(ly),"2层%.1f",q.layerThick);
+        else if(q.layerCnt == 1) snprintf(ly,sizeof(ly),"单层%.1f",q.layerThick);
+        else                     snprintf(ly,sizeof(ly),"未判");
+        printf("%2d %6d  (% .3f,% .3f,% .3f) (% .3f,% .3f,% .3f) %5.1f %6.1f  %s  %s  %s %5.1f/%-5.1f %-8s (%.1f,%.1f,%.1f)%s\n",
             i, q.count, q.nx,q.ny,q.nz, q.n0x,q.n0y,q.n0z, q.angZ, q.tiltDeg,
-            cls, inn, src, q.freePlus, q.freeMinus,
+            cls, inn, src, q.freePlus, q.freeMinus, ly,
             q.cx,q.cy,q.cz, flip<0 ? "  <== 内外反" : "");
     }
     printf("窗口内 %d 面 / 分割共 %d 面", nWin, r.plane_count);
     if(nSkip) printf("，滤除 %d 面（与 +Z 夹角 > %.0f°，朝下）", nSkip, SPRAYTRAJ_NORMAL_WIN_DEG);
     printf("\n");
+    if(nWin > 0 && nSingle == nWin)
+        printf("  ※ 清单内全部为单层壳：点云在每个面只有一层点、没有壁厚，"
+               "数据里不含第二层，内/外壁无从区分\n");
 
     // 面级清单落盘（Excel 可直接看）
     {
         char buf[512]; snprintf(buf,sizeof(buf),"%s.faces.csv",outcsv);
         FILE* ff=fopen(buf,"w");
         if(ff){
-            fprintf(ff,"face,count,nx,ny,nz,n0x,n0y,n0z,angZ,tiltDeg,side,isInner(1内/0外/-1未分),sideSrc(1射线/2兜底/3强制/4薄壁),freePlus,freeMinus,cx,cy,cz,inWin(1=夹角<=%.0f)\n", SPRAYTRAJ_NORMAL_WIN_DEG);
+            fprintf(ff,"face,count,nx,ny,nz,n0x,n0y,n0z,angZ,tiltDeg,side,isInner(1内/0外/-1未分),sideSrc(1射线/2兜底/3强制/4薄壁),freePlus,freeMinus,cx,cy,cz,layerCnt(1单层/2双层/0未判定),layerThick,inWin(1=夹角<=%.0f)\n", SPRAYTRAJ_NORMAL_WIN_DEG);
             for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
                 const SprayTrajPlane& q=r.planes[i];
-                fprintf(ff,"%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%d\n",
+                fprintf(ff,"%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%.2f,%d\n",
                     i,q.count,q.nx,q.ny,q.nz,q.n0x,q.n0y,q.n0z,q.angZ,q.tiltDeg,
                     q.side,q.isInner,q.sideSrc,q.freePlus,q.freeMinus,q.cx,q.cy,q.cz,
+                    q.layerCnt,q.layerThick,
                     q.angZ <= SPRAYTRAJ_NORMAL_WIN_DEG ? 1 : 0);
             }
             fclose(ff);

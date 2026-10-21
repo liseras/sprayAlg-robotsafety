@@ -51,6 +51,9 @@ namespace SprayTrajViewer
         public double vx, vy, vz;
         public double minU, maxU;
         public double minV, maxV;
+        // 单层壳 / 薄壁双层：1=单层(只有一层点) 2=双层(内外壁都在数据里) 0=未判定
+        public int layerCnt;
+        public double layerThick;      // 沿法向 2%~98% 分位跨度 mm
         // 规则化重建面片：轮廓矢量化 + 矩形吸附 + 三角化后的网格
         public int polyVertCount;                       // 顶点数
         public int polyTriCount;                        // 三角形数

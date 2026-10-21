@@ -172,6 +172,7 @@
                         <DataGridTextColumn Header="内壁" Binding="{Binding Inner}" Width="48"/>
                         <DataGridTextColumn Header="依据" Binding="{Binding Src}" Width="52"/>
                         <DataGridTextColumn Header="自由 +/- (mm)" Binding="{Binding Free}" Width="118"/>
+                        <DataGridTextColumn Header="层/跨度" Binding="{Binding Layer}" Width="86"/>
                         <DataGridTextColumn Header="提示" Binding="{Binding Note}" Width="*"/>
                     </DataGrid.Columns>
                 </DataGrid>
