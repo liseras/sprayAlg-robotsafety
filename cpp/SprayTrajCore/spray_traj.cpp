@@ -4300,6 +4300,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     Vec3 prevNormal{0,0,1};
     int transCount = 0;
     int nApproachFix = 0;   // 面间过渡：垂直直降会穿件、改沿法向进入的次数
+    int nDropFace = 0;      // 面间过渡：没有任何可行进入路径（窄缝/深腔）、整面不喷的面数
 
     // ---- 空移段"直线可达"判定 ----
     // 原来面间过渡一律"沿法向退出 → 抬到全局安全高度 zSafe → 平移 → 下降"，
@@ -4455,7 +4456,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     auto segClearOK = [&](const Vec3& a, const Vec3& b)->bool{
         const double d = len(b-a);
         if(d < 1e-6) return true;
-        const int nsep = std::max(2, (int)std::ceil(d/std::max(1.0, pstep*2.0)));
+        const int nsep = std::max(2, (int)std::ceil(d/std::max(1.0, pstep)));   // 步距 = 点距（原 2×点距，细长凸台会被跨过）
         for(int i=0;i<=nsep;++i){
             Vec3 q = a + (b-a)*((double)i/(double)nsep);
             KnnBuf kb; partTree.knn(q, 1, kb);
@@ -4707,6 +4708,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 haveRectAng = true;
             }
         }
+        if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+            fprintf(stderr, "[rect] 面%zu P2=%zu haveRect=%d thLong=%.1f forced=%.1f  c=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f)\n",
+                    si, P2.size(), (int)haveRectAng, thLong*180.0/3.141592653589793,
+                    forcedTheta*180.0/3.141592653589793,
+                    pl.c.x, pl.c.y, pl.c.z, pl.n.x, pl.n.y, pl.n.z);
         auto normAng=[&](double a){ while(a<0) a+=3.141592653589793; while(a>=3.141592653589793) a-=3.141592653589793; return a; };
         // 兜底校验：行方向必须落在"面内更长的那一维"上。
         // minAreaRect 的边序对窄带点集不可靠（现场长板端部 1012×30 的棱条上，
@@ -4732,9 +4738,31 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         else if(haveRectAng){
             // mode1/0 = 沿长边；mode2 = 沿短边（长边方向转 90°）
             theta = normAng((params->scanDirMode == 2) ? thLong + 1.5707963267948966 : thLong);
+            // ---- 竖直面：行方向一律取"水平"----
+            // 病灶：方形侧壁（300×300）的最小外接矩形两条边等长，minAreaRect 的边序
+            // 由凸包起点决定 —— 同一工件上 x=0/x=400 两个侧壁排到了**竖直**行（沿 z），
+            // y=0/y=300 两个侧壁排到了**水平**行（沿 x）。3D 视图里就是一横一竖
+            // 交叉的乱麻，用户反馈"就不能是规则的轨迹嘛"。
+            // 工艺上侧壁本来就是水平往复：喷枪沿水平走，靠升降换行，重力方向的重叠
+            // 更均匀。所以只要面法向接近水平（竖直面），行方向就锁到面内水平方向
+            // （= Z × n），与面的长短边无关；scanDirMode=2 时再转 90°（竖直往复）。
+            bool forcedHoriz = false;
+            if(std::fabs(pl.n.z) < 0.7){
+                Vec3 hz = cross(Vec3{0.0,0.0,1.0}, pl.n);
+                const double hl = len(hz);
+                if(hl > 1e-9){
+                    hz = hz * (1.0/hl);
+                    double thH = std::atan2(dot(hz,v), dot(hz,u));
+                    theta = normAng((params->scanDirMode == 2)
+                                    ? thH + 1.5707963267948966 : thH);
+                    forcedHoriz = true;
+                }
+            }
             double e1=0,e2=0; extentAlong(theta,e1,e2);
             bool wantShort = (params->scanDirMode == 2);
-            if((!wantShort && e1 < e2) || (wantShort && e1 > e2)){
+            // 水平锁定后不再按"哪一维更长"翻转：窄高侧壁（100 宽 × 500 高）的下场
+            // 就是被翻成竖直往复，又回到一横一竖的乱麻里。
+            if(!forcedHoriz && ((!wantShort && e1 < e2) || (wantShort && e1 > e2))){
                 theta = normAng(theta + 1.5707963267948966);
                 std::swap(e1,e2);
             }
@@ -4845,8 +4873,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 外扩点抬 standoff 后若距件 < gunClear（再往外枪头就顶进相邻壁了）就地停住。
         // 于是"往空处外扩"照扩（开口盒内壁顶部朝空，扩满），"往实体里外扩"自动拦住
         // （内壁底部朝内底，扩一两毫米就停），不需要事先知道面的真实边界在哪。
-        // 配置：params->edgeExtend，<0 = 自动 = 1×行距，0 = 不外扩。
-        const double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : params->scanRowSpacing;
+        // 配置：params->edgeExtend，<0 = 自动 = 0.25×行距（行距 80 时 20mm），0 = 不外扩。
+        // 自动值原来取 1×行距（80mm）：行端点整整多喷一个行距到空处，既浪费涂料，
+        // 3D 视图里又是一圈"出框"的线，看着不像长在工件上的轨迹。半条喷幅以内
+        // 就足够把边沿那一条带盖住（喷幅本身有 20~30% 搭接）。
+        const double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : 0.25*params->scanRowSpacing;
         const bool extDbg = std::getenv("SPRAYTRAJ_CONN_DBG") != nullptr;
         if(!ringMode && extRow > 1e-9 && !bestRows.empty()){
             int nExt=0, nBlk=0; double extSum=0.0, extMax=0.0;
@@ -5156,6 +5187,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
         // 面间过渡：从上一面终点出发，抬枪绕行到本面首点。
         // 全部为 spray=0 空移点，WPF 与上位机据此断开喷涂段。
+        const size_t nPtsBefore = allPts.size();   // 无可行进入路径时用来越界回滚整面
+        bool approachHopeless = false;
         if(!allPts.empty() && !traj2.empty()){
             Vec3 pEnd{ allPts.back().x, allPts.back().y, allPts.back().z };
             Vec2 q0 = rotInv(traj2[0].p);
@@ -5173,6 +5206,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             //    segClearOK 只看最近点会一路放行（complex 实测一段 204mm 直线穿过
             //    凸台，最差 0.38mm）。
             if(segClearOK(pEnd, pStart) && !segCrossFace(pEnd, pStart)){
+                if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
+                    fprintf(stderr, "[trans] 面%zu 直连 pEnd=(%.1f,%.1f,%.1f) pStart=(%.1f,%.1f,%.1f)\n",
+                            si, pEnd.x,pEnd.y,pEnd.z, pStart.x,pStart.y,pStart.z);
                 pushMove(pEnd + (pStart - pEnd)*0.5);
             } else {
                 // ② 沿上一面法向退出（离开该面，不擦面）
@@ -5184,23 +5220,73 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 //    垂直降落会穿件的情形：首点正上方有凸台、或首点在腔内/凸台下
                 //    （complex 实测 204mm 直降穿过工件，最差 0.38mm，且这一段
                 //    spray=0→1，正是"落枪第一下就撞"）。改沿本面法向 n（指向可喷侧）
-                //    偏移后降落，再沿法向进到首点——进入段全程沿法向远离工件。
+                //    偏移后降落，再沿法向进到首点。
+                //    注意**两条腿都要查**：垂直腿 SideTop→Side 和进入腿 Side→pStart。
+                //    原来只查了垂直腿，complex 上进入腿沿法向走 100mm，中途擦过
+                //    一个凸台（实测最差 0.35mm，12 个点 <20mm），因为没人查。
                 const Vec3 Top{pStart.x, pStart.y, zSafe};
-                if(!segCrossFace(Top, pStart) && segClearOK(Top, pStart)){
+                auto legOK=[&](const Vec3& w0, const Vec3& w1){
+                    return !segCrossFace(w0, w1) && segClearOK(w0, w1);
+                };
+                if(legOK(Top, pStart)){
                     pushMove(Top);
                 } else {
-                    const Vec3 Side = pStart + pl.n*std::max(clear, gunClearEff);
-                    const Vec3 SideTop{Side.x, Side.y, zSafe};
-                    if(!segCrossFace(SideTop, Side) && segClearOK(SideTop, Side)){
-                        pushMove(SideTop);
-                        pushMove(Side);
-                    } else {
-                        pushMove(Top);          // 兜底：无解时保持原样（有日志可查）
+                    // 候选落点：沿法向由近到远 3 档 + 面内 8 个横向方位，逐条两腿验。
+                    // 都不干净时取"最小净空最大"的那个 —— 宁可绕远，也不留一段 0.2mm
+                    // 的擦壁直降（那是"落枪第一下就撞"）。
+                    const double base = std::max(clear, gunClearEff);
+                    auto segMinClear=[&](const Vec3& w0, const Vec3& w1)->double{
+                        const double d = len(w1-w0);
+                        const int ns = std::max(2, (int)std::ceil(d/std::max(1.0, pstep)));
+                        double mn = 1e30;
+                        for(int k=0;k<=ns;++k){
+                            Vec3 q = w0 + (w1-w0)*((double)k/(double)ns);
+                            KnnBuf kb; partTree.knn(q, 1, kb);
+                            if(kb.n < 1) return 0.0;
+                            mn = std::min(mn, std::sqrt(kb.d2[0]));
+                            if(segCrossFace(w0, q)) return 0.0;
+                        }
+                        return mn;
+                    };
+                    Vec3 bestW = Top; double bestScore = -1.0;
+                    auto consider=[&](const Vec3& W){
+                        const Vec3 Wtop{W.x, W.y, zSafe};
+                        double s = std::min(segMinClear(Wtop, W), segMinClear(W, pStart));
+                        if(s > bestScore){ bestScore = s; bestW = W; }
+                    };
+                    consider(Top);
+                    for(double f : {0.25, 0.5, 1.0}) consider(pStart + pl.n*(base*f));
+                    Vec3 inPlane = cross(Vec3{0,0,1}, pl.n);
+                    if(len(inPlane) < 1e-6) inPlane = Vec3{1,0,0};
+                    inPlane = norm(inPlane);
+                    const Vec3 inPlane2 = cross(pl.n, inPlane);
+                    for(int a=0;a<8;++a){
+                        const double th = a*3.141592653589793/4.0;
+                        consider(pStart + (inPlane*std::cos(th) + inPlane2*std::sin(th))*base);
                     }
+                    const Vec3 Wtop{bestW.x, bestW.y, zSafe};
+                    pushMove(Wtop);
+                    if(len(bestW - pStart) > 1e-6) pushMove(bestW);
+                    if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
+                        fprintf(stderr, "[trans] 面%zu 降落改道 W=(%.1f,%.1f,%.1f) 最小净空 %.1f\n",
+                                si, bestW.x, bestW.y, bestW.z, bestScore);
                     ++nApproachFix;
+                    // 连"最好的"落法都撑不到安全半径 → 这个面根本进不去（窄缝/深腔）。
+                    // 与其生成一段 1.3mm 的擦壁进入（落枪就撞），不如整面不喷，
+                    // 与"gunClear 是生成期硬约束"一致；日志里明说，便于工艺端补喷。
+                    if(bestScore < 0.9*gunClearEff){
+                        approachHopeless = true;
+                        fprintf(stderr, "[skip] 面%zu 无可行进入路径（最佳 %.1fmm < 枪体安全 %.0fmm），整面不喷\n",
+                                si, bestScore, gunClearEff);
+                    }
                 }
             }
             ++transCount;
+        }
+        if(approachHopeless){
+            allPts.resize(nPtsBefore);      // 回滚该面已写入的过渡点
+            ++nDropFace;
+            continue;
         }
         prevNormal = pl.n;
 
@@ -5216,7 +5302,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 transCount, zSafe, zPartMax);
     if(nApproachFix)
         fprintf(stderr, "，其中 %d 处直降会穿件→改沿面法向进入", nApproachFix);
-    if(transCount) fprintf(stderr, "\n");
+    if(nDropFace)
+        fprintf(stderr, "，%d 面因无可行进入路径整面不喷", nDropFace);
+    if(transCount || nDropFace) fprintf(stderr, "\n");
 
     // ================= 转角平滑 + 零长段清理（第十八轮） =================
     // 病灶（实测 bin.ply）：喷涂段内 >60° 的转角 56 处、>120° 的 23 处、最大 165°。

@@ -40,3 +40,7 @@ cpp/_regress/regress_old/
 
 # 回归临时中间产物（调试用，_ 前缀）
 cpp/_regress/_*
+
+# 现场点云转出来的 ascii 副本（用 ply2ascii.py 随时重生成，不入库）
+cpp/_regress/ubox.ply
+cpp/_regress/ubox4.ply
