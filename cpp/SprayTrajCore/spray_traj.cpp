@@ -276,8 +276,23 @@ std::vector<Vec3> sor_filter(const std::vector<Vec3>& P, int k, double z){
     double mu=sum/P.size();
     double var=0; for(double v:md) var+=(v-mu)*(v-mu); var/=P.size();
     double sd=std::sqrt(var);
+    // 阈值下限：中位数 × 1.6。纯"mean+z·σ"在干净点云上会失灵——σ 极小时阈值
+    // 贴着均值，把**棱边/顶沿的边界点整圈删掉**（实测开口盒 343 个被删点 100%
+    // 落在 z>290 的壁顶一圈：边界点邻域只有半边有支撑，meanKNN 比内部高 28%，
+    // 而 σ=0.32 时 2.5σ 只放行 +0.8mm）。顶沿一丢，枪位净空检查对壁顶"失明"，
+    // 顶行外扩直接冲出板边、蛇形连接段横穿相邻壁（实测枪位距壁 0.8mm）。
+    // 真正的离群噪声 meanKNN 通常是中位数的 2~10 倍，1.6 倍的下限不会放走它们；
+    // 点云真有噪声时 σ 大，mean+z·σ 本来就高于下限，行为不变。
+    std::vector<double> mds(md);
+    double med = 0.0;
+    if(!mds.empty()){
+        size_t km = mds.size()/2;
+        std::nth_element(mds.begin(), mds.begin()+km, mds.end());
+        med = mds[km];
+    }
+    const double thr = std::max(mu + z*sd, med*1.6);
     std::vector<Vec3> out;
-    for(size_t i=0;i<P.size();++i) if(md[i] < mu + z*sd) out.push_back(P[i]);
+    for(size_t i=0;i<P.size();++i) if(md[i] < thr) out.push_back(P[i]);
     return out;
 }
 
@@ -4648,6 +4663,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // （内壁底部朝内底，扩一两毫米就停），不需要事先知道面的真实边界在哪。
         // 配置：params->edgeExtend，<0 = 自动 = 1×行距，0 = 不外扩。
         const double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : params->scanRowSpacing;
+        const bool extDbg = std::getenv("SPRAYTRAJ_CONN_DBG") != nullptr;
         if(!ringMode && extRow > 1e-9 && !bestRows.empty()){
             int nExt=0, nBlk=0; double extSum=0.0, extMax=0.0;
             for(auto& r : bestRows){
@@ -4658,7 +4674,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         Vec2 q2{ (sgn>0 ? r.xe : r.xs) + sgn*d, r.yc };
                         Vec2 w = rotInv(q2);
                         Vec3 X = pl.c + u*w.x + v*w.y;
-                        if(gunClearAt(X, pl.n) < gunClearEff){ ++nBlk; break; }
+                        const double clr = gunClearAt(X, pl.n);
+                        if(extDbg && (d<=3 || clr < gunClearEff+5))
+                            fprintf(stderr, "[ext] 面%zu row yc=%.1f side=%d d=%.0f X=(%.1f,%.1f,%.1f) clr=%.1f\n",
+                                    si, r.yc, side, d, X.x, X.y, X.z, clr);
+                        if(clr < gunClearEff){ ++nBlk; break; }
                         add = d;
                     }
                     if(add > 0.0){
@@ -4673,12 +4693,17 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         si, nExt, nExt? extSum/nExt : 0.0, extMax, nBlk, extRow);
         }
 
-        // 生成该平面的 2D 轨迹（每个点带 spray 标记：1=喷涂，0=空移）
-        std::vector<std::pair<Vec2,int>> traj2;
+        // 生成该平面的 2D 轨迹。元素 = (旋转系 2D 坐标, spray, 额外抬升 lift)：
+        // 3D 枪位 = 面点 X(p2) + pl.n·(standoff + lift)。lift=0 即普通贴面轨迹点；
+        // lift>0 用于"抬枪绕行"的过渡点（净空不足的连接段降级，见下方 connSafe）。
+        // 任意 3D 点都能表达：h = dot(P-pl.c, pl.n)，p2 = rot(投影到面内 2D)，
+        // lift = h - standoff —— (2D, lift) → 3D 是仿射映射，直线段仍是直线段。
+        struct T2 { Vec2 p; int spray; double lift; };
+        std::vector<T2> traj2;
         auto sampleLine=[&](Vec2 a, Vec2 b, int spray){
             double LL=len2(b-a);
             int np=std::max(2,(int)std::ceil(LL/pstep)+1);
-            for(int t=0;t<np;++t){ double f=(double)t/(np-1); traj2.push_back({a+(b-a)*f, spray}); }
+            for(int t=0;t<np;++t){ double f=(double)t/(np-1); traj2.push_back({a+(b-a)*f, spray, 0.0}); }
         };
         auto sampleArc=[&](Vec2 a, Vec2 b, Vec2 apex){
             const int M=60; std::vector<Vec2> crv(M+1);
@@ -4690,7 +4715,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             for(int i=0;i<=np;++i){
                 double target=(double)i/np*arc;
                 int lo=0,hi=M; while(lo<hi){int mid=(lo+hi)/2; if(s[mid]>=target)hi=mid;else lo=mid+1;}
-                traj2.push_back({crv[lo], 1});
+                traj2.push_back({crv[lo], 1, 0.0});
             }
         };
 
@@ -4715,16 +4740,16 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         double g = len2(first - prevEnd);
                         int nI = std::max(1, (int)std::ceil(g/pstep));
                         for(int t=1;t<nI;++t)
-                            traj2.push_back({prevEnd + (first-prevEnd)*((double)t/(double)nI), 1});
+                            traj2.push_back({prevEnd + (first-prevEnd)*((double)t/(double)nI), 1, 0.0});
                     }
                 }
                 for(int t=0;t<=np;++t){
                     int ti = rev ? (np - t) : t;
                     double aa = 2.0*3.14159265358979*(double)ti/(double)np;
                     Vec2 q{ ringC.x + rad*std::cos(aa), ringC.y + rad*std::sin(aa) };
-                    traj2.push_back({toRow(q), 1});
+                    traj2.push_back({toRow(q), 1, 0.0});
                 }
-                prevEnd = traj2.back().first; hasPrev = true;
+                prevEnd = traj2.back().p; hasPrev = true;
             }
         }
         if(!ringMode)
@@ -4733,6 +4758,68 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             if(i%2==1) std::swap(a,b);
             segs2.push_back({a,b});
         }
+        const bool connDbg = std::getenv("SPRAYTRAJ_CONN_DBG") != nullptr;
+        if(connDbg){
+            fprintf(stderr, "[conn] 面%zu 行数=%zu turnR=%.1f L=%.1f\n", si, bestRows.size(), turnR, L);
+            for(size_t i=0;i<bestRows.size();++i)
+                fprintf(stderr, "[conn]   row%zu xs=%.1f xe=%.1f yc=%.1f seg=%d\n",
+                        i, bestRows[i].xs, bestRows[i].xe, bestRows[i].yc, bestRows[i].segIdx);
+        }
+        // ---- 连接段净空检查与降级（第三十二轮）----
+        // 病灶（实测开口盒，行距 80 / 折返系数 0.5）：末行被跨行外扩顶到板边外
+        // 16mm、再被行端点外扩推出板边最远 80mm，蛇形连接段从"板内 20mm 处"连到
+        // "板外 80mm 处"，在相邻壁的半高处直接穿墙——枪位距壁最近 0.8mm。此前
+        // 连接段（直线/圆弧）没有任何净空检查，行端点检查和布行前过滤都管不到它。
+        // 处理：连接段逐点（≤2mm 步距）查枪位到工件点云的净空，不足时按代价从低
+        // 到高降级：弧(原侧) → 弧(另一侧鼓出) → 直连 → 抬到全局安全高度绕行(spray=0)。
+        // 前三档保持喷涂连续；只有确实绕不过去才抬枪断喷。
+        auto clearOK3=[&](const Vec3& g)->bool{
+            KnnBuf kb; partTree.knn(g, 1, kb);
+            double d=1e30;
+            for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d=std::min(d, len(Pf[kb.id[t]]-g));
+            return d >= gunClearEff;
+        };
+        auto gunOf2=[&](const Vec2& p2)->Vec3{
+            Vec2 w = rotInv(p2);
+            Vec3 X = pl.c + u*w.x + v*w.y;
+            return X + pl.n*params->standoff;
+        };
+        auto polyOK=[&](const std::vector<Vec2>& ps)->bool{
+            if(ps.empty()) return true;
+            for(size_t k=0;k<ps.size();++k){
+                if(k>0){
+                    Vec2 dd=ps[k]-ps[k-1]; double dl=len2(dd);
+                    int ns=(int)std::ceil(dl/(pstep*2.0));
+                    for(int t=1;t<ns;++t){
+                        Vec2 m=ps[k-1]+dd*((double)t/(double)ns);
+                        if(!clearOK3(gunOf2(m))) return false;
+                    }
+                }
+                if(!clearOK3(gunOf2(ps[k]))) return false;
+            }
+            return true;
+        };
+        auto arcPoly=[&](Vec2 a, Vec2 b, Vec2 apex)->std::vector<Vec2>{
+            const int M=24; std::vector<Vec2> c(M+1);
+            for(int k=0;k<=M;++k){ double t=(double)k/M; c[k]=a*((1-t)*(1-t))+apex*(2*(1-t)*t)+b*(t*t); }
+            return c;
+        };
+        // 抬到全局安全高度绕行：A → A 正上方 zSafe → B 正上方 → B，全部 spray=0。
+        // zSafe 在工件最高点之上，横向平移段必然安全；两段垂直起降与面间过渡同款。
+        auto hopZ=[&](const Vec2& a2, const Vec2& b2){
+            Vec3 A = gunOf2(a2), B = gunOf2(b2);
+            Vec3 P1{A.x, A.y, zSafe}, P2{B.x, B.y, zSafe};
+            auto emit3=[&](const Vec3& P, int sp){
+                const double h = dot(P - pl.c, pl.n);
+                Vec3 X = P - pl.n*h;
+                Vec3 qq = X - pl.c;
+                Vec2 q2{dot(qq,u), dot(qq,v)};
+                Vec2 p2{ca*q2.x + sa*q2.y, -sa*q2.x + ca*q2.y};
+                traj2.push_back({p2, sp, h - params->standoff});
+            };
+            emit3(P1,0); emit3(P2,0); emit3(B,0);
+        };
+        int nHop=0;
         for(size_t i=0;i<segs2.size();++i){
             sampleLine(segs2[i].a, segs2[i].b, 1);
             if(i+1<segs2.size()){
@@ -4742,21 +4829,39 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 // 中间有孔洞）才关枪。原来只看 turnR*3（与行距无关），L=30 时
                 // 一个 20mm 的普通换行也被关枪，白停一次。
                 const double gapHard = std::max(turnR*3.0, 3.0*L);
+                if(connDbg)
+                    fprintf(stderr, "[conn]   conn%zu gap=%.1f hard=%.1f A=(%.1f,%.1f) B=(%.1f,%.1f)\n",
+                            i, gap, gapHard, segs2[i].b.x, segs2[i].b.y, segs2[i+1].a.x, segs2[i+1].a.y);
                 if(gap > gapHard){
                     // 跨段大跳跃：直线空移过渡，spray=0（不喷涂）。
-                    // WPF 按 spray=0 断开显示。
-                    sampleLine(segs2[i].b, segs2[i+1].a, 0);
+                    // WPF 按 spray=0 断开显示。空移也可能穿墙，同样查净空。
+                    if(polyOK({segs2[i].b, segs2[i+1].a})){
+                        sampleLine(segs2[i].b, segs2[i+1].a, 0);
+                    } else { hopZ(segs2[i].b, segs2[i+1].a); ++nHop; }
                 } else if(gap > turnR*3){
                     // 中等跨接：同一平面内平移，直连并保持喷涂（不做圆弧，免得外扩）
-                    sampleLine(segs2[i].b, segs2[i+1].a, 1);
+                    if(polyOK({segs2[i].b, segs2[i+1].a})){
+                        sampleLine(segs2[i].b, segs2[i+1].a, 1);
+                    } else { hopZ(segs2[i].b, segs2[i+1].a); ++nHop; }
                 } else {
                     Vec2 dir=norm2(segs2[i].b - segs2[i].a);
                     Vec2 cr{-dir.y, dir.x};
                     Vec2 apex=(segs2[i].b + segs2[i+1].a)*0.5 + cr*turnR;
-                    sampleArc(segs2[i].b, segs2[i+1].a, apex);
+                    if(polyOK(arcPoly(segs2[i].b, segs2[i+1].a, apex))){
+                        sampleArc(segs2[i].b, segs2[i+1].a, apex);
+                    } else {
+                        Vec2 apex2=(segs2[i].b + segs2[i+1].a)*0.5 - cr*turnR;
+                        if(polyOK(arcPoly(segs2[i].b, segs2[i+1].a, apex2))){
+                            sampleArc(segs2[i].b, segs2[i+1].a, apex2);
+                        } else if(polyOK({segs2[i].b, segs2[i+1].a})){
+                            sampleLine(segs2[i].b, segs2[i+1].a, 1);
+                        } else { hopZ(segs2[i].b, segs2[i+1].a); ++nHop; }
+                    }
                 }
             }
         }
+        if(nHop)
+            fprintf(stderr, "[traj] 面%zu: %d 处连接段净空不足，抬枪绕行\n", si, nHop);
 
         // 转 3D（用该平面自己的法向抬升，避免撞击凸起/侧壁）
         Vec3 gun = pl.n*(-1.0);
@@ -4765,7 +4870,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 全部为 spray=0 空移点，WPF 与上位机据此断开喷涂段。
         if(!allPts.empty() && !traj2.empty()){
             Vec3 pEnd{ allPts.back().x, allPts.back().y, allPts.back().z };
-            Vec2 q0 = rotInv(traj2[0].first);
+            Vec2 q0 = rotInv(traj2[0].p);
             Vec3 X0 = pl.c + u*q0.x + v*q0.y;
             Vec3 pStart = X0 + pl.n*params->standoff;
 
@@ -4791,11 +4896,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         }
         prevNormal = pl.n;
 
-        for(auto& [p2, sp] : traj2){
-            Vec2 q = rotInv(p2);
+        for(auto& t2 : traj2){
+            Vec2 q = rotInv(t2.p);
             Vec3 X = pl.c + u*q.x + v*q.y;
-            Vec3 pos = X + pl.n*params->standoff;
-            allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, sp});
+            Vec3 pos = X + pl.n*(params->standoff + t2.lift);
+            allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, t2.spray});
         }
     }
     if(transCount)
