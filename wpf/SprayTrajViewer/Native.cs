@@ -21,6 +21,7 @@ namespace SprayTrajViewer
         public double gunClear;         // 枪体安全半径 mm（喷头外径/2 + 安全余量）
         public double edgeExtend;       // 行端点外扩 mm（<0=自动 1×行距，0=不外扩）
         public double edgeExtendAcross; // 跨行方向外扩 mm（<0=自动 0.25×行距，0=首末行压边界）
+        public double shellThick;       // 薄板双面壁厚 mm（0=关闭；>0 时给单层壳补出另一面）
     }
 
     [StructLayout(LayoutKind.Sequential)]

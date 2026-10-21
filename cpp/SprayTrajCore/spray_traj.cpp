@@ -3448,6 +3448,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     p.gunClear       = 20.0;   // 枪帽 Ø32 半径16 + 余量4；大枪/旋杯按实际改
     p.edgeExtend     = -1.0;   // 行端点外扩：-1 = 自动(1×行距)，0 = 不外扩
     p.edgeExtendAcross = -1.0; // 跨行方向外扩：-1 = 自动(0.25×行距)，0 = 首末行压边界
+    p.shellThick     = 0.0;    // 薄壳双面壁厚：0 = 关闭（不推断另一面）
     return p;
 }
 
@@ -3610,6 +3611,28 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 否则拿到的是 PCA 的随机符号，n0 与最终 nx 会对不上。
     // 只填 PlaneSeg::fo，不回写 pl.n —— 轨迹输出与本改动前逐字节一致。
     for(auto& s : segs) s.fo = classify_face_orientation(Pf, cn.tree, s, partC, params->normalFlip);
+
+    // 内壁的喷距法向必须朝腔内。
+    // 上面那轮定向（|nz|>0.05 归 +Z 半球 / 近竖直背离质心）对**单层壳内壁**会把法向
+    // 翻到盒外：点在内腔壁上、质心在腔内，"背离质心"就等于朝外。于是清单里出现
+    // "分类=内壁、内外反"——判成内壁，枪却停在外表面，喷的其实是外面。
+    // 射线结论可靠时（src==1：一侧近挡=材料、另一侧远挡=腔体）以可喷侧 fo.n 为准，
+    // 让枪真的进腔。兜底/强制/薄壁拆层的结果不动（它们的符号另有依据）。
+    {
+        int nFix = 0;
+        for(auto& s : segs){
+            if(s.fo.src != 1 || s.fo.isInner <= 0) continue;
+            if(dot(s.pl.n, s.fo.n) > 0.0) continue;        // 本来就一致
+            s.pl.n = s.fo.n;
+            s.pl.d = -dot(s.pl.n, s.pl.c);
+            if(s.curved && isCurved){
+                surf.n0 = surf.n0*(-1.0);
+                for(auto& v : surf.N) v = v*(-1.0);
+            }
+            ++nFix;
+        }
+        if(nFix) fprintf(stderr, "[fix] 内壁喷距法向翻转朝腔: %d 面\n", nFix);
+    }
 
     // 报告：用面积/点数最大的主平面作为"重建面"统计信息
     // 曲面块：平面残差天然很大（它不是平面），但曲面贴合残差要等行追踪跑完才知道，
@@ -3812,6 +3835,57 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         for(auto& s : innerSegs) segs.push_back(std::move(s));
         if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（含内壁 %d 面，其中双峰判据 %d 块）\n",
                            nSplit, segs.size(), nSplit, nSplitPeak);
+    }
+
+    // ---- 薄壳双面：一层点代表一张板，板有两面 ----
+    // 上面所有内外壁判据都要求"点云里有两片点"（间隙或双峰）。但薄壁件（1~4mm）的
+    // 激光通常只打到可及的那一面，只有一层点 —— 这时"内外"不是两片点，而是**同一张
+    // 板的两个朝向**，这是几何事实，不需要第二片点来证明。
+    // 判据用射线自由距离：两侧都够伸枪 → 两面都是空腔、都能喷，按 shellThick 沿法向
+    // 偏移复制一个反向面；只有一侧够 → 实心件外表面，另一面埋在材料里，不复制。
+    // 默认 shellThick=0 关闭，行为与之前逐点一致。
+    if(params->shellThick > 0.0){
+        const double gcD = (params->gunClear > 0.0) ? params->gunClear
+                                                    : std::max(12.0, 0.2*params->standoff);
+        const double needClear = std::max(25.0, 2.0*gcD);   // 能伸进枪的最小空腔
+        const double D2R = 3.141592653589793/180.0;
+        std::vector<PlaneSeg> back;
+        back.reserve(segs.size());
+        int nDual = 0;
+        for(size_t i=0;i<segs.size();++i){
+            const PlaneSeg& s = segs[i];
+            if(s.curved) continue;                 // 曲面块不推断（法向逐点变，偏移没有定义）
+            if(s.layerCnt == 2) continue;          // 双层已经拆出内外两片，不用再补
+            if(segs.size() + back.size() >= (size_t)SPRAYTRAJ_PLANE_SLOTS) break;
+            // -1 = 量程内无命中，视为无限自由
+            const bool pFree = (s.fo.freePlus  < 0.0) || (s.fo.freePlus  >= needClear);
+            const bool mFree = (s.fo.freeMinus < 0.0) || (s.fo.freeMinus >= needClear);
+            if(!(pFree && mFree)) continue;
+            PlaneSeg b = s;                        // inl 是点索引，与原面共享即可
+            // 背面 = 真实可喷侧（fo.n）的**反方向**。
+            // 不能用 pl.n：pl.n 是"枪从哪边来"，对侧壁它朝盒外、对顶/底面它朝腔内
+            // （|nz|>0.05 强制归 +Z 半球），方向语义不统一，拿它偏移会把底面的背面
+            // 算到腔里去（实测内底 z=0 的背面被算成 z=+4）。
+            const Vec3 nb = s.fo.n * (-1.0);
+            b.pl.n = nb;
+            b.pl.c = s.pl.c + nb*params->shellThick;
+            b.pl.d = -dot(b.pl.n, b.pl.c);
+            b.fo   = s.fo;
+            b.fo.n = b.pl.n;
+            b.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,b.pl.n.z)))/D2R;
+            b.fo.tilt = 90.0 - b.fo.angZ;
+            b.fo.side = (b.fo.angZ < 87.0) ? 1 : (b.fo.angZ > 93.0 ? -1 : 0);
+            b.fo.isInner = (s.fo.isInner > 0) ? 0 : 1;     // 内壁的背面就是外壁
+            b.fo.src = 5;                                   // 5 = 薄壳双面（推断的另一面）
+            std::swap(b.fo.freePlus, b.fo.freeMinus);
+            b.layerCnt = 1;
+            b.layerThick = params->shellThick;
+            back.push_back(std::move(b));
+            ++nDual;
+        }
+        for(auto& b : back) segs.push_back(std::move(b));
+        if(nDual) fprintf(stderr, "[dual] 薄壳双面: %d 面按壁厚 %.1fmm 补出另一侧（总 %zu 段）\n",
+                          nDual, params->shellThick, segs.size());
     }
 
     // 输出所有分割平面（供 WPF 显示重建面）

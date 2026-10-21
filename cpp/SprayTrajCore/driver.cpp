@@ -81,6 +81,8 @@ int main(int argc, char** argv){
     //           -gc <枪体安全半径mm>（= 喷头外径/2 + 安全余量，内壁角落让枪用）
     //           -ee <行端点外扩mm>（行方向；-1=自动 1×行距，0=不外扩）
     //           -ea <跨行外扩mm>（首末行位置；-1=自动 0.25×行距，0=压点云边界）
+    //           -st <薄壳双面壁厚mm>（0=关闭；>0 时对"射线两侧都够伸枪"的单层面
+    //                补一个反向面，代表这张板的另一面）
     for(int i=4;i+1<argc;++i){
         if(!strcmp(argv[i],"-flat"))  p.flatnessTol  = atof(argv[i+1]);
         if(!strcmp(argv[i],"-curve")) p.curvatureTol = atof(argv[i+1]);
@@ -93,10 +95,11 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"-gc"))    p.gunClear       = atof(argv[i+1]);
         if(!strcmp(argv[i],"-ee"))    p.edgeExtend     = atof(argv[i+1]);
         if(!strcmp(argv[i],"-ea"))    p.edgeExtendAcross = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-st"))    p.shellThick     = atof(argv[i+1]);
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f\n",
+    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f\n",
         p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
-        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross);
+        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross, p.shellThick);
     // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
     printf("[abi] sizeof Plane=%zu Point=%zu Result=%zu\n",
         sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
@@ -124,14 +127,18 @@ int main(int argc, char** argv){
         ++nWin;
         const char* cls = q.side>0 ? "正向" : (q.side<0 ? "反向" : "竖直");
         const char* src = q.sideSrc==1 ? "射线" : (q.sideSrc==3 ? "强制"
-                        : (q.sideSrc==4 ? "薄壁" : "兜底"));
+                        : (q.sideSrc==4 ? "薄壁" : (q.sideSrc==5 ? "双面" : "兜底")));
         const char* inn = q.isInner>0 ? "内 " : (q.isInner<0 ? "未分" : "外 ");
         double flip = q.nx*q.n0x + q.ny*q.n0y + q.nz*q.n0z;
         // 层/壁厚：单层壳 = 这一面在点云里只有一层点、没有壁厚。这种面谈不上
         // "有外壁"，清单里统计成"内壁 N / 外壁 0"会让人以为漏了 N 个外壁。
-        if(q.layerCnt == 1) ++nSingle;
+        // sideSrc==5 是薄板双面补出来的面：它也只有一个层点，但就是"另一面"，
+        // 不能算进"单层壳无从区分"。
+        const bool dualF = (q.sideSrc == 5);
+        if(q.layerCnt == 1 && !dualF) ++nSingle;
         char ly[32];
-        if(q.layerCnt == 2)      snprintf(ly,sizeof(ly),"2层%.1f",q.layerThick);
+        if(dualF)                snprintf(ly,sizeof(ly),"双面%.1f",q.layerThick);
+        else if(q.layerCnt == 2) snprintf(ly,sizeof(ly),"2层%.1f",q.layerThick);
         else if(q.layerCnt == 1) snprintf(ly,sizeof(ly),"单层%.1f",q.layerThick);
         else                     snprintf(ly,sizeof(ly),"未判");
         printf("%2d %6d  (% .3f,% .3f,% .3f) (% .3f,% .3f,% .3f) %5.1f %6.1f  %s  %s  %s %5.1f/%-5.1f %-8s (%.1f,%.1f,%.1f)%s\n",

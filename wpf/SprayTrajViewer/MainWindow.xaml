@@ -57,6 +57,11 @@
                         <TextBox x:Name="TxtEdgeExtendAcross" Text="-1" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
+                        <TextBlock Text="薄板双面壁厚 (mm)" Width="150" VerticalAlignment="Center"
+                                   ToolTip="薄壁件扫描通常只有一层点（激光只打到可及的那一面）。填上板厚后，对&quot;射线两侧都够伸枪&quot;的面会沿壁厚补出另一面，内外各生成一套轨迹。0=关闭。实心件（只有一侧能伸枪）不会补，避免对着材料喷"/>
+                        <TextBox x:Name="TxtShellThick" Text="0" Padding="4"/>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
                         <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
                         <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
                     </DockPanel>
