@@ -4176,7 +4176,15 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 跨越生成连续行（重建面已把该洞补齐，行应贴重建面连续无断点）；
         // 间隙 >= fillHole 的真实孔/槽才断开为两段。
         const double gapSeg = std::max(fillHole, L*0.5);   // x 间隙超过此值视为两段；以下则跨越填补
-        const double y0 = mny - acrossExt, y1 = mxy + acrossExt;
+        // 跨行外扩不许越出面的真实边界：面外没有材料可喷，扩出去只是空走+撞壁风险。
+        // 实测开口盒内壁（行距80、-ea 默认16）：首行被推到 z=316（越顶 16mm），行端点
+        // 再沿行外扩 8mm 到距邻壁 12mm，斜向净空 sqrt(12²+16²)=20.0 恰好卡在阈值上；
+        // 连接段从这一点出发判定全部失败 → 该面每个换行都抬枪绕行，轨迹碎成一截截。
+        // 行中心压在真实边沿上即足够（喷幅本身有 20~30% 搭接），越界纯属多余。
+        const double ryLo = *std::min_element(ry.begin(), ry.end());
+        const double ryHi = *std::max_element(ry.begin(), ry.end());
+        const double y0 = std::min(std::max(mny - acrossExt, ryLo), mxy);
+        const double y1 = std::max(std::min(mxy + acrossExt, ryHi), mny);
         int nRow = 1; double stepA = L;
         if(y1 - y0 > 1e-9){
             // 行数按跨度/行距四舍五入（行距允许比设定值大 20% 以内——喷涂本来有
@@ -4352,6 +4360,27 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         }
         return best;
     };
+    // 线段 A→B 是否穿过某个面（交点落在面内包围盒里）。
+    // 这是"穿模"的精确判据。gunClear 只测距离，测不出穿越：内壁蛇形换行时折返弧
+    // 的 cr 恰好平行于行方向，弧鼓 40mm 到面外（枪位越过 x=400 的壁到 420），
+    // 墙前 20mm 与墙后 20mm 在距离上完全一样，旧判据一律放行。
+    // 注意不能用"点在面背侧"来判：枪在腔内时，对**所有外壁面**都在背面（合法）；
+    // 枪在件外时，对所有内壁面都在背面（也合法）。只有"跨越"才是穿模。
+    auto segCrossFace=[&](const Vec3& A, const Vec3& B)->bool{
+        for(const auto& f : blkFaces){
+            const double da = dot(A - f.c, f.n), db = dot(B - f.c, f.n);
+            if(da * db > 0.0) continue;                       // 同侧，不可能穿
+            if(std::fabs(da - db) < 1e-12) continue;          // 与面平行且共面
+            const double t = da / (da - db);
+            if(t < -1e-9 || t > 1.0 + 1e-9) continue;
+            const Vec3 X = A + (B - A)*t;
+            const Vec3 w = X - f.c;
+            const double a = dot(w, f.u), b = dot(w, f.v);
+            if(a >= f.u0 - 1e-6 && a <= f.u1 + 1e-6 &&
+               b >= f.v0 - 1e-6 && b <= f.v1 + 1e-6) return true;
+        }
+        return false;
+    };
     // 点到各面**边界线**的最小净空。
     // 平面判据管"枪压在面上"，管不了"枪贴着棱边擦过去"——开口盒的壁顶就是一条
     // 棱边，去噪往往正好把这条棱边上的点删光（边界点邻域只有半边支撑），于是
@@ -4515,7 +4544,11 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 点云是否采到棱边，对所有面统一执行——单独一块平板没有邻居面，
         // 判据自然放行，不会误删。
         if(!inl.empty()){
-            const double gunClear = gunClearEff;
+            // 留 1mm 余量：布行端点最终就落在过滤阈值上，若阈值正好等于 gunClear，
+            // 行端点距邻壁刚好 20.0mm，点云拟合残差（box 实测 0.3~0.6mm）一叠加就
+            // 变成 19.4 < 20，蛇形换行的连接段从端点出发必然判失败 → 整面退化成
+            // 抬枪绕行。多留 1mm 让连接段有可用余量，覆盖损失 1mm 可忽略。
+            const double gunClear = gunClearEff + 1.0;
             std::vector<int> keep; keep.reserve(inl.size());
             int drop = 0;
             for(int i : inl){
@@ -4847,11 +4880,20 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 处理：连接段逐点（≤2mm 步距）查枪位到工件点云的净空，不足时按代价从低
         // 到高降级：弧(原侧) → 弧(另一侧鼓出) → 直连 → 抬到全局安全高度绕行(spray=0)。
         // 前三档保持喷涂连续；只有确实绕不过去才抬枪断喷。
-        auto clearOK3=[&](const Vec3& g)->bool{
+        auto clearMin3=[&](const Vec3& g)->double{
             KnnBuf kb; partTree.knn(g, 1, kb);
             double d=1e30;
             for(int t=0;t<kb.n;++t) if(kb.id[t]>=0) d=std::min(d, len(Pf[kb.id[t]]-g));
-            return d >= gunClearEff;
+            // 与 gunClearAt 同口径：点云 + 面（投影在面内）+ 面边界线。只用点云时，
+            // 棱边上的点一旦稀疏/被去噪删掉就会把"贴着壁面飞"判成安全。
+            d = std::min(d, planeClearAt(g, (int)si));
+            d = std::min(d, edgeClearAt(g, (int)si));
+            return d;
+        };
+        auto clearOK3=[&](const Vec3& g)->bool{
+            // 0.5mm 容差：枪位恰好落在安全带边界上（例如行端点正好距邻壁 20.0）时，
+            // 浮点累积/降采样误差会让它变成 19.999 而误判——否则整面退化成抬枪绕行。
+            return clearMin3(g) >= gunClearEff - 0.5;
         };
         auto gunOf2=[&](const Vec2& p2)->Vec3{
             Vec2 w = rotInv(p2);
@@ -4860,16 +4902,33 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         };
         auto polyOK=[&](const std::vector<Vec2>& ps)->bool{
             if(ps.empty()) return true;
+            auto bad=[&](const char* why, const Vec3& g, double d){
+                if(connDbg) fprintf(stderr,"[why] %s d=%.2f at (%.1f,%.1f,%.1f)\n",
+                                     why, d, g.x,g.y,g.z);
+                return false;
+            };
+            const double lim = gunClearEff - 0.5;
             for(size_t k=0;k<ps.size();++k){
                 if(k>0){
                     Vec2 dd=ps[k]-ps[k-1]; double dl=len2(dd);
                     int ns=(int)std::ceil(dl/(pstep*2.0));
+                    Vec3 prevG = gunOf2(ps[k-1]);
                     for(int t=1;t<ns;++t){
                         Vec2 m=ps[k-1]+dd*((double)t/(double)ns);
-                        if(!clearOK3(gunOf2(m))) return false;
+                        Vec3 g = gunOf2(m);
+                        if(segCrossFace(prevG, g)) return bad("穿面", g, 0.0);
+                        double d = clearMin3(g);
+                        if(d < lim) return bad("净空", g, d);
+                        prevG = g;
                     }
+                    Vec3 gEnd = gunOf2(ps[k]);
+                    if(segCrossFace(prevG, gEnd)) return bad("穿面", gEnd, 0.0);
+                    double d2 = clearMin3(gEnd);
+                    if(d2 < lim) return bad("净空", gEnd, d2);
+                    continue;
                 }
-                if(!clearOK3(gunOf2(ps[k]))) return false;
+                double d0 = clearMin3(gunOf2(ps[k]));
+                if(d0 < lim) return bad("净空", gunOf2(ps[k]), d0);
             }
             return true;
         };
