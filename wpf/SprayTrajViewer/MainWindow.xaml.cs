@@ -191,9 +191,50 @@ namespace SprayTrajViewer
             }
         }
 
+        /// <summary>
+        /// 浏览对话框的起始目录。优先级：
+        ///   1) 当前路径框里文件所在目录（用户此刻的意图，最贴近他要找的地方）；
+        ///   2) 上次成功打开过的目录（换了一批文件、路径框已清空时用）；
+        ///   3) 文档目录（首次运行兜底）。
+        /// 任一候选目录不存在就跳到下一档，最后再退回文档，避免对话框报错或乱跳。
+        /// </summary>
+        string PickStartDir()
+        {
+            string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+
+            string? inBox = null;
+            try
+            {
+                string t = TxtPath.Text?.Trim();
+                if (!string.IsNullOrEmpty(t))
+                    inBox = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(t));
+            }
+            catch { }
+            if (!string.IsNullOrEmpty(inBox) && System.IO.Directory.Exists(inBox)) return inBox;
+
+            string? remembered = UiState.Get("lastCloudDir");
+            if (!string.IsNullOrEmpty(remembered))
+            {
+                // 用户可能把文件夹改名/移到别处，逐级上退找一个还存在的
+                var d = new System.IO.DirectoryInfo(remembered);
+                while (d != null && !d.Exists) d = d.Parent;
+                if (d != null) return d.FullName;
+            }
+
+            return System.IO.Directory.Exists(docs) ? docs : System.IO.Path.GetTempPath();
+        }
+
         void BtnBrowse_Click(object sender, RoutedEventArgs e)
         {
-            var dlg = new OpenFileDialog { Filter = "PLY 点云|*.ply|所有文件|*.*" };
+            var dlg = new OpenFileDialog
+            {
+                Filter = "PLY 点云|*.ply|所有文件|*.*",
+                // 必须显式给 InitialDirectory：.NET Core 下的 WPF 对话框不会自己记忆，
+                // 不给就每次都从"文档"开始（这正是此前"每次点开都到这里"的原因）。
+                InitialDirectory = PickStartDir(),
+                // 不要设 true：true 会把进程当前目录恢复原值并绕开系统记忆，反而更死。
+                RestoreDirectory = false,
+            };
             if (dlg.ShowDialog() == true)
             {
                 TxtPath.Text = dlg.FileName;
@@ -209,6 +250,13 @@ namespace SprayTrajViewer
                 _cloud = PlyReader.Read(path);
                 swLoad.Stop();
                 _currentFile = path;
+                // 记住这次文件的目录：下次点"浏览"直接从这里开始（含命令行 --ply 打开的情况）
+                try
+                {
+                    var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
+                    if (!string.IsNullOrEmpty(dir)) UiState.Set("lastCloudDir", dir);
+                }
+                catch { }
                 RenderCloud();
                 TxtHint.Text = $"点云已加载：{_cloud.Count} 点（读取 {swLoad.ElapsedMilliseconds} ms）";
                 Title = $"喷涂轨迹生成器 - {System.IO.Path.GetFileName(path)}";
