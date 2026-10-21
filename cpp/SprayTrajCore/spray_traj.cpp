@@ -3442,6 +3442,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     p.normalFlip     = 0;
     p.fillHoleSize   = 300.0;
     p.scanDirMode    = 0;
+    p.gunClear       = 20.0;   // 枪帽 Ø32 半径16 + 余量4；大枪/旋杯按实际改
     return p;
 }
 
@@ -4182,7 +4183,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         // 只对内壁/内底生效：外壁枪位在件外 standoff 处，最近点距离必然 >= standoff，
         // 不会误删。
         if(seg.fo.isInner > 0 && !inl.empty()){
-            const double gunClear = std::max(12.0, 0.2*params->standoff);
+            const double gunClear = params->gunClear > 0.0
+                                  ? params->gunClear
+                                  : std::max(12.0, 0.2*params->standoff);
             std::vector<int> keep; keep.reserve(inl.size());
             int drop = 0;
             for(int i : inl){

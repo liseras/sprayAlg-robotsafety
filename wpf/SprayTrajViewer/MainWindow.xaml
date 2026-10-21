@@ -42,6 +42,11 @@
                         <TextBox x:Name="TxtStandoff" Text="100" Padding="4"/>
                     </DockPanel>
                     <DockPanel Margin="0,4">
+                        <TextBlock Text="枪体安全半径 (mm)" Width="150" VerticalAlignment="Center"
+                                   ToolTip="喷头外径/2 + 安全余量。内壁角落枪位距件小于此值即不布行。0=按 0.2×离面距离 自动"/>
+                        <TextBox x:Name="TxtGunClear" Text="20" Padding="4"/>
+                    </DockPanel>
+                    <DockPanel Margin="0,4">
                         <TextBlock Text="移动速度 (mm/s)" Width="150" VerticalAlignment="Center"/>
                         <TextBox x:Name="TxtSpeed" Text="200" Padding="4"/>
                     </DockPanel>

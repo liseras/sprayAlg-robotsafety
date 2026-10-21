@@ -30,6 +30,10 @@ typedef struct SprayTrajParams {
     int    normalFlip;       // 法向翻转：0=自动判向，1=强制翻转（法向取反）
     double fillHoleSize;     // 孔洞填补阈值 mm：点云间隙/孔洞跨距 < 此值 → 覆盖重建（行连续跨越、重建面补洞）；>= 此值 → 真实孔/槽保留
     int    scanDirMode;      // 轨迹方向：0=自动(最平滑)，1=沿长边喷(行平行长边,换行少)，2=沿短边喷(行平行短边,换行多)
+    // 枪体安全半径 mm：喷头（枪帽/旋杯）端面到障碍物的最小允许距离，= 喷头外径/2 + 安全余量。
+    // 内壁/内底布行时，枪位（面点沿法向抬 standoff 处）到工件点云距离 < 此值即不布行，
+    // 避免枪头在角落顶进相邻壁。<=0 时回落到 max(12, 0.2*standoff)。
+    double gunClear;
 } SprayTrajParams;
 
 // 默认参数
