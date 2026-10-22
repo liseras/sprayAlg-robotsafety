@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 
 namespace SprayTrajViewer
@@ -18,6 +18,10 @@ namespace SprayTrajViewer
         public int    normalFlip;       // 法向翻转：0=自动，1=强制翻转
         public double fillHoleSize;     // 孔洞填补阈值 mm（间隙<此值覆盖重建，行连续跨越）
         public int    scanDirMode;      // 轨迹方向：0=自动，1=沿长边喷，2=沿短边喷
+        public double gunClear;         // 枪体安全半径 mm（喷头外径/2 + 安全余量）
+        public double edgeExtend;       // 行端点外扩 mm（<0=自动 1×行距，0=不外扩）
+        public double edgeExtendAcross; // 跨行方向外扩 mm（<0=自动 0.25×行距，0=首末行压边界）
+        public double shellThick;       // 薄板双面壁厚 mm（0=关闭；>0 时给单层壳补出另一面）
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -32,13 +36,25 @@ namespace SprayTrajViewer
     [StructLayout(LayoutKind.Sequential)]
     public struct SprayTrajPlane
     {
-        public double nx, ny, nz;
+        public double nx, ny, nz;   // 喷距法向（轨迹按它抬升）
         public double cx, cy, cz;
         public int count;
+        // 面级法向诊断：与 C++ SprayTrajPlane 逐字段对应，顺序不能改
+        public double n0x, n0y, n0z;   // 射线自由空间判出的真实法向（可喷侧）
+        public double angZ;            // 与 +Z 夹角 0~180
+        public double tiltDeg;         // 仰角 90-angZ，-90~90
+        public double freePlus;        // +n 侧自由距离 mm（-1 = 量程内无命中）
+        public double freeMinus;       // -n 侧自由距离 mm
+        public int side;               // +1 正向 / -1 反向 / 0 竖直
+        public int isInner;            // 1 = 内壁
+        public int sideSrc;            // 1=射线 2=兜底 3=强制
         public double ux, uy, uz;
         public double vx, vy, vz;
         public double minU, maxU;
         public double minV, maxV;
+        // 单层壳 / 薄壁双层：1=单层(只有一层点) 2=双层(内外壁都在数据里) 0=未判定
+        public int layerCnt;
+        public double layerThick;      // 沿法向 2%~98% 分位跨度 mm
         // 规则化重建面片：轮廓矢量化 + 矩形吸附 + 三角化后的网格
         public int polyVertCount;                       // 顶点数
         public int polyTriCount;                        // 三角形数
@@ -63,7 +79,7 @@ namespace SprayTrajViewer
         public int removed_points;
         public int inlier_points;
         public int plane_count;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
         public SprayTrajPlane[] planes;
         public IntPtr error;    // const char*
     }

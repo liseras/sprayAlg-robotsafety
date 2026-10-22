@@ -32,3 +32,18 @@ cpp/*.png
 # SPRAYTRAJ_DUMP 倒出的调试图（在仓库根目录跑 driver 时会生成）
 /mask_*.pgm
 /uv_plane*.csv
+cpp/_regress/thinbox*.ply
+
+# 回归测试脚本的运行产物（基线文件入库，输出不入库）
+cpp/_regress/regress_out/
+cpp/_regress/regress_old/
+
+# 回归临时中间产物（调试用，_ 前缀）
+cpp/_regress/_*
+
+# 现场点云转出来的 ascii 副本（用 ply2ascii.py 随时重生成，不入库）
+cpp/_regress/ubox.ply
+cpp/_regress/ubox4.ply
+
+# 仓库外的一次性探针脚本（内有密钥等敏感信息，与算法无关，永不入库）
+/_probe/
