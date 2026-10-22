@@ -5,7 +5,8 @@
 //
 // 选项：
 //   -standoff <mm>   喷距（必须与生成轨迹时一致，默认 100）
-//   -safety <mm>     安全间隙（默认 20）
+//   -safety <mm>     间隙告警阈值（P1，软约束，默认 20）
+//   -hardclr <mm>    绝对安全距离/回退硬下限（默认 2；0=只要不穿透）
 //   -search <mm>     判定带（默认 120；超过只报下界）
 //   -tool <mm>       法兰→喷嘴（默认 150）
 //   -tilt <deg>      非朝上面基准倾角（默认 20）
@@ -348,15 +349,17 @@ int main(int argc, char** argv) {
                    (int)offsetof(RobotSafetyResult, basePose), (int)offsetof(RobotSafetyResult, error));
             // 新增字段的偏移也要报：C# 侧用 Marshal.OffsetOf 对这几个数，
             // 只对总尺寸不够（字段整体错位时总尺寸常常还是对的）。
-            printf("  Res.azRows=%d azStanceRows=%d · Params.azMode=%d\n",
+            printf("  Res.azRows=%d azStanceRows=%d · Params.safety=%d hardClearance=%d azMode=%d\n",
                    (int)offsetof(RobotSafetyResult, azRows), (int)offsetof(RobotSafetyResult, azStanceRows),
+                   (int)offsetof(RobotSafetyParams, safety), (int)offsetof(RobotSafetyParams, hardClearance),
                    (int)offsetof(RobotSafetyParams, azMode));
             return 0;
         }
     }
     if (argc < 4) {
         printf("用法: spray_safety <traj.csv> <cloud.ply> <out.csv> [选项]\n");
-        printf("      -standoff -safety -search -tool -tilt -tiltmax -rate -sprayang\n");
+        printf("      -standoff -safety -hardclr -search -tool -tilt -tiltmax -rate -sprayang\n");
+        printf("      -hardclr <mm>  绝对安全距离/回退硬下限（默认 2；0=只要不穿透）\n");
         printf("      -threads <n>  -stride <n>  -voxel <mm>  -azmode <0|1>  -base <x y z rx ry rz>  -quiet\n");
         printf("      -azmode 0 = 按机器人站位逐行择优进刀侧（默认）；1 = 只用「向上」（旧口径）\n");
         return 2;
@@ -373,6 +376,7 @@ int main(int argc, char** argv) {
     for (int i = 4; i < argc; ++i) {
         if (!strcmp(argv[i], "-standoff") && i + 1 < argc) p.standoff = atof(argv[++i]);
         else if (!strcmp(argv[i], "-safety") && i + 1 < argc) p.safety = atof(argv[++i]);
+        else if ((!strcmp(argv[i], "-hardclr") || !strcmp(argv[i], "-hard")) && i + 1 < argc) p.hardClearance = atof(argv[++i]);
         else if (!strcmp(argv[i], "-search") && i + 1 < argc) p.search = atof(argv[++i]);
         else if (!strcmp(argv[i], "-tool") && i + 1 < argc) p.toolLen = atof(argv[++i]);
         else if (!strcmp(argv[i], "-tilt") && i + 1 < argc) p.tiltNonUpDeg = atof(argv[++i]);
@@ -427,9 +431,9 @@ int main(int argc, char** argv) {
     }
     if (!quiet) {
         printf("轨迹 %d 点 · 点云 %d 点\n", (int)traj.pts.size(), cloud.n);
-        printf("参数: standoff=%.1f safety=%.1f search=%.1f tool=%.1f tilt=%.1f/%.1f rate=%.1f sprayAngle<=%.1f\n",
-               p.standoff, p.safety, p.search, p.toolLen, p.tiltNonUpDeg, p.tiltMaxDeg, p.tiltRateDeg,
-               p.maxSprayAngleDeg);
+        printf("参数: standoff=%.1f safety=%.1f hardClearance=%.1f search=%.1f tool=%.1f tilt=%.1f/%.1f rate=%.1f sprayAngle<=%.1f\n",
+               p.standoff, p.safety, p.hardClearance, p.search, p.toolLen, p.tiltNonUpDeg, p.tiltMaxDeg,
+               p.tiltRateDeg, p.maxSprayAngleDeg);
     }
 
     RobotSafetyResult r = robot_safety_check(traj.pts.data(), (int)traj.pts.size(), cloud.xyz.data(), cloud.n,

@@ -34,14 +34,20 @@ namespace SprayTrajViewer
         public MainWindow()
         {
             InitializeComponent();
-            // ABI 自检：与 C++ driver 打印的 sizeof 对齐（Plane=18648 Point=64 Result=149304）
+            // ABI 自检：与 C++ `spray_safety.exe --abi` 打印的 sizeof 对齐
+            // （Plane=18664 Point=64 Result=298744 Params=128；SafetyParams=152 SafetyPoint=216 SafetyResult=304）
             try
             {
                 App.Log("ABI", null,
                     $"Plane={Marshal.SizeOf<SprayTrajPlane>()} " +
                     $"Point={Marshal.SizeOf<SprayTrajPoint>()} " +
                     $"Result={Marshal.SizeOf<SprayTrajResult>()} " +
-                    $"Params={Marshal.SizeOf<SprayTrajParams>()}");
+                    $"Params={Marshal.SizeOf<SprayTrajParams>()} | " +
+                    $"SafetyParams={Marshal.SizeOf<RobotSafetyParams>()} " +
+                    $"SafetyPoint={Marshal.SizeOf<RobotSafetyPoint>()} " +
+                    $"SafetyResult={Marshal.SizeOf<RobotSafetyResult>()} " +
+                    $"safety@{Marshal.OffsetOf<RobotSafetyParams>(nameof(RobotSafetyParams.safety))} " +
+                    $"hardClearance@{Marshal.OffsetOf<RobotSafetyParams>(nameof(RobotSafetyParams.hardClearance))}");
             }
             catch (Exception ex) { App.Log("ABI/FAIL", ex); }
             Loaded += (_, _) =>
@@ -147,6 +153,11 @@ namespace SprayTrajViewer
             if (o.TryGetValue("tab", out v)) Tabs.SelectedIndex = Math.Clamp(int.TryParse(v, out var ti) ? ti : 0, 0, 1);
             // --azmode 1：切回「只用向上」的旧口径（与 spray_safety -azmode 1 等价）
             if (o.TryGetValue("azmode", out v)) CmbAzMode.SelectedIndex = (int.TryParse(v, out var azm) && azm == 1) ? 1 : 0;
+            // 注意：--safety 是"跑安全评估"的开关（无值），不能拿它覆盖告警阈值，
+            // 否则 ParseArgs 会把无值开关当成 "1"，把 20mm 告警阈值误改成 1mm。
+            // 要覆盖阈值请用 --safety-gap 20。
+            if (o.TryGetValue("safety-gap", out v)) TxtSafetyGap.Text = v;
+            if (o.TryGetValue("hardclr", out v)) TxtHardClearance.Text = v;
 
             // 显示项（显式给值时才改，避免把用户默认勾选状态打乱）
             if (o.TryGetValue("show-cloud", out v)) ChkShowCloud.IsChecked = v != "0";
@@ -161,6 +172,7 @@ namespace SprayTrajViewer
                 $"dir={CmbScanDir.SelectedIndex} flip={CmbNormalFlip.SelectedIndex}");
             App.Log("CLI", null,
                 $"show: cloud={ChkShowCloud.IsChecked} traj={ChkShowTraj.IsChecked} plane={ChkShowPlane.IsChecked}");
+            App.Log("CLI", null, $"safetyGap={TxtSafetyGap.Text} hardClr={TxtHardClearance.Text}");
 
             if (!System.IO.File.Exists(TxtPath.Text))
             {
@@ -899,6 +911,8 @@ namespace SprayTrajViewer
             // 后面「可达 / 碰撞」的结论全部不成立，所以这里强制取界面上的生成值。
             p.standoff = ParseDouble(TxtStandoff.Text, p.standoff);
             p.safety = ParseDouble(TxtSafetyGap.Text, p.safety);
+            // 绝对安全距离/回退硬下限：只有低于它才回退，间隙略小但高于它时保留平滑。
+            p.hardClearance = Math.Max(0, ParseDouble(TxtHardClearance.Text, p.hardClearance));
             p.toolLen = ParseDouble(TxtToolLen.Text, p.toolLen);
             p.tiltMaxDeg = ParseDouble(TxtTiltMax.Text, p.tiltMaxDeg);
             p.maxSprayAngleDeg = ParseDouble(TxtMaxSprayAngle.Text, p.maxSprayAngleDeg);
@@ -1013,8 +1027,11 @@ namespace SprayTrajViewer
                 ? $"进刀侧：全部向上（旧口径，{sum.azRows} 行）"
                 : $"进刀侧：{sum.azRows} 行中 {sum.azStanceRows} 行按站位侧（其余沿法向上）");
             sb.AppendLine($"喷距守恒偏差 {sum.standoffMaxErrMm:E2} mm");
+            sb.AppendLine($"回退策略：绝对安全距离 {p.hardClearance:F1} mm（硬约束通过即保留平滑）");
             if (sum.poseReverted > 0)
-                sb.AppendLine($"平滑回退 {sum.poseReverted} 点（碰撞优先于姿态连续）");
+                sb.AppendLine($"平滑回退 {sum.poseReverted} 点（仅低于硬下限/碰撞/自碰撞/关节超限）");
+            else
+                sb.AppendLine("平滑回退 0 点（全部硬约束通过）");
             sb.AppendLine($"违规：不可达 {Rule(0)} · 连杆撞 {Rule(8)} · 枪体撞 {Rule(9)} · 自碰撞 {Rule(3)}");
             sb.AppendLine($"　　　间隙 {Rule(2)} · 关节 {Rule(4)} · 喷角 {Rule(5)} · 奇异 {Rule(6)} · 跳变 {Rule(7)}");
             sb.AppendLine(sum.baseAuto != 0
@@ -1029,7 +1046,8 @@ namespace SprayTrajViewer
             TxtHint.Text = $"安全评估：{verdict} · 可达 {sum.reachable}/{sum.count} · 最小间隙 {sum.minClearanceMm:F1}mm";
             App.Log("SAFETY", null,
                 $"verdict={verdict} p0={nP0} p1={nP1} p2={nP2} count={sum.count} reachable={sum.reachable} " +
-                $"minClr={sum.minClearanceMm:F2} tool={sum.minClearanceToolMm:F2} link={sum.minClearanceLinkMm:F2} " +
+                $"minClr={sum.minClearanceMm:F2} hardClr={p.hardClearance:F2} " +
+                $"tool={sum.minClearanceToolMm:F2} link={sum.minClearanceLinkMm:F2} " +
                 $"linkSeg={LinkDesc()} " +
                 $"tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
                 $"tilted={sum.tiltedPoints} reverted={sum.poseReverted} standoffErr={sum.standoffMaxErrMm:E2} " +

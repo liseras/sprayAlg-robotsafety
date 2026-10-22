@@ -10,10 +10,12 @@
 //   ① 非朝上法向加倾角；② 倾角改变时 TCP 到面点距离严格不变（球面旋转）；
 //   ③ 枪体/连杆 vs 原始点云碰撞 + 非相邻连杆自碰撞。
 //
-// 一个反直觉但必须守住的优先级：**碰撞(P0) 永远压过姿态连续(P2)**。
+// 优先级：**硬约束（碰撞/自碰撞/关节超限/低于绝对安全距离） > 姿态连续 > 间隙告警**。
 // 实测 complex 的 idx 3163：本点最优方位下间隙 -2.35mm，被"整行统一方位"顶成 -5.81mm
-// 真穿透；同理"只升不降"的倾角平滑在凹槽里会把间隙从 18.6mm 抬到 0.48mm。
-// 所以平滑之后要回eval：位姿变差就退回本点最优（见 stage3 的 reverted）。
+// 真穿透；这种硬约束被破坏时必须回退。
+// 但只要平滑后仍高于 hardClearance（默认 2mm），就不再因为"比本点最优差一点"而回退：
+// 有凸点、间隙从 30mm 降到 8mm 没关系，以平滑为主；safety（默认 20mm）只负责标橙告警。
+// 见 stage3 的 reverted。
 
 #include "robot_safety.h"
 
@@ -564,6 +566,30 @@ inline int rankCmp(const IkSol& a, const IkSol& b) {
     return 0;
 }
 
+// 关节空间距离（平方，度²）：用来在多个合法 IK 解里挑“离上一点最近”的那支。
+// 只用于比较，不开方。
+inline double jointDist2(const double a[6], const double b[6]) {
+    double s = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        double d = a[i] - b[i];
+        s += d * d;
+    }
+    return s;
+}
+
+inline double maxJointDelta(const double a[6], const double b[6]) {
+    double m = 0.0;
+    for (int i = 0; i < 6; ++i) m = std::max(m, std::fabs(a[i] - b[i]));
+    return m;
+}
+
+// 上一点解如果单关节跳超过这个角度，就怀疑换了 IK 解支；再多试解析种子，
+// 选离上一点最近的合法解。低于它直接返回，绝大多数点不额外花时间。
+constexpr double kBranchContinuityTrigDeg = 10.0;
+// 阶段 3 复用阶段 1 缓存的连续性阈值。比 IK 解支阈值更严：
+// 缓存是“另一条轨迹”的解，只要和最终上一点差得多就重解，避免 5~10° 的隐形换支。
+constexpr double kCacheContinuityTrigDeg = 5.0;
+
 // 种子顺序：上一点解（连续性）→ 解析种子（解支正确）→ 固定种子表（兜底）
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
     ++g_prof.ik;
@@ -579,20 +605,48 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         ++ns;
     }
 
+    auto valid = [](const IkSol& s) {
+        return s.ok && s.posErr < 0.05 && s.rotErrDeg < 0.05 && !s.over;
+    };
     IkSol best;
     bool hasBest = false;
-    for (int i = 0; i < ns; ++i) {
+    IkSol bestValid;
+    bool hasValid = false;
+    double bestValidDist = 1e300;
+
+    // 先跑上一点种子：连续且合法就直接返回，保持主路径速度。
+    if (seed) {
+        IkSol sol = ikOnce(pTarget, RTarget, toolLen, seed);
+        best = sol;
+        hasBest = true;
+        if (valid(sol)) {
+            if (maxJointDelta(sol.theta, seed) <= kBranchContinuityTrigDeg) return sol;
+            // 跳得大：先把它作为“最近的合法解”的兜底，再找有没有更近的解支。
+            bestValid = sol;
+            hasValid = true;
+            bestValidDist = jointDist2(sol.theta, seed);
+        }
+    }
+
+    // 解析种子 / 固定种子。有 seed 且上一点解跳得大时，选关节距离最近的合法解；
+    // 没有 seed 时保持旧行为（第一个合法解直接返回）。
+    for (int i = (seed ? 1 : 0); i < ns; ++i) {
         IkSol sol = ikOnce(pTarget, RTarget, toolLen, seeds[i]);
-        // 快路径：收敛 + 残差好 + **不超限**。缺了"不超限"这一条，
-        // DLS 会稳定地采纳"数学正确、机械要撞"的那支（它反而收敛得更快）。
-        if (sol.ok && sol.posErr < 0.05 && sol.rotErrDeg < 0.05 && !sol.over) return sol;
-        if (!hasBest) {
+        if (valid(sol)) {
+            if (!seed) return sol;
+            double dist = jointDist2(sol.theta, seed);
+            if (!hasValid || dist < bestValidDist) {
+                bestValid = sol;
+                bestValidDist = dist;
+                hasValid = true;
+            }
+        }
+        if (!hasBest || rankCmp(sol, best) < 0) {
             best = sol;
             hasBest = true;
-            continue;
         }
-        if (rankCmp(sol, best) < 0) best = sol;
     }
+    if (hasValid) return bestValid;
     return best;
 }
 
@@ -973,7 +1027,8 @@ void computeRows(const TrajIn& t, std::vector<std::pair<int, int>>& rows) {
 
 struct Params {
     double standoff = 100.0;
-    double safety = 20.0;
+    double safety = 20.0;          // 间隙告警阈值（软约束，只影响 P1 报告）
+    double hardClearance = 2.0;    // 绝对安全距离（硬约束，低于它才回退）
     double search = 120.0;
     double toolLen = kDefaultToolLen;
     double tiltNonUpDeg = 30.0;      // α=90°（竖直侧壁）时的倾角，实际按 α/90 线性缩放
@@ -1028,6 +1083,31 @@ inline int poseCmp(const PR& a, const PR& b) {
     return 0;
 }
 
+// 硬约束：IK 成功、不自碰撞、间隙不低于绝对安全距离、关节不超限。
+// 注意 margin < jointMarginMin 只是 P1 软告警，不在这里判死；over（真正超限）才是硬约束。
+inline bool hardOk(const PR& q, double hardClearance) {
+    return q.ikOk
+        && q.selfGap >= 0.0
+        && q.clearance >= hardClearance
+        && !q.over;
+}
+
+// 两个“都不满足硬约束”的位姿二选一：先比硬约束通过项，再比自间隙/间隙/关节余量。
+// 与 poseCmp 的区别：selfGap<0 时还要比谁的负值更小；关节真正超限（over）
+// 也单独判负，不能因为另一个位姿间隙大就选一个关节超限的位姿。
+inline int hardCmp(const PR& a, const PR& b) {
+    int ia = a.ikOk ? 1 : 0, ib = b.ikOk ? 1 : 0;
+    if (ia != ib) return ia < ib ? -1 : 1;
+    int sa = (a.selfGap >= 0.0) ? 1 : 0, sb = (b.selfGap >= 0.0) ? 1 : 0;
+    if (sa != sb) return sa < sb ? -1 : 1;
+    int oa = a.over ? 0 : 1, ob = b.over ? 0 : 1;
+    if (oa != ob) return oa < ob ? -1 : 1;
+    if (a.selfGap != b.selfGap) return a.selfGap < b.selfGap ? -1 : 1;
+    if (a.clearance != b.clearance) return a.clearance < b.clearance ? -1 : 1;
+    if (a.margin != b.margin) return a.margin < b.margin ? -1 : 1;
+    return 0;
+}
+
 class Evaluator {
 public:
     Evaluator(const CloudIndex& cloud, const Pose& base, const Params& p)
@@ -1047,6 +1127,8 @@ public:
     V3 toBaseP(const V3& p) const { return m3mul(baseRT_, p - baseT_); }
     M3 toBaseR(const M3& R) const { return m3mul(baseRT_, R); }
     V3 toCloudP(const V3& p) const { return m3mul(baseR_, p) + baseT_; }
+    // 方向向量：基座系 → 点云系（只有旋转，不平移）。refX 这类「来自 FK 的轴」必须过这一步。
+    V3 toCloudR(const V3& v) const { return m3mul(baseR_, v); }
     // 基座原点（点云系）。方位决策要用它判"机器人从哪一侧够过来"。
     V3 baseOrigin() const { return baseT_; }
 
@@ -1061,7 +1143,13 @@ public:
         V3 pC = face + d * p_.standoff;
         M3 Rc = frameFromZ(zTool);
         if (refX) {
-            V3 x0 = *refX - zTool * dot(*refX, zTool);
+            // refX 来自上一点 fk() 的工具 x 轴，是**基座系**的；zTool 是**点云系**的。
+            // 不转坐标系直接投影 = 拿两个不同坐标系的向量做正交分解，工具 x 轴每步都会被
+            // 额外偏转一份「基座偏航」的角量，并且逐点累加 → 手腕绕枪轴持续自旋。
+            // 实测（complex，自动基座偏航 18.08°）：J6 每点 -17.6°、整行拧到 J6 限位；
+            // 而 tray（自动基座偏航 0）同一段代码完全平滑（每点 0.5°）——正是坐标系混用的铁证。
+            V3 rx = toCloudR(*refX);
+            V3 x0 = rx - zTool * dot(rx, zTool);
             if (norm(x0) > 1e-6) {
                 x0 = unit(x0);
                 V3 y0 = unit(cross(zTool, x0));
@@ -1400,6 +1488,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     std::memset(&p, 0, sizeof(p));
     p.standoff = 100.0;
     p.safety = 20.0;
+    p.hardClearance = 2.0;   // 绝对安全距离：只在这个硬下限被破坏时才回退
     p.search = 120.0;
     p.toolLen = kDefaultToolLen;
     p.tiltNonUpDeg = 30.0;   // α=90°（竖直侧壁）时的倾角 = 工艺上限。见 needTilt 的说明
@@ -1479,6 +1568,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         const RobotSafetyParams& s = paramsIn ? *paramsIn : d;
         p.standoff = s.standoff > 0 ? s.standoff : d.standoff;
         p.safety = s.safety > 0 ? s.safety : d.safety;
+        // 0 是合法值（只要不穿透）；负数才回落到默认 2mm。
+        p.hardClearance = s.hardClearance >= 0 ? s.hardClearance : d.hardClearance;
         p.search = s.search > 0 ? s.search : d.search;
         p.toolLen = s.toolLen > 0 ? s.toolLen : d.toolLen;
         p.tiltNonUpDeg = s.tiltNonUpDeg >= 0 ? s.tiltNonUpDeg : d.tiltNonUpDeg;
@@ -1685,8 +1776,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     }
 
     // 说明：曾在这里加过"拿到真实倾角后复核方位"的一轮（阶段 2.5），实测是负收益，
-    // 已删。原因写在阶段 0 的注释里：复核用的是抽样，判断与阶段 3 的 poseCmp（逐点）
-    // 不一致时会整行被 poseCmp 退回旧位姿 —— complex 上花了 15~20% 时间，
+    // 已删。原因写在阶段 0 的注释里：复核用的是抽样，判断与阶段 3 的逐点复核
+    // 不一致时会整行被逐点回退 —— complex 上花了 15~20% 时间，
     // 输出与旧口径逐字节相同。要真正按"最差点"决策，就必须整行逐点评估两个方位，
     // 那是 2× 阶段 1 的开销（阶段 1 已占 84%），产线不接受。
     // ---- 阶段 2.5：进刀侧（方位角）逐行决策
@@ -1850,6 +1941,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
 
             bool reuse = hasCache[i] && std::fabs(cache[i].tiltDeg - tilt) < 1e-6 &&
                          std::fabs(cache[i].azDeg - az) < 1e-6;
+            // 阶段 1 的缓存是在“阶段 1 的倾角 + 阶段 1 的上一点解”下算出来的；
+            // 阶段 3 的 final 倾角可能已经变了，上一点也可能被重解。若直接复用缓存，
+            // 会出现“上一点已换到 A 支、本点缓存仍在 B 支”的关节跳变（complex idx 3161：
+            // J6 从 32° 跳到 8°，但目标只转了 3°）。缓存与当前上一点不连续时重解一次，
+            // 再用硬约束决定是否退回缓存。
+            if (reuse && hasSeed &&
+                maxJointDelta(cache[i].theta, prevTheta) > kCacheContinuityTrigDeg)
+                reuse = false;
             PR pr;
             if (reuse) {
                 pr = cache[i];
@@ -1878,14 +1977,25 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     continue;   // 违规位在输出阶段按 pr.viol 统一统计，这里不必重复累加
                 }
                 pr.idx = i;
-                // ---- 平滑回退：平滑不许把好点变坏
-                // 平滑位姿只要比本点最优更差，就退回本点最优 —— 宁可姿态跳一下
-                // （由 TILT_JUMP 报出来），也不接受穿透。
-                if (hasCache[i] && poseCmp(pr, cache[i]) < 0) {
-                    pr = cache[i];
-                    pr.idx = i;
-                    pr.reverted = true;
-                    ++acc.reverted;
+                // ---- 平滑回退：只回退硬约束，不再“差一点就回退”
+                // 用户现场口径：有凸点没关系，只要不碰撞就以平滑为主。
+                // 所以这里把“平滑后间隙比本点最优小”从回退条件里拿掉：
+                //   · 平滑位姿满足硬约束（IK / 自碰撞 / 间隙≥hardClearance / 关节不超限）
+                //     → 保留平滑，哪怕间隙比本点最优小几毫米；
+                //   · 只有硬约束被破坏，且本点最优更安全时，才退回本点最优。
+                // 注意：margin < jointMarginMin 仍只是 P1 软告警，不触发回退；
+                //       safety（默认 20mm）也只影响报告标橙，不再是回退阈值。
+                if (hasCache[i]) {
+                    bool smoothHard = hardOk(pr, p.hardClearance);
+                    if (!smoothHard) {
+                        bool cacheHard = hardOk(cache[i], p.hardClearance);
+                        if (cacheHard || hardCmp(pr, cache[i]) < 0) {
+                            pr = cache[i];
+                            pr.idx = i;
+                            pr.reverted = true;
+                            ++acc.reverted;
+                        }
+                    }
                 }
             }
             pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
@@ -1957,8 +2067,9 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     }
 
     // 生效行数：只有"确实改变了个点位姿"的行才计入 azStanceRows。
-    // 阶段 3 的 poseCmp 会把更差的位姿逐点退回，于是会出现"改判 N 行、实际一点没变"
-    // （complex 上就是：改判 1 行、输出与旧口径逐字节相同）。报数字要报生效的。
+    // 阶段 3 的硬约束回退会把低于 hardClearance / 自碰撞 / 关节超限的位姿逐点退回，
+    // 于是会出现"改判 N 行、实际一点没变"（complex 上就是：改判 1 行、输出与旧口径逐字节相同）。
+    // 报数字要报生效的。
     {
         std::vector<char> applied(rows.size(), 0);
         for (int i = 0; i < n; ++i) {

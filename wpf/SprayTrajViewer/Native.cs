@@ -94,7 +94,8 @@ namespace SprayTrajViewer
     public struct RobotSafetyParams
     {
         public double standoff;         // 喷距 mm（必须与生成轨迹时一致）
-        public double safety;           // 安全间隙 mm
+        public double safety;           // 间隙告警阈值 mm（P1，软约束）
+        public double hardClearance;    // 绝对安全距离 mm（硬约束）：平滑姿态低于它才回退；0=只要不穿透
         public double search;           // 判定带 mm（超过只报下界）
         public double toolLen;          // 法兰 → 喷嘴 mm
         public double tiltNonUpDeg;     // α=90°（竖直侧壁）时的倾角；实际 = 它 × α/90°（α 为法向与 +Z 夹角）

@@ -204,6 +204,7 @@
                                         <RowDefinition/>
                                         <RowDefinition/>
                                         <RowDefinition/>
+                                        <RowDefinition/>
                                     </Grid.RowDefinitions>
 
                                     <StackPanel Grid.Row="0" Grid.Column="0">
@@ -211,7 +212,8 @@
                                         <TextBox x:Name="TxtToolLen" Text="150" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
                                     <StackPanel Grid.Row="0" Grid.Column="2">
-                                        <TextBlock Text="安全间隙 (mm)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBlock Text="间隙告警阈值 (mm)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="P1 软告警：低于它只标橙提示，不触发回退"/>
                                         <TextBox x:Name="TxtSafetyGap" Text="20" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
 
@@ -248,6 +250,17 @@
                                             <ComboBoxItem Content="只用「向上」(旧口径)"/>
                                         </ComboBox>
                                     </StackPanel>
+
+                                    <StackPanel Grid.Row="4" Grid.Column="0" Margin="0,8,0,0">
+                                        <TextBlock Text="绝对安全距离 / 回退硬下限 (mm)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="平滑姿态只要间隙≥此值、无碰撞/自碰撞、关节不超限，就保留平滑；低于此值才回退。0=只要不穿透。与上面的 20mm 告警阈值分开。"/>
+                                        <TextBox x:Name="TxtHardClearance" Text="2" Padding="4" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Row="4" Grid.Column="2" Margin="0,8,0,0">
+                                        <TextBlock Text="平滑优先" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBlock Text="仅硬约束回退；间隙略小不回退" FontSize="11" Foreground="#111827"
+                                                   Margin="0,4,0,0" TextWrapping="Wrap"/>
+                                    </StackPanel>
                                 </Grid>
 
                                 <CheckBox x:Name="ChkAutoSafety" Content="生成轨迹后自动评估"
@@ -275,6 +288,8 @@
                                     <Run Text="P1（间隙不足 / 关节余量不足 / 喷角超工艺上限）可执行但有代价。"/>
                                     <LineBreak/>
                                     <Run Text="P2（接近奇异 / 倾角跳变）只影响节拍与平顺性。"/>
+                                    <LineBreak/>
+                                    <Run Text="回退只在硬约束（碰撞/自碰撞/关节超限/低于绝对安全距离）被破坏时发生；间隙告警只标橙，不改变姿态。"/>
                                     <LineBreak/>
                                     <LineBreak/>
                                     <Run Text="倾斜是绕面点的球面旋转：只改喷角，喷距严格不变，逐点偏差会打在结论里。"/>

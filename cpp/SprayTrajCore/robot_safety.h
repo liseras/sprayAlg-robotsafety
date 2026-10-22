@@ -23,7 +23,10 @@ extern "C" {
 // ---------------------------------------------------------------- 参数
 typedef struct RobotSafetyParams {
     double standoff;         // 喷距 mm（必须与生成轨迹时用的值一致；轨迹点 = 面点 + standoff·n）
-    double safety;           // 安全间隙 mm：表面距离小于它 → 告警（P1）
+    double safety;           // 间隙告警阈值 mm：表面距离小于它 → 告警（P1，软约束）
+    double hardClearance;    // 绝对安全距离 mm：平滑姿态低于它才回退（硬约束）。
+                             // 0 = 只要不穿透；默认 2。与上面的 safety 告警阈值分开：
+                             // safety 只决定报告是否标橙，hardClearance 才决定是否回退。
     double search;           // 判定带 mm：超过它只报下界，不当实测值。默认 120（≈ DensoArmKine 口径）
     double toolLen;          // 法兰面 → 喷嘴出口 mm（VS-087 默认 150）
     double tiltNonUpDeg;     // α=90°（竖直侧壁）时的倾角；实际倾角 = 它 × α/90°，α 为法向与 +Z 夹角（默认 20）
@@ -89,7 +92,8 @@ typedef struct RobotSafetyPoint {
 
     int    spray;            // 1=喷涂
     int    ikOk;
-    int    reverted;         // 1 = 平滑位姿更差，已退回本点最优（碰撞优先于姿态连续）
+    int    reverted;         // 1 = 平滑位姿违反硬约束（低于绝对安全距离/碰撞/自碰撞/关节超限），
+                             //     已退回本点最优；硬约束通过时即使间隙略小也保留平滑
     unsigned int violation;  // RS_VIOL_* 位或
     int    worstKind;        // 全局最近部位（RS_SEG_*）；-1 = 无位姿
     int    worstJ0, worstJ1; // 该部位两端关节号（连杆用；其余为 -1）

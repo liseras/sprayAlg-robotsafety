@@ -153,7 +153,7 @@ def write_report_md(path: str, res: Result, traj: traj_mod.Traj, src_traj: str, 
     A(f"| 最小表面距离 | {s['min_clearance_mm']:.2f} mm | 全部碰撞段（枪体 + 连杆）的最小值 |")
     A(f"| 过渡点抬升 | {s['transit_lifted']} 点 | spray=0 且原本贴太近，沿 +Z 抬开 |")
     A(f"| 平滑后重算点 | {s['recomputed_after_smoothing']} | 倾角被包络抬高、需要重新求解的点 |")
-    A(f"| 平滑回退点 | {s.get('pose_reverted', 0)} | 平滑会使这些点间隙变差，已退回本点最优位姿 |")
+    A(f"| 平滑回退点 | {s.get('pose_reverted', 0)} | 平滑位姿低于绝对安全距离/碰撞/自碰撞/关节超限，才退回本点最优；间隙略小不回退 |")
     A("")
     by = s["violations_by_rule"]
     if by:
@@ -223,9 +223,10 @@ def write_report_md(path: str, res: Result, traj: traj_mod.Traj, src_traj: str, 
     A(f"2. 若基准倾角下 clearance < {p.safety:.0f}mm 或不可达 → 按 {p.tilt_step_deg:.0f}° 步进加大，上限 {p.tilt_max_deg:.0f}°。")
     A("3. 仍不行 → 把「上翻方向」左右偏 30°/60° 再试（内壁往上扳可能顶到对面的壁）。")
     A(f"4. 倾角沿行做**只升不降**的限幅平滑（每点 ≤ {p.tilt_rate_deg_per_pt:.0f}°），保证姿态连续。")
-    A("5. **但平滑不许把好点变坏**：倾角与间隙不是单调关系（凹槽里倾角越大间隙反而越小），"
-      "整行统一倾斜方位同理。所以平滑后的位姿一旦比该点自身最优位姿更差，就退回后者，"
-      f"宁可姿态跳一下（见 CSV 的 `tilt_jump_deg` 列）。本轮退回 {s.get('pose_reverted', 0)} 点。")
+    A("5. **平滑优先，只回退硬约束**：倾角与间隙不是单调关系（凹槽里倾角越大间隙反而越小），"
+      "整行统一倾斜方位同理。但只要平滑后的位姿仍满足硬约束（无碰撞/自碰撞、间隙 ≥ "
+      f"{p.hard_clearance:.1f}mm、关节不超限），就保留平滑，哪怕间隙比本点最优小几毫米；"
+      f"只有硬约束被破坏时才退回本点最优（见 CSV 的 `tilt_jump_deg` 列）。本轮退回 {s.get('pose_reverted', 0)} 点。")
     A("")
     A("### 2.3 碰撞判据（与 DensoArmKine 同源）")
     A("")

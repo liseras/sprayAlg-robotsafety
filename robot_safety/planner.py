@@ -45,7 +45,8 @@ from . import geom, robot, traj as traj_mod
 @dataclass
 class Params:
     standoff: float = 100.0            # 喷距（mm），master 的 standoff 参数
-    safety: float = 20.0               # 安全距离（mm）：表面距离小于它 → 告警
+    safety: float = 20.0               # 间隙告警阈值（mm）：表面距离小于它 → P1 告警（软约束）
+    hard_clearance: float = 2.0        # 绝对安全距离（mm）：平滑姿态低于它才回退（硬约束）；0=只要不穿透
     # 判定带 120mm：喷距本身就有 100mm，判定带比它小的话所有段都会"饱和"——
     # 报告里只剩一排"≥40"，等于什么都没测到。这是 DensoArmKine CloudCheck 的同一口径
     # （EffectiveSearchMm = max(120, safety*4)）。
@@ -85,7 +86,7 @@ class PointResult:
     self_collision: float = math.inf    # 自碰撞最小间隙（负 = 干涉）
     lifted: float = 0.0                 # 过渡点抬升量
     az_deg: float = 0.0                 # 倾斜方位（相对"向上"方向绕法向的转角）
-    reverted: bool = False              # 是否因为"平滑反而更差"退回了本点最优位姿
+    reverted: bool = False              # 平滑位姿违反硬约束（低于绝对安全距离/碰撞/自碰撞/关节超限），已退回本点最优
 
 
 @dataclass
@@ -176,6 +177,10 @@ class Evaluator:
     def to_cloud_p(self, p: np.ndarray) -> np.ndarray:
         return self.R @ p + self.t
 
+    def to_cloud_R(self, v: np.ndarray) -> np.ndarray:
+        """方向向量：基座系 → 点云系（只转不平移）。ref_x 这类来自 FK 的轴必须过这一步。"""
+        return self.R @ v
+
     def eval_pose(self, face: np.ndarray, d: np.ndarray, ref_x: np.ndarray | None,
                   seed: np.ndarray | None, tilt_deg: float, az_deg: float = 0.0,
                   check_links: bool = True):
@@ -195,7 +200,12 @@ class Evaluator:
         if ref_x is not None:
             # 用上一点的工具 x 轴做参考（投影到新切平面）——保证姿态「最小旋转」。
             # 否则枪轴接近竖直时参考向量会在 +Z/+X 之间跳变，IK 会跳到另一个解支。
-            x0 = ref_x - z_tool * float(np.dot(ref_x, z_tool))
+            # ⚠ ref_x 来自 fk()，是**基座系**；z_tool 是**点云系**。必须先转坐标系：
+            #   混着用等于拿两个坐标系的向量做正交分解，工具 x 轴每步被额外偏转一份
+            #   「基座偏航」并逐点累加 → 手腕绕枪轴持续自旋（complex 实测 J6 −17.6°/点，
+            #   整行拧到限位；tray 基座偏航为 0 所以完全正常 —— 这就是混用的铁证）。
+            rx = self.to_cloud_R(ref_x)
+            x0 = rx - z_tool * float(np.dot(rx, z_tool))
             if geom.norm(x0) > 1e-6:
                 x0 = geom.unit(x0)
                 y0 = geom.unit(np.cross(z_tool, x0))
@@ -380,12 +390,30 @@ def _smooth_only_up(need: list[float], rows: list[tuple[int, int]], rate: float)
     return out
 
 
-def _pose_key(pr: PointResult) -> tuple[float, float, float]:
-    """位姿优劣排序键（越大越好）：自碰撞通过 > 间隙大 > 关节余量大。
+def _pose_key(pr: PointResult) -> tuple[float, float, float, float, float, float]:
+    """硬约束二选一的排序键（越大越好）：IK 成功 > 自碰撞通过 > 关节不超限 >
+    自间隙大 > 间隙大 > 关节余量大。
 
-    碰撞（P0）永远压过姿态连续性（P2），所以 self_collision < 0 直接判负。
+    碰撞（P0）永远压过姿态连续性（P2）；关节真正超限（over_limit）也单独判负，
+    不能因为另一个位姿间隙大就选一个关节超限的位姿。
     """
-    return (1.0 if pr.self_collision >= 0.0 else 0.0, pr.clearance, pr.margin_min)
+    return (1.0 if pr.ik_ok else 0.0,
+            1.0 if pr.self_collision >= 0.0 else 0.0,
+            1.0 if not pr.over_limit else 0.0,
+            pr.self_collision,
+            pr.clearance,
+            pr.margin_min)
+
+
+def _hard_ok(pr: PointResult, params: Params) -> bool:
+    """硬约束：IK 成功、不自碰撞、间隙不低于绝对安全距离、关节不超限。
+
+    margin_min < joint_margin_min 只是 P1 软告警，不在这里判死；over_limit 才是硬约束。
+    """
+    return (pr.ik_ok
+            and pr.self_collision >= 0.0
+            and pr.clearance >= params.hard_clearance
+            and not pr.over_limit)
 
 
 # ---------------------------------------------------------------- L0 参数自检
@@ -559,18 +587,19 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
                                    "severity": "P0", "note": "所有候选倾角都解不出逆解（不可达）"})
                 continue
             pr.idx = i
-            # ---- 平滑回退：**平滑不许把好点变坏**
-            # 两处平滑都用"连续性"当理由改位姿，但连续性只是 P2，碰撞是 P0：
-            #   · _smooth_only_up 假设"倾角越大越安全" → 凹槽里恰好相反；
-            #   · az_row 为了"倾斜方向不逐点跳"统一整行方位 → 个别点被统一的方位顶进工件。
+            # ---- 平滑回退：只回退硬约束，不再"差一点就回退"
+            # 用户现场口径：有凸点没关系，只要不碰撞就以平滑为主。
+            #   · 平滑位姿满足硬约束（IK / 自碰撞 / 间隙≥hard_clearance / 关节不超限）
+            #     → 保留平滑，哪怕间隙比本点最优小几毫米；
+            #   · 只有硬约束被破坏，且本点最优更安全时，才退回本点最优。
             # 实测（complex idx 3163）：本点最优 az 下间隙 -2.35mm，被整行统一成 az=30° 后
-            # 变成 -5.81mm 真穿透。所以只要平滑后的位姿比本点最优位姿更差，就退回后者，
-            # 宁可姿态跳一下（可由 tilt_jump 列看出），也不接受穿透。
-            if cached is not None and _pose_key(pr) < _pose_key(cached):
-                pr = cached
-                pr.idx = i
-                pr.reverted = True
-                reverted += 1
+            # 变成 -5.81mm 真穿透 —— 这种硬约束被破坏时必须回退。
+            if cached is not None and not _hard_ok(pr, params):
+                if _hard_ok(cached, params) or _pose_key(pr) < _pose_key(cached):
+                    pr = cached
+                    pr.idx = i
+                    pr.reverted = True
+                    reverted += 1
         pr.spray_angle_to_normal = geom.angle_between(-pr.gun, n)
         standoff_max_err = max(standoff_max_err, pr.standoff_err)
 

@@ -237,10 +237,12 @@ az_stance = atan2( u·(n×uUp), u·uUp )     u = unit((base−face) − n·((bas
 加大倾角在这里**不是变好，而是变坏**。而"只升不降"的限幅平滑隐含假设了"倾角越大越安全"，
 "整行统一倾斜方位"又让个别点被统一方位顶进工件——两处都在**拿 P0 碰撞换 P2 姿态平滑**。
 
-改法：平滑后的位姿只要比本点最优更差（自碰撞通过 / 间隙 / 关节余量逐项比较），就退回本点最优，
-记 `reverted`。代价是姿态可能跳一下，由 `TILT_JUMP`（P2）报出来。
+改法：平滑后的位姿只有低于绝对安全距离 `hardClearance`（默认 2mm）、发生碰撞/自碰撞、
+IK 失败或关节真正超限时，才退回本点最优，记 `reverted`。硬约束通过时，即使间隙比本点最优
+小几毫米也保留平滑；`safety`（默认 20mm）只做 P1 标橙告警，不再是回退阈值。
 
-效果：`complex` 由穿透 **−5.81mm** → 最小间隙 **+19.87mm**，回退 853 点。
+效果（旧严格口径）：`complex` 由穿透 **−5.81mm** → 最小间隙 **+19.87mm**，回退 853 点。
+新口径回退点数会显著减少，最小间隙可能低于 19.87mm，但不会低于硬下限。
 
 ---
 
@@ -333,7 +335,7 @@ longstripe（11558 点 / 22 万点点云）
 | big | 9761 | 60 万 | 1461 ms | 1205 ms | **735 ms** |
 | longstripe | 11558 | 22 万 | 14836 ms | **3735 ms** | 4201 ms |
 
-界面（`--safety 1`，8 线程）实测 `longstripe` 5.4 s，与命令行一致。
+界面（`--safety --hardclr 2`，8 线程）实测 `longstripe` 5.4 s，与命令行一致。
 
 > **`voxel` 的精度代价必须说清，不能只看速度。** `longstripe` 用 `voxel 3` 后连杆距离
 > 从 **−8.56mm 变成 −1.81mm**，偏乐观 6.75mm——因为它是薄壁长条件，3mm 体素会把薄结构抽稀掉。
@@ -348,6 +350,41 @@ longstripe（11558 点 / 22 万点点云）
 **一条没做（也建议先别做）的优化**：给候选倾角复用"上一档的解"当 IK 种子。实测反而慢 7%
 （13.1s → 14.2s）——DLS 会顺着那条解支收敛到**更超限**的构型，然后还得回头试其它种子。
 这类"看起来聪明"的改动必须实测，不能凭直觉。
+
+### 4.5 工具滚转连续性（2026-10-22 修复坐标系混用）
+
+枪是回转体，绕枪轴的**滚转（J6）不影响喷涂**，但机器人会真的转。本层用"上一点的工具 x 轴"
+做参考、投影到新切平面，保证滚转最小变化——这条链路里藏了一个**坐标系混用**：
+
+* `refX` 来自 `fk()`，是**基座系**；
+* `zTool`（枪轴）是**点云系**。
+
+两者直接做正交分解，等于每步把工具 x 轴额外偏转一份「基座偏航」，并且**逐点累加**。
+表现是手腕绕枪轴匀速自旋、直到拧到 J6 限位：
+
+| 样本 | 自动基座偏航 | 修复前 喷涂段内关节步长 | 修复后 |
+|---|---|---|---|
+| `tray` / `panel` / `synth` / `big` | 0° | 0.50~0.54° | 0.50~0.54°（**一字不差**） |
+| `zhe` | 非 0 | 2.51° | **0.44°** |
+| `complex` | 18.08° | **17.11°**（J6 −17.6°/点，撞 J6 限位） | **0.47°** |
+| `curved` | 非 0 | **178.55°**（每点 180° 翻腕） | **0.69°** |
+| `longstripe` | 非 0 | **178.44°** | **0.60°** |
+
+「基座偏航为 0 的样本一字不差、非 0 的样本按偏航角量级自旋」正是坐标系混用的判据——
+这也是这次能一次定位的原因：先看**哪些样本正常**，再看它们与异常样本的差别（基座偏航）。
+
+修复：`Evaluator` 增加 `toCloudR()`，投影前把 `refX` 从基座系转到点云系（一行改动）。
+连带收益（同一条轨迹）：
+
+* `complex` 倾角最大从 **50.0° → 20.0°**（自旋把 IK 逼进需要额外抬倾角的构型），
+  `JOINT_LIMIT 1 / SPRAY_ANGLE 3 / TILT_JUMP 6` 全部归零；
+* `longstripe` 的 **IK_FAIL 55 → 0**（P0 只剩真实连杆穿透 `LINK_HIT 20`）。
+
+**已知残留（未见修复，留档）**：界面路径的 `complex` 在 idx 2696→2697 有一处行反转点，
+J6 单点翻转 **177°**（该处同时换了面，法向突变使"上一点参考"退化）。命令行同一条轨迹
+（`spray_safety` 重算）最大只有 7.05°，说明它是对输入极敏感的单点分支选择问题，
+不是普遍现象。下一轮若要彻底解决，应在"参考向量与当前枪轴接近平行/反向"时显式重锚，
+而不是继续沿用上一点参考。
 
 ---
 
@@ -442,7 +479,9 @@ self_gap_mm, margin_deg, standoff_err_mm, lifted_mm, cond, reverted, J1_deg..J6_
 
 ```csharp
 var sp = Native.robot_safety_default_params();
-sp.standoff = 100; sp.safety = 20; sp.toolLen = 150;
+sp.standoff = 100; sp.toolLen = 150; sp.search = 120;
+sp.safety = 20;        // P1 间隙告警阈值（软约束，标橙但不回退）
+sp.hardClearance = 2;  // 绝对安全距离/回退硬下限（硬约束，低于它才回退；0=只要不穿透）
 var rs = Native.robot_safety_check(pts, pts.Length, cloudXyz, cloudXyz.Length / 3, null, ref sp);
 try {
     // rs.points / rs.byRule / rs.minClearanceMm …
@@ -479,20 +518,24 @@ try {
 命令行（无人值守验收 / 截图取证）：
 
 ```bash
-SprayTrajViewer.exe --ply xxx.ply --auto --safety 1 --tab 1 --view iso \
+SprayTrajViewer.exe --ply xxx.ply --auto --safety --hardclr 2 --tab 1 --view iso \
     --shot 3d.png --shot-win win.png --export-fixed safe.csv --exit
 ```
 
 `--safety` 不给就完全不调安全层，行为与以前一模一样（实测日志里 0 条 `SAFETY`）。
 `--shot` 只截 3D 视图，`--shot-win` 截整窗（含结论卡）。
 
-**已验证**（截图在 `wpf_shots/`，日志见 `%TEMP%\SprayTrajViewer.log`）：
+**已验证**（截图在 `wpf_shots/`，日志见 `%TEMP%\SprayTrajViewer.log`）。
+下表是旧“严格回退”口径的历史验收记录；新口径（`hardClearance=2mm`）只回退硬约束，
+`complex` 实测回退 **0 点**、最小间隙 **16.76mm**，结论仍为 PASS WITH WARNINGS。
+（早前记录的 5.67mm 是**工具滚转坐标系混用 bug** 未修时的读数——手腕被逐点拧转，
+把喷距/姿态带偏了；修掉之后同一条轨迹回到 16.76mm，见「4.5 工具滚转连续性」。）
 
 | 样本 | 结论 | 关键数字 | 耗时 | 截图 |
 |---|---|---|---|---|
 | `tray` | PASS | 1323/1323 · 枪体 54.87mm · 连杆 77.01mm · 喷角 4.3/29.2/29.2° | 174 ms | `tray_pass.png` / `tray_pass_safety_tab.png` |
 | `big` | PASS WITH WARNINGS | 9761/9761 · 枪体 47.14mm · **连杆 J3-J4 29.68mm** · 关节 11 | 1.2 s | `big_link_bottleneck.png` |
-| `complex` | PASS WITH WARNINGS | 4989/4989 · 枪体 19.87mm · 连杆 77.01mm · 喷角 14.2/45/60° · 回退 852 | 880 ms | `complex_warnings.png` |
+| `complex`（旧严格口径） | PASS WITH WARNINGS | 4989/4989 · 枪体 19.87mm · 连杆 77.01mm · 喷角 14.2/45/60° · 回退 852 | 880 ms | `complex_warnings.png` |
 | `longstripe` | REJECT | 11522/11558 · **枪体 20.09mm（安全）/ 连杆 J3-J4 −7.24mm（穿透）** · P0=57 | 3.6 s（22 万点，8 线程） | `longstripe_azstance.png` |
 
 `big` 与 `longstripe` 这两张是这次改动的直接证据：**枪体和连杆分开之后，问题从"最小距离不够"

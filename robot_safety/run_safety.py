@@ -52,7 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cloud", required=True, help="工件点云 PLY（原始扫描点云，越大越准）")
     ap.add_argument("--out-dir", default="robot_safety_out", help="输出目录")
     ap.add_argument("--standoff", type=float, default=100.0, help="喷距 mm（必须与生成轨迹时一致）")
-    ap.add_argument("--safety", type=float, default=20.0, help="安全距离 mm")
+    ap.add_argument("--safety", type=float, default=20.0, help="间隙告警阈值 mm（P1，软约束）")
+    ap.add_argument("--hard-clearance", type=float, default=2.0,
+                    help="绝对安全距离/回退硬下限 mm（默认 2；0=只要不穿透）")
     ap.add_argument("--search", type=float, default=120.0, help="碰撞判定带 mm（默认 120，与 DensoArmKine 一致）")
     ap.add_argument("--tilt-nonup", type=float, default=20.0, help="非朝上面的基准倾角（度）")
     ap.add_argument("--up-threshold", type=float, default=45.0, help="法向偏离竖直多少度算「非朝上」")
@@ -89,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     p = planner.Params(
         standoff=args.standoff,
         safety=args.safety,
+        hard_clearance=args.hard_clearance,
         search=args.search,
         tilt_nonup_deg=0.0 if args.no_tilt else args.tilt_nonup,
         up_threshold_deg=args.up_threshold,
@@ -166,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
           f"p95 {res.stats['tilt_p95_deg']:.1f}° 最大 {res.stats['tilt_max_deg']:.1f}° · "
           f"喷距偏差 {res.stats['standoff_max_err_mm']:.6f}mm")
     if res.stats.get("pose_reverted"):
-        print(f"⚠ 平滑回退 {res.stats['pose_reverted']} 点（平滑会使这些点间隙变差，已退回本点最优位姿）")
+        print(f"⚠ 平滑回退 {res.stats['pose_reverted']} 点（仅硬约束被破坏：碰撞/自碰撞/关节超限/间隙低于 "
+              f"{p.hard_clearance:.1f}mm）")
     print(f"输出：{args.out_dir}\\trajectory_checked.csv / verdict.json / report.md / report.png")
     print(f"耗时 {dt:.1f}s")
     print("═" * 62)
