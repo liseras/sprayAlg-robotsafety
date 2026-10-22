@@ -44,3 +44,6 @@ cpp/_regress/_*
 # 现场点云转出来的 ascii 副本（用 ply2ascii.py 随时重生成，不入库）
 cpp/_regress/ubox.ply
 cpp/_regress/ubox4.ply
+
+# 仓库外的一次性探针脚本（内有密钥等敏感信息，与算法无关，永不入库）
+/_probe/
