@@ -1969,8 +1969,12 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
                     bad.selfGap = std::numeric_limits<double>::quiet_NaN();
                     bad.ikOk = false;
-                    bad.pos = t.pos[i];
-                    bad.gun = t.gun[i];
+                    // 位置写「本该倾斜到的 TCP」= face + d·standoff，不写原始未倾斜点。
+                    // 写成 t.pos[i] 会与相邻的倾斜点差 2·standoff·sin(tilt/2)（60° 时
+                    // 整整 100mm），一条轨迹被拆成「倾斜壳」和「原始壳」两套，画出来
+                    // 全是长刺，落盘执行时也是一串不可插补的突跳。
+                    bad.pos = face + d * p.standoff;
+                    bad.gun = -d;
                     bad.viol = RS_VIOL_IK_FAIL;
                     results[i] = bad;
                     hasResult[i] = 1;
