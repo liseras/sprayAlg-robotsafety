@@ -1,8 +1,19 @@
 # 机器人安全 · 分支交接说明
 
-> 分支：`robot-safety`（从 `master@3b0c059` 拉出）
+> 分支：`robot-safety`（从 `master@3b0c059` 拉出；2026-10-22 合并 `master@33ee166`）
 > 建立时间：2026-10-20 10:45
-> **当前状态：只有这份文档，没有任何代码改动。** 用户明确要求"先不需要改"。
+> **当前状态：安全层已实现（`robot_safety` + `spray_safety` + WPF 安全页签），并已合并 master 最新喷涂算法。**
+
+---
+
+## 0.1 2026-10-22 算法合并记录
+
+- 合并 `master@33ee166`，并覆盖为 master 工作区最新版 `spray_traj.cpp`（KD 树面标签剪枝 + `nearestWithin` 性能优化）。
+- ABI 变化：plane 槽位 8→16；`Params` 新增 `gunClear` / `edgeExtend` / `edgeExtendAcross` / `shellThick`，`sizeof(Params)=128`（Plane=18664，Point=64，Result=298744）。
+- WPF：保留双页签与安全评估 UI，并入新增 4 个参数输入和面级法向清单表。
+- 回归与 master 基线一致：tray 2 面/1356 点/rms 5.104、complex 5 面/3994 点/rms 9.182、curved 3 面/2490 点/rms 5.374。
+- 安全评估抽样：tray 可达 1356/1356、最小间隙 54.91mm；curved 最小间隙 20.34mm（P1 45 条）。
+- 冲突只在 `wpf/SprayTrajViewer/MainWindow.xaml`：按"保留当前安全 UI + 并入 master 新控件"解决，`CMakeLists.txt` 保留 `spray_safety` 目标。
 
 ---
 
