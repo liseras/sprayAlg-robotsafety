@@ -4746,8 +4746,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             // 工艺上侧壁本来就是水平往复：喷枪沿水平走，靠升降换行，重力方向的重叠
             // 更均匀。所以只要面法向接近水平（竖直面），行方向就锁到面内水平方向
             // （= Z × n），与面的长短边无关；scanDirMode=2 时再转 90°（竖直往复）。
+            //
+            // **只对真·竖直面生效**（|n.z| < 0.3，即与竖直方向夹角 >72°）。斜面
+            // （曲型板工件那个 52° 斜面，n.z=0.61）的长边本来沿坡向，硬锁"水平"会
+            // 把行切成一小段一小段：实测该面 4 行 300mm 的长行变成 13 行 ~90mm 的
+            // 短行，总行数 18→27，轨迹反而更碎。斜面仍按最小外接矩形长边走。
             bool forcedHoriz = false;
-            if(std::fabs(pl.n.z) < 0.7){
+            if(std::fabs(pl.n.z) < 0.3){
                 Vec3 hz = cross(Vec3{0.0,0.0,1.0}, pl.n);
                 const double hl = len(hz);
                 if(hl > 1e-9){

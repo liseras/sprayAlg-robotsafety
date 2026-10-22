@@ -7,14 +7,19 @@
     python regress_run.py --only box      # 只跑名字含 box 的用例
     python regress_run.py --no-clear      # 跳过安全距离复算（快）
 
-每个用例测四项指标：
+每个用例测六项指标：
     faces   面级清单面数（几何理解是否变化）
     rows    轨迹行数（布行策略是否变化）
     points  轨迹点数（采样密度是否变化）
     minP    枪位到工件点云的最小距离（点级）
     minS    轨迹折线中段到工件的最小距离（穿模的直接指标）
+    rowLen  喷涂段内直线行的平均长度 / 行数（轨迹"碎不碎"的直接指标）
 
 后两项直接调用 traj_clear_scan 的测距内核，与人工体检口径完全一致。
+rowLen/nRow 专治"行被切碎"：行数涨而平均行长跌，说明布行方向选错了
+（曲型板工件的 52° 斜面被误锁成水平往复，4 行 300mm 变成 13 行 90mm，
+总行数 18→27，三维里看着就是一团碎线——这类回归只比 rows 会被当成
+"方向变化"而放过去，必须比行数与行长两项）。
 """
 import os
 import re
@@ -40,6 +45,7 @@ CASES = [
     ("cao",       "cao.ply",       "-flat 40",                                              20.0, "槽形件"),
     ("complex",   "complex.ply",   "-flat 40",                                              20.0, "高复杂度件"),
     ("curved",    "curved.ply",    "-flat 40",                                              20.0, "曲面件"),
+    ("curved_user", "ucurved.ply", "-flat 40",                                              20.0, "曲型板工件（用户桌面原件，需 ply2ascii.py 转换）"),
     ("longstripe","longstripe.ply","-flat 40",                                              20.0, "长条面"),
     ("zhe",       "zhe.ply",       "-flat 40",                                              20.0, "折弯件"),
     ("tray",      "tray.ply",      "-flat 40",                                              20.0, "托盘"),
@@ -54,6 +60,47 @@ CASES = [
 # 允许波动
 TOL_POINTS_PCT = 1.0      # 点数 ±1%
 TOL_CLEAR_MM = 0.5        # 最小净空允许下降 0.5mm
+
+
+def frag_stats(csv, min_len=30.0):
+    """把喷涂段拆成直线行，统计"轨迹碎不碎"。
+
+    返回 (行数, 平均行长, 最短行)。行 = 喷涂段内方向基本不变的直线段，
+    长度 >= min_len 才算一行（更短的是换行连接弧，不算行）。
+    """
+    G, sp = read_traj(csv)
+    lens = []
+    i = 0
+    n = len(G)
+    while i < n:
+        if sp[i] != 1:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and sp[j + 1] == 1:
+            j += 1
+        # [i, j] 是一段连续喷涂
+        if j - i >= 2:
+            P = G[i:j + 1]
+            d = P[1:] - P[:-1]
+            L = np.linalg.norm(d, axis=1)
+            L[L < 1e-9] = 1e-9
+            u = d / L[:, None]
+            # 方向突变点切分
+            brk = [0]
+            for k in range(1, len(u)):
+                if float(np.dot(u[k], u[k - 1])) < 0.866:      # >30° 转角
+                    brk.append(k)
+            brk.append(len(P) - 1)
+            for a, b in zip(brk[:-1], brk[1:]):
+                seg = P[a:b + 1]
+                sl = float(np.linalg.norm(seg[-1] - seg[0]))
+                if sl >= min_len:
+                    lens.append(sl)
+        i = j + 1
+    if not lens:
+        return 0, 0.0, 0.0
+    return len(lens), round(float(np.mean(lens)), 1), round(float(np.min(lens)), 1)
 
 
 def run_case(name, ply, args, clear):
@@ -80,6 +127,14 @@ def run_case(name, ply, args, clear):
 
     r = {"faces": faces, "rows": rows, "points": pts, "rms": round(rms, 3),
          "sec": round(dt, 1), "n_lift": n_lift}
+
+    try:
+        nf, fl, fmin = frag_stats(csv)
+        r["nRow"] = nf
+        r["rowLen"] = fl
+        r["rowLenMin"] = fmin
+    except Exception as e:                                  # noqa: BLE001
+        r["frag_err"] = str(e)
 
     if clear > 0:
         Q = read_ply(ply_path)
@@ -128,6 +183,16 @@ def cmp(old, new):
             probs.append("%s %.2f→%.2f (%.2f)" % (k, old[k], new[k], d))
         elif d > tol:
             notes.append("%s %.2f→%.2f (+%.2f)" % (k, old[k], new[k], d))
+    # ---- 碎片化：面数没变，但行变多、行变短 → 布行方向选错 ----
+    if old.get("faces") == new.get("faces") and old.get("nRow") and new.get("nRow"):
+        dr = 100.0 * (new["nRow"] - old["nRow"]) / old["nRow"]
+        dl = 100.0 * (new["rowLen"] - old["rowLen"]) / max(old["rowLen"], 1e-6)
+        if dr > 25.0 and dl < -20.0:
+            probs.append("碎片化 行数%d→%d (+%.0f%%) 行长%.0f→%.0f (%.0f%%)"
+                         % (old["nRow"], new["nRow"], dr, old["rowLen"], new["rowLen"], dl))
+        elif abs(dr) > 25.0 or abs(dl) > 25.0:
+            notes.append("行数%d→%d (%+.0f%%) 行长%.0f→%.0f (%+.0f%%)"
+                         % (old["nRow"], new["nRow"], dr, old["rowLen"], new["rowLen"], dl))
     return bool(probs), probs + notes
 
 
@@ -146,10 +211,10 @@ def main():
         baseline = json.load(open(BASE, encoding="utf-8"))
 
     res, nreg = {}, 0
-    print("=" * 100)
-    print("%-11s %5s %5s %7s %7s %7s %7s %6s  %s"
-          % ("用例", "面", "行", "点数", "minP", "minS", "耗时s", "绕行", "结论"))
-    print("-" * 100)
+    print("=" * 116)
+    print("%-11s %5s %5s %7s %7s %7s %7s %6s %6s %7s  %s"
+          % ("用例", "面", "行", "点数", "minP", "minS", "耗时s", "绕行", "行数", "行均长", "结论"))
+    print("-" * 116)
     for name, ply, args, clear, desc in CASES:
         if only and only not in name:
             continue
@@ -169,11 +234,11 @@ def main():
                 nreg += 1
         if "skip" in r:
             verdict = "跳过 " + r["skip"]
-        print("%-11s %5s %5s %7s %7s %7s %7s %6s  %s"
+        print("%-11s %5s %5s %7s %7s %7s %7s %6s %6s %7s  %s"
               % (name,
                  r.get("faces", "-"), r.get("rows", "-"), r.get("points", "-"),
                  r.get("minP", "-"), r.get("minS", "-"), r.get("sec", "-"),
-                 r.get("n_lift", "-"), verdict))
+                 r.get("n_lift", "-"), r.get("nRow", "-"), r.get("rowLen", "-"), verdict))
         if "fail" in r:
             print("  !! %s" % r["fail"])
             print("  " + (r.get("log", "") or "").replace("\n", "\n  ")[-900:])

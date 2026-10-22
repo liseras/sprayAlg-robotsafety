@@ -91,10 +91,11 @@ def main():
                     k = (yy * W + xx) * 3
                     pix[k], pix[k + 1], pix[k + 2] = r, g, b
 
-    step = max(1, len(cloud) // 40000)
-    for p in cloud[::step]:
-        x, y = to_px(p)
-        dot(x, y, 70, 70, 78)
+    if "--no-cloud" not in sys.argv:
+        step = max(1, len(cloud) // 40000)
+        for p in cloud[::step]:
+            x, y = to_px(p)
+            dot(x, y, 70, 70, 78)
     for p in traj:
         x, y = to_px(p)
         if p[3] == 1:
