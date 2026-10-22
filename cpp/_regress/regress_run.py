@@ -111,7 +111,7 @@ def run_case(name, ply, args, clear):
     oply = os.path.join(OUT, name + ".ply")
     t0 = time.time()
     cp = subprocess.run([EXE, ply_path, csv, oply] + args.split(),
-                        capture_output=True, text=True, errors="ignore", cwd=HERE)
+                        capture_output=True, text=True, encoding="utf-8", errors="ignore", cwd=HERE)
     dt = time.time() - t0
     log = cp.stdout + cp.stderr
 

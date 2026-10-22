@@ -748,10 +748,16 @@ static bool detect_ring_uv(const std::vector<Vec2>& uv, double L,
     return ringish;
 }
 
+// 重建/分割专用的几何尺度（mm），与工艺参数 scanRowSpacing 完全解耦。
+// 为什么不能用行距：行距是"布行"参数，同一份点云可以填 12/20/60，重建结果
+// 必须完全一致。现场点云实测线间距仅 1~8mm（KNN 估计），12mm 是历史默认
+// 重建尺度，对稀疏边缘仍有余量，同时尽量保持既有回归基线。
+static constexpr double kReconGap = 12.0;
+
 // 由面内点集重建规则三角网格（局部 uv 坐标，mm）。
-//   rowGap   扫描线间距（跨线空隙要用闭运算桥接，否则每行独立成条）
+//   reconGap 重建几何尺度（不是工艺行距；跨线空隙用闭运算桥接，否则每行独立成条）
 //   fillHole 孔洞填补阈值：连通孔洞的外接跨距 <= 此值 → 填实（覆盖重建）
-static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double fillHole,
+static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, double fillHole,
                              std::vector<Vec2>& outVerts, std::vector<int>& outTris,
                              int maxVerts, int maxTris,
                              std::vector<char>* keepMask = nullptr,
@@ -781,7 +787,7 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double 
     // 2) 形态学闭运算：先膨胀再腐蚀，核半径按扫描线间距取
     //    （线扫点云沿行进方向很密、跨行很疏，不做闭运算每行都是一条独立细条）
     {
-        int rr=(int)std::ceil(std::max(rowGap,1.0)/(2.0*cs))+1;
+        int rr=(int)std::ceil(std::max(reconGap,1.0)/(2.0*cs))+1;
         rr=std::min(rr,6);
         auto dilate=[&](std::vector<unsigned char>& g, int r){
             std::vector<unsigned char> t(g.size(),0), o(g.size(),0);
@@ -948,15 +954,15 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double 
             if(dbg) fprintf(stderr, "[mesh]     -> 碎块丢弃(占主环 %.0f%%)\n", std::fabs(a0)/maxLoopArea*100.0);
             continue;
         }
-        // 直线简化的容差取"扫描线间距量级"：线扫点云边界天然是"梳齿"状
-        // （每行末端位置不同，齿深约等于行距），容差小于行距就会把梳齿保留
-        // 下来，看起来像锯子。取 max(2×cell, 1.5×行距) 把梳齿抹成直边。
-        std::vector<Vec2> s = simplifyClosed(lp, std::max(2.0*cs, 1.5*rowGap));
+        // 直线简化的容差取"重建几何尺度"：线扫点云边界天然是"梳齿"状
+        // （每行末端位置不同，齿深约等于扫描线间距），容差小于齿深就会把梳齿保留
+        // 下来，看起来像锯子。取 max(2×cell, 1.5×重建尺度) 把梳齿抹成直边。
+        std::vector<Vec2> s = simplifyClosed(lp, std::max(2.0*cs, 1.5*reconGap));
         double a=polyArea2(s);
         if(std::fabs(a)<1e-6) continue;
 
         // 凸包规整：相邻面在折棱处会互相混入几个点，在轮廓上咬出浅缺口。
-        // 只有当"轮廓相对凸包的最大凹陷深度 <= max(孔洞填补阈值, 2.5×行距)"时
+        // 只有当"轮廓相对凸包的最大凹陷深度 <= max(孔洞填补阈值, 5×重建尺度)"时
         // 才用凸包拉平——即只抹平噪声咬边；真实缺口/凹槽（如长板宽板的中间
         // 残缺，深达 100mm）保留原轮廓，不会被"填成矩形"。
         {
@@ -976,10 +982,10 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double 
                     }
                     maxDev = std::max(maxDev, dmin);
                 }
-                // 容差取 max(5×行距, 孔洞填补阈值)：行距决定了"扫描线间混入"的
+                // 容差取 max(5×重建尺度, 孔洞填补阈值)：重建尺度决定了"扫描线间混入"的
                 // 量级，边界的浅缺口都在这个尺度内；真实大缺口（长板宽板的中间
                 // 残缺，深 100mm）超出容差，仍然保留原轮廓。
-                double devTol = std::max(5.0*rowGap, fillHole);
+                double devTol = std::max(5.0*reconGap, fillHole);
                 if(std::fabs(ha)>1e-9 && maxDev <= devTol && std::fabs(a)/std::fabs(ha) >= 0.80){
                     if((a>0)!=(ha>0)) std::reverse(hull.begin(), hull.end());
                     s = hull;
@@ -1017,7 +1023,7 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double 
     // 边界追踪出来是一条 4~8mm 的细带 + 若干孤立点，重建覆盖只有外接矩形的 40%。
     // 但工件本身是连续的（只是扫描缺陷），工程上必须按条带补齐，否则那段没有面、
     // 也就没有轨迹。判据三条同时满足才补：
-    //   a) 短向跨度 <= 4×行距（确实是"窄条"，不是大平面；大平面的大缺口必须保留）
+    //   a) 短向跨度 <= 4×重建尺度（确实是"窄条"，不是大平面；大平面的大缺口必须保留）
     //   b) 重建覆盖 < 65%（确实缺得厉害）
     //   c) 长向跨度 > 2×短向（是条带而非小碎块）
     {
@@ -1041,7 +1047,7 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double rowGap, double 
         for(auto& o : outers) recon += std::fabs(polyArea2(o));
         for(auto& h : holes)  recon -= std::fabs(polyArea2(h));
         double box = wU*wV;
-        if(wShort > 4.0 && wShort <= 4.0*rowGap && box > 1.0 && wLong > 2.0*wShort
+        if(wShort > 4.0 && wShort <= 4.0*reconGap && box > 1.0 && wLong > 2.0*wShort
            && recon/box < 0.65){
             std::vector<Vec2> rect = {
                 {u0,v0},{u1,v0},{u1,v1},{u0,v1}
@@ -2892,6 +2898,48 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
         if(std::getenv("SPRAYTRAJ_DUMP"))
             fprintf(stderr,"[曲面dbg] 跨行姿态一致化: 行点 %d/%d 被统一\n", rep, (int)sp.rowP.size());
     }
+
+    // ---- 剔除"卷边行"：行内法向翻转 >90° ----
+    // 曲型板薄壁的圆角边缘处，iso 线会顺着卷边绕到板的另一侧，同一行里前半段
+    // 法向朝正面、后半段朝背面。这样的行不能按"一行一个姿态"喷：
+    // 相邻两点法向几乎相反，枪位会从面的一侧瞬移到另一侧（实测 100mm 离面时
+    // 跨 195mm），而这两点又都在 spray=1 的同一行里，中间没有任何空移点，
+    // 折线直接穿过工件（实测折线中段最小净空 0.09mm）。
+    // 判据用相邻法向点积 <0（>90°）：正常行逐点转角 <3°（实测），余量充足。
+    // 整行剔除而不是拆分：拆出来的短段仍贴着卷边背面，喷它没有工艺意义，
+    // 保留只会让枪绕到板背面。行距 20/60 时该行本来就不存在（iso 线离边缘更远），
+    // 所以剔除它与"行距只影响布行"的预期一致。
+    {
+        std::vector<Vec3> rp, rn;
+        std::vector<int> rb;
+        rp.reserve(sp.rowP.size()); rn.reserve(sp.rowN.size());
+        rb.reserve(sp.rowBeg.size()); rb.push_back(0);
+        int dropped = 0;
+        std::vector<double> dropMinS;
+        for(int r=0;r<sp.nRow;++r){
+            const int b=sp.rowBeg[r], e=sp.rowBeg[r+1];
+            bool flipped = false;
+            for(int k=b+1;k<e;++k){
+                if(dot(sp.rowN[k-1], sp.rowN[k]) < 0.0){ flipped = true; break; }
+            }
+            if(flipped){
+                ++dropped;
+                dropMinS.push_back(dot(sp.rowP[b], eIdx));
+                continue;
+            }
+            rp.insert(rp.end(), sp.rowP.begin()+b, sp.rowP.begin()+e);
+            rn.insert(rn.end(), sp.rowN.begin()+b, sp.rowN.begin()+e);
+            rb.push_back((int)rp.size());
+        }
+        if(dropped){
+            fprintf(stderr, "[曲面] 剔除卷边行 %d 行（行内法向翻转 >90°，枪位会绕到板背面）：", dropped);
+            for(size_t q=0;q<dropMinS.size();++q)
+                fprintf(stderr, " s=%.1f%s", dropMinS[q], q+1<dropMinS.size()?",":"\n");
+            sp.rowP.swap(rp); sp.rowN.swap(rn); sp.rowBeg.swap(rb);
+            sp.nRow = (int)sp.rowBeg.size()-1;
+            rowsMade = sp.nRow;
+        }
+    }
     if(rowsMade < 1) return false;
 
     // 调试：SPRAYTRAJ_DUMP=1 时导出行点（含横向坐标 s = p·eIdx）与行边界。
@@ -2942,11 +2990,11 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
 //   3) 闭运算（膨胀 1 格再腐蚀 1 格）桥接扫描线间隙，否则网格中间漏缝；
 //   4) 只对"四角都占用且四角高度有效"的格发 2 个三角（CCW，法向朝外，
 //      与平面路径的绕向约定一致）；顶点/三角数在循环里逐项对照 ABI 预算保护。
-static bool build_surface_mesh(const SurfPatch& sp, double rowGap, double fillHole,
+static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fillHole,
                                std::vector<Vec3>& verts, std::vector<int>& tris,
                                int maxVerts, int maxTris)
 {
-    (void)rowGap; (void)fillHole;   // 网格分辨率改由 ABI 预算决定，不再用行距推
+    (void)reconGap; (void)fillHole;   // 网格分辨率改由 ABI 预算决定，不再用行距/重建尺度推
     const int m = (int)sp.P.size();
     if(m < 20) return false;
     std::vector<Vec2> uv(m);
@@ -3104,7 +3152,7 @@ static bool build_surface_mesh(const SurfPatch& sp, double rowGap, double fillHo
 // 原因：连通判据是"相邻点法向夹角 < 20°"。棱边两侧的点，KNN 邻域同时包含两个面，
 //       法向落在中间过渡带；这一串过渡点把 0° 的底面和 90° 的侧壁一段段接起来，
 //       于是 91.2% 的点连成一个"光滑块"，整体平面拟合 p95 自然高达 167.7mm，
-//       超过"曲面"门限（max(4*curvatureTol, 2*行距) = 24mm）而被判成曲面。
+//       超过"曲面"门限（max(4*curvatureTol, 2*重建尺度) = 40mm）而被判成曲面。
 //
 // 判据：真正的曲面没法被少数几个平面**精确**覆盖；多面体可以。
 //       用紧公差顺序 RANSAC 剥离，若 <=nmax 个平面就能覆盖 >=coverReq 的点 → 多面体。
@@ -3207,9 +3255,12 @@ static bool ransac_one_plane(const std::vector<Vec3>& P, const std::vector<int>&
 //     的曲面会被种子法向切成几块（这正是原来被硬切成 8 个平面的原因）；
 //   * 平整判据用整体平面拟合的 p95 残差。实测 10 个样本里只有曲型板
 //     p95=72.9mm，其余最大 16.5mm（complex），所以门限取
-//     max(4*curvatureTol, 2*行距) 有 4 倍以上余量，不会误伤其他工件。
+//     max(4*curvatureTol, 2*重建尺度) 有 4 倍以上余量，不会误伤其他工件。
+//   * reconGap 是重建几何尺度，**不是工艺行距**。以前这里传 scanRowSpacing，
+//     行距 60 时门限被抬到 120mm，曲型板 p95=74 反而被判成"平"的，
+//     整块板被拆成十几个小平面——重建结果随布行参数变化。
 static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& cn,
-                               const Vec3& partC, double curvatureTol, double rowSpacing,
+                               const Vec3& partC, double curvatureTol, double reconGap,
                                SurfPatch& sp, std::vector<int>& outInl)
 {
     const int n = (int)P.size();
@@ -3251,7 +3302,7 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
     Vec3 nf, cf;
     if(!ls_plane(P, outInl, nf, cf)) return false;
     nf = norm(nf);
-    const double thr = std::max(4.0*curvatureTol, 2.0*rowSpacing);
+    const double thr = std::max(4.0*curvatureTol, 2.0*reconGap);
     {
         std::vector<double> ds; ds.reserve(outInl.size());
         for(int i : outInl) ds.push_back(std::fabs(dot(P[i]-cf, nf)));
@@ -3266,10 +3317,10 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
 
     // ---- 多平面件排除：能拆成几个精确平面 → 不是曲面，退回平面分割 ----
     {
-        // 公差取 0.2×行距（11.76mm → 2.4mm）：既容得下现场点云的墙面噪声（~0.5mm），
+        // 公差取 0.2×重建尺度（12mm → 2.4mm）：既容得下现场点云的墙面噪声（~0.5mm），
         // 又远小于"浅曲面被切成薄带"的厚度，避免把 sag 30mm 级的缓曲面误判成多面体
         // （sag 30mm 的板在 2.4mm 带宽下要 12 个平面才铺满，nmax=8 只够盖 ~75%）。
-        const double tolPl = std::min(3.0, std::max(1.5, 0.20*rowSpacing));
+        const double tolPl = std::min(3.0, std::max(1.5, 0.20*reconGap));
         int np = 0; double cov = 0.0;
         std::vector<Vec3> pn;                       // 各剥离平面的法向
         bool poly = patch_is_polyhedral(P, outInl, 8, tolPl, 0.93, np, cov, &pn);
@@ -3315,11 +3366,14 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
     //   垃圾桶：底面 2700 点/箱 vs 锥面 ~36 点/箱；曲型板：~150 点/箱、占 1.7%。
     // 两条判据同时满足才剥：
     //   ① 峰值箱 ±tol 的点占块 ≥ 5%；
-    //   ② 这些点在垂直于 nf 的平面上最小宽度 ≥ 3×行距 —— 排除弯曲板被 2.4mm
+    //   ② 这些点在垂直于 nf 的平面上最小宽度 ≥ 3×重建尺度 —— 排除弯曲板被 2.4mm
     //      薄层切出的窄条（曲型板实测宽度只有 4~5mm）。
     // 循环最多 3 轮：一个件可能同时有顶部唇边和底面两个平盘。
     for(int pass=0; pass<3; ++pass){
-        const double tolPl = std::min(3.0, std::max(1.5, 0.20*rowSpacing));
+        // 公差固定 3.0mm：曲型板的两个平盘（侧板）只有在这个公差下才会被完整
+        // 剥出来；退回 2.4mm 时剥不干净，整块板会被当成一个曲面块，侧板丢失。
+        // 该值只描述"平盘/曲面"的几何分界，与工艺行距无关。
+        const double tolPl = 3.0;
         {   // 每轮用"剩下这些点"重拟合法向，第二个盘才不会被第一个盘带偏
             Vec3 nf2, cf2;
             if(outInl.size() >= 200 && ls_plane(P, outInl, nf2, cf2)){
@@ -3367,7 +3421,7 @@ static bool detect_curved_patch(const std::vector<Vec3>& P, const CloudNormals& 
             wmin = 4.0*std::sqrt(std::max(0.0, lm));
         }
         const bool big  = (share2 >= 0.05);
-        const bool wide = (wmin >= 3.0*rowSpacing);
+        const bool wide = (wmin >= 3.0*reconGap);
         if(big && wide){
             fprintf(stderr, "[曲面] 剥离块内平盘[%d]: %zu 点(%.1f%%) 沿nf高度=%.1fmm 宽%.1fmm\n",
                     pass, pin.size(), share2*100.0, hc0, wmin);
@@ -3473,6 +3527,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     std::vector<Vec3> P(n);
     for(int i=0;i<n;++i) P[i]={xyz[i*3],xyz[i*3+1],xyz[i*3+2]};
     res.input_points=n;
+    fprintf(stderr, "[参数] 工艺行距=%.2fmm（只用于布行） 重建几何尺度=%.1fmm（固定，与工艺行距解耦）\n",
+            params->scanRowSpacing, kReconGap);
 
     double tSor=0, tSplit=0, tMesh=0, tTraj=0;
     // 1. 去噪
@@ -3513,7 +3569,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
         std::vector<int> curvedInl;
         isCurved = detect_curved_patch(Pf, cn, partC, params->curvatureTol,
-                                       params->scanRowSpacing, surf, curvedInl);
+                                       kReconGap, surf, curvedInl);
         if(isCurved){
             // 剩余点单独分割（索引要映射回 Pf）
             std::vector<char> isCurvedPt(Pf.size(), 0);
@@ -3983,7 +4039,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             {
                 ProfStage ps("3.曲面重建", &tMesh);
                 if(!surf.modelOk) build_surf_model(surf, 0.0);
-                okMesh = build_surface_mesh(surf, params->scanRowSpacing, params->fillHoleSize,
+                okMesh = build_surface_mesh(surf, kReconGap, params->fillHoleSize,
                                             verts3, tris,
                                             SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
                                             SPRAYTRAJ_PLANE_MAX_POLY_TRIS);
@@ -4037,17 +4093,17 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             bool okMesh = false;
             {
                 ProfStage ps("3.轮廓重建", &tMesh);
-                // 环形窄面：重建格距必须能分辨环宽。默认格距 = 行距，行距调到 30mm
-                // 时格距 30 > 环宽 32 的一半，开运算把整圈削成几段弧，内点被剔掉
+                // 环形窄面：重建尺度必须能分辨环宽。若用工艺行距，行距调到 30mm
+                // 时尺度 30 > 环宽 32 的一半，开运算把整圈削成几段弧，内点被剔掉
                 // 一半（6977→3653），轨迹只能盖住 250° 的环。
-                double cellMesh = params->scanRowSpacing;
+                double cellMesh = kReconGap;
                 {
                     Vec2 rc; double rin=0, rout=0, rw=0; int ns=0;
-                    if(detect_ring_uv(uv, params->scanRowSpacing, rc, rin, rout, &rw, &ns)){
-                        cellMesh = std::min(params->scanRowSpacing,
+                    if(detect_ring_uv(uv, kReconGap, rc, rin, rout, &rw, &ns)){
+                        cellMesh = std::min(kReconGap,
                                             std::max(1.5, rw/6.0));
-                        fprintf(stderr, "[重建] 面片%zu 环形(内径%.1f 外径%.1f 宽%.1f 方位%d/36): 重建格距 %.1fmm (原 %.1f)\n",
-                                i, rin, rout, rw, ns, cellMesh, params->scanRowSpacing);
+                        fprintf(stderr, "[重建] 面片%zu 环形(内径%.1f 外径%.1f 宽%.1f 方位%d/36): 重建格距 %.1fmm (固定尺度 %.1f)\n",
+                                i, rin, rout, rw, ns, cellMesh, kReconGap);
                     }
                 }
                 okMesh = build_plane_mesh(uv, cellMesh, params->fillHoleSize,
@@ -4299,6 +4355,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     const double zSafe = zPartMax + 1.3*params->standoff;
     Vec3 prevNormal{0,0,1};
     int transCount = 0;
+    int nGapSafe = 0;          // 曲面行间直线会穿件→改走安全空移的次数
     int nApproachFix = 0;   // 面间过渡：垂直直降会穿件、改沿法向进入的次数
     int nDropFace = 0;      // 面间过渡：没有任何可行进入路径（窄缝/深腔）、整面不喷的面数
 
@@ -4330,6 +4387,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 越过去"应有的行为，不会把正常的越顶外扩拦掉。
     struct BlkFace {
         Vec3 n, c, u, v; double u0, u1, v0, v1; int si;
+        bool curved = false;      // 曲面块的拟合平面只用于净空估计，不参与穿面判定
         // 面内占据栅格：矩形包围盒会覆盖面上的空洞（槽口、孔、环形中间的空区），
         // 把"枪从空洞里穿过去"误判成"压在面上"。5mm 一格 + 3×3 邻域容忍稀疏点。
         double cell = 5.0; int gu = 0, gv = 0;
@@ -4356,6 +4414,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         Vec3 u = norm(cross(ax, n));
         Vec3 v = cross(n, u);
         BlkFace bf{n, s.pl.c, u, v, 1e30, -1e30, 1e30, -1e30, (int)k};
+        bf.curved = s.curved;
         // 必须用全部内点求范围：抽样会漏掉面最外侧那一圈，包围盒比真实面小
         // 1~2mm，恰好把"枪位压在棱边内侧"这种最该拦的情形放过去。
         for(size_t q=0;q<s.inl.size();++q){
@@ -4400,6 +4459,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 枪在件外时，对所有内壁面都在背面（也合法）。只有"跨越"才是穿模。
     auto segCrossFace=[&](const Vec3& A, const Vec3& B)->bool{
         for(const auto& f : blkFaces){
+            if(f.curved) continue;      // 曲面/球面的拟合平面横穿自身，跨越它≠穿模；靠点云净空判
             const double da = dot(A - f.c, f.n), db = dot(B - f.c, f.n);
             if(da * db > 0.0) continue;                       // 同侧，不可能穿
             if(std::fabs(da - db) < 1e-12) continue;          // 与面平行且共面
@@ -4465,6 +4525,21 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         }
         return true;
     };
+    // 段到工件的“最小净空”打分：只用于出口/落点改道搜索（正常路段用 segClearOK 快速判）。
+    // 返回 0 表示该段穿过某个面（几何穿模），搜索时优先级最低。
+    auto segMinClear = [&](const Vec3& a, const Vec3& b)->double{
+        const double d = len(b-a);
+        const int ns = std::max(2, (int)std::ceil(d/std::max(1.0, pstep)));
+        double mn = 1e30;
+        for(int k=0;k<=ns;++k){
+            Vec3 q = a + (b-a)*((double)k/(double)ns);
+            KnnBuf kb; partTree.knn(q, 1, kb);
+            if(kb.n < 1) return 0.0;
+            mn = std::min(mn, std::sqrt(kb.d2[0]));
+            if(segCrossFace(a, q)) return 0.0;
+        }
+        return mn;
+    };
 
     for(size_t si=0; si<segs.size(); ++si){
         if(!meshOk[si]) continue;          // 轮廓都重建不出来的面，不喷
@@ -4527,21 +4602,73 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 Vec3 pos = X + nrm*params->standoff;
                 allPts.push_back({pos.x,pos.y,pos.z, -nrm.x,-nrm.y,-nrm.z, params->speed, spray});
             };
-            // 行间连接：两行端点相距约一个行距，按点距插值，短距保持喷涂不关枪
+            // 行间连接：
+            //   · 正常相邻行（枪位只挪一个行距、法向一致、直线净空足够）
+            //     → 按点距插值，短距保持喷涂不关枪；
+            //   · 其余情况（跨到远端的卷边行 / 缺口两侧）→ 关枪，沿法向退出、
+            //     抬到安全高度绕行。原来一律线性插值，曲型板实测有一段 648mm
+            //     的跨行直线从板中穿过（折线最小净空 1.7mm）；两端法向相反时
+            //     插值法向还会在中间过零，枪位直接落到工件表面（0.09mm）。
             auto emitGap=[&](const Vec3& a, const Vec3& na, const Vec3& b, const Vec3& nb){
                 double d = len(b-a);
                 if(d <= pstep*0.5) return;
-                int np = std::max(2, (int)std::ceil(d/pstep));
+                const Vec3 ga = a + na*params->standoff;
+                const Vec3 gb = b + nb*params->standoff;
                 // 关枪判据必须看**枪位行程**，不是面点跳距。
                 // 枪位 = 面点 + standoff·n，两行端点法向不同，法向旋转会把面点的大跳距
                 // 在枪位上大幅抵消：垃圾桶 L=12 时面点跳 93mm、枪位只走 13mm。
                 // 用面点跳距判会白关 8 次枪（每次都要停-关-开-加速，很费时间），
                 // 而实际喷嘴只挪了十几毫米，根本不需要断。
-                const double dg = len((b + nb*params->standoff) - (a + na*params->standoff));
-                int spray = (dg <= 3.0*L) ? 1 : 0;
-                for(int t=1;t<np;++t){
-                    double f = (double)t/(double)np;
-                    emitPt(a + (b-a)*f, na + (nb-na)*f, spray);
+                const double dg = len(gb - ga);
+                const double nd = dot(na, nb);
+                if(dg <= 3.0*L && nd > 0.5 && segClearOK(ga,gb) && !segCrossFace(ga,gb)){
+                    int np = std::max(2, (int)std::ceil(d/pstep));
+                    for(int t=1;t<np;++t){
+                        double f = (double)t/(double)np;
+                        // 法向必须归一化：两端法向夹角大时线性插值的模长 <1，
+                        // 枪位会向工件下陷（90° 夹角时只剩 0.707×standoff）。
+                        Vec3 n = norm(na*(1.0-f) + nb*f);
+                        emitPt(a + (b-a)*f, n, 1);
+                    }
+                } else {
+                    // 安全空移：沿法向退出 → 抬到工件最高点之上 → 目标上方 →
+                    // （垂直下降不干净时沿目标法向退 clear 再进）→ 目标枪位。
+                    ++nGapSafe;
+                    auto move=[&](const Vec3& p, const Vec3& nrm){
+                        allPts.push_back({p.x,p.y,p.z, -nrm.x,-nrm.y,-nrm.z, params->speed, 0});
+                    };
+                    // 出口两腿同样要查：腔宽≈clear 时，沿法向退到对面内壁再竖
+                    // 直抬枪会贴着壁顶擦过（bin 实测 0.06mm）。改道顺序：
+                    // 原地竖直 → 缩短法向退出 → 枪体安全距离，取两腿净空最大者。
+                    Vec3 L1 = ga + na*clear;
+                    const Vec3 L1top{L1.x, L1.y, zSafe};
+                    if(!segClearOK(ga, L1) || segCrossFace(ga, L1) ||
+                       !segClearOK(L1, L1top) || segCrossFace(L1, L1top)){
+                        double best = std::min(segMinClear(ga, L1), segMinClear(L1, L1top));
+                        Vec3 bestW = L1;
+                        auto considerExit=[&](const Vec3& W){
+                            const Vec3 Wtop{W.x, W.y, zSafe};
+                            double s = std::min(segMinClear(ga, W), segMinClear(W, Wtop));
+                            if(s > best){ best = s; bestW = W; }
+                        };
+                        considerExit(ga);
+                        for(double f : {0.75, 0.5, 0.25}) considerExit(ga + na*(clear*f));
+                        considerExit(ga + na*gunClearEff);
+                        L1 = bestW;
+                        if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
+                            fprintf(stderr, "[trans] 曲面空移出口改道 L1=(%.1f,%.1f,%.1f) 最小净空 %.1f\n",
+                                    L1.x,L1.y,L1.z, best);
+                    }
+                    move(L1, na);
+                    move({L1.x,L1.y,zSafe}, na);
+                    const Vec3 Top{gb.x,gb.y,zSafe};
+                    move(Top, nb);
+                    if(!segClearOK(Top,gb) || segCrossFace(Top,gb)){
+                        const Vec3 L2 = gb + nb*clear;
+                        move({L2.x,L2.y,zSafe}, nb);
+                        move(L2, nb);
+                    }
+                    move(gb, nb);
                 }
             };
 
@@ -4552,7 +4679,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 Vec3 firstPos = firstX + firstN*params->standoff;
                 if(!allPts.empty()){
                     Vec3 pEnd{allPts.back().x, allPts.back().y, allPts.back().z};
-                    if(segClearOK(pEnd, firstPos)){
+                    if(segClearOK(pEnd, firstPos) && !segCrossFace(pEnd, firstPos)){
                         // 直线全程离开件 >= moveClear，直连（不必抬到安全高度）。
                         // spray 是"段属性"（两端都为 1 才是喷涂段），所以必须在
                         // 中间插一个 spray=0 才能把线断开；插中点而不插端点，
@@ -4562,9 +4689,32 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                                           -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
                     } else {
                         Vec3 L1 = pEnd + prevNormal*clear;
+                        const Vec3 L1top{L1.x, L1.y, zSafe};
+                        if(!segClearOK(pEnd, L1) || segCrossFace(pEnd, L1) ||
+                           !segClearOK(L1, L1top) || segCrossFace(L1, L1top)){
+                            // 与曲面行间空移同样的出口改道：原地竖直 / 缩短法向退出
+                            double best = std::min(segMinClear(pEnd, L1), segMinClear(L1, L1top));
+                            Vec3 bestW = L1;
+                            auto considerExit=[&](const Vec3& W){
+                                const Vec3 Wtop{W.x, W.y, zSafe};
+                                double s = std::min(segMinClear(pEnd, W), segMinClear(W, Wtop));
+                                if(s > best){ best = s; bestW = W; }
+                            };
+                            considerExit(pEnd);
+                            for(double f : {0.75, 0.5, 0.25}) considerExit(pEnd + prevNormal*(clear*f));
+                            considerExit(pEnd + prevNormal*gunClearEff);
+                            L1 = bestW;
+                        }
                         allPts.push_back({L1.x,L1.y,L1.z, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
                         allPts.push_back({L1.x,L1.y,zSafe, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
-                        allPts.push_back({firstPos.x,firstPos.y,zSafe, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                        const Vec3 Top{firstPos.x,firstPos.y,zSafe};
+                        allPts.push_back({Top.x,Top.y,Top.z, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                        // 直降穿件时沿首点法向退 clear，再垂直降到侧上方进入
+                        if(!segClearOK(Top, firstPos) || segCrossFace(Top, firstPos)){
+                            const Vec3 L2 = firstPos + firstN*clear;
+                            allPts.push_back({L2.x,L2.y,zSafe, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                            allPts.push_back({L2.x,L2.y,L2.z, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                        }
                     }
                     ++transCount;
                 }
@@ -5216,8 +5366,37 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                             si, pEnd.x,pEnd.y,pEnd.z, pStart.x,pStart.y,pStart.z);
                 pushMove(pEnd + (pStart - pEnd)*0.5);
             } else {
+                const Vec3 Top{pStart.x, pStart.y, zSafe};
+                auto legOK=[&](const Vec3& w0, const Vec3& w1){
+                    return !segCrossFace(w0, w1) && segClearOK(w0, w1);
+                };
                 // ② 沿上一面法向退出（离开该面，不擦面）
                 Vec3 L1 = pEnd + prevNormal*clear;
+                const Vec3 L1top{L1.x, L1.y, zSafe};
+                if(!legOK(pEnd, L1) || !legOK(L1, L1top)){
+                    // 出口两条腿也必须查：腔宽与退出距离相当时，沿法向退 100mm
+                    // 恰好顶到对面内壁，再竖直抬枪就贴着壁顶擦上去（bin 实测 0.06mm）。
+                    // 先试"原地竖直抬枪"，再试缩短法向退出；取两腿最小净空最大者。
+                    double exitScore = std::min(segMinClear(pEnd, L1), segMinClear(L1, L1top));
+                    Vec3 exitW = L1;
+                    auto considerExit=[&](const Vec3& W){
+                        const Vec3 Wtop{W.x, W.y, zSafe};
+                        double s = std::min(segMinClear(pEnd, W), segMinClear(W, Wtop));
+                        if(s > exitScore){ exitScore = s; exitW = W; }
+                    };
+                    considerExit(pEnd);
+                    for(double f : {0.75, 0.5, 0.25}) considerExit(pEnd + prevNormal*(clear*f));
+                    considerExit(pEnd + prevNormal*gunClearEff);
+                    L1 = exitW;
+                    if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
+                        fprintf(stderr, "[trans] 面%zu 出口改道 L1=(%.1f,%.1f,%.1f) 最小净空 %.1f\n",
+                                si, L1.x,L1.y,L1.z, exitScore);
+                    if(exitScore < 0.9*gunClearEff){
+                        approachHopeless = true;
+                        fprintf(stderr, "[skip] 面%zu 无可行退出路径（最佳 %.1fmm < 枪体安全 %.0fmm），整面不喷\n",
+                                si, exitScore, gunClearEff);
+                    }
+                }
                 pushMove(L1);
                 // ③ 抬到全局安全高度（最高面上二者等高，不会出现"先冲高再回落"）
                 pushMove({L1.x, L1.y, zSafe});
@@ -5229,10 +5408,6 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 //    注意**两条腿都要查**：垂直腿 SideTop→Side 和进入腿 Side→pStart。
                 //    原来只查了垂直腿，complex 上进入腿沿法向走 100mm，中途擦过
                 //    一个凸台（实测最差 0.35mm，12 个点 <20mm），因为没人查。
-                const Vec3 Top{pStart.x, pStart.y, zSafe};
-                auto legOK=[&](const Vec3& w0, const Vec3& w1){
-                    return !segCrossFace(w0, w1) && segClearOK(w0, w1);
-                };
                 if(legOK(Top, pStart)){
                     pushMove(Top);
                 } else {
@@ -5240,19 +5415,6 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                     // 都不干净时取"最小净空最大"的那个 —— 宁可绕远，也不留一段 0.2mm
                     // 的擦壁直降（那是"落枪第一下就撞"）。
                     const double base = std::max(clear, gunClearEff);
-                    auto segMinClear=[&](const Vec3& w0, const Vec3& w1)->double{
-                        const double d = len(w1-w0);
-                        const int ns = std::max(2, (int)std::ceil(d/std::max(1.0, pstep)));
-                        double mn = 1e30;
-                        for(int k=0;k<=ns;++k){
-                            Vec3 q = w0 + (w1-w0)*((double)k/(double)ns);
-                            KnnBuf kb; partTree.knn(q, 1, kb);
-                            if(kb.n < 1) return 0.0;
-                            mn = std::min(mn, std::sqrt(kb.d2[0]));
-                            if(segCrossFace(w0, q)) return 0.0;
-                        }
-                        return mn;
-                    };
                     Vec3 bestW = Top; double bestScore = -1.0;
                     auto consider=[&](const Vec3& W){
                         const Vec3 Wtop{W.x, W.y, zSafe};
@@ -5302,6 +5464,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, t2.spray});
         }
     }
+    if(nGapSafe)
+        fprintf(stderr, "[traj] 曲面行间安全空移: %d 处（直线会穿件，spray=0）\n", nGapSafe);
     if(transCount)
         fprintf(stderr, "[traj] 面间过渡: %d 处，安全高度 z=%.1f（工件最高 %.1f）",
                 transCount, zSafe, zPartMax);
