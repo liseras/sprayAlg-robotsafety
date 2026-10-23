@@ -981,8 +981,8 @@ struct TrajIn {
 //
 // 这个区别是致命的：母版生成器跨折返**不关喷**，所以 longstripe 的 45 笔在 CSV 里只有
 // 2 个 spray 连续段（11044 + 511 点）。按 spray 段当行，等于把 22 笔当成 1 行 ——
-// 方位角只能取一个（22 笔朝向不同的壁共用一个进刀侧）、倾角"只升不降"的平滑会跨折返
-// 传递（上一笔的高倾角把下一笔整段抬起来）。
+// 方位角只能取一个（22 笔朝向不同的壁共用一个进刀侧）；姿态又是面组级常量，跨折返
+// 合并会把两笔朝向不同的壁强行统一成一个姿态（上一笔的高倾角把下一笔整段抬起来）。
 //
 // 折返判据用**水平投影**方向掉头：与"本笔起始方向"夹角 > 120°（dot < −0.5）即断行。
 // 不用三维方向是因为曲面/法向变化会让三维步长抖动；而折返在水平面上一定是掉头。
@@ -1443,14 +1443,6 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     hasPR = false;
 }
 
-// 只升不降的限幅平滑：final[i] = max(need[i], final[邻点] - rate)
-void smoothOnlyUp(std::vector<double>& v, const std::vector<std::pair<int, int>>& rows, double rate) {
-    for (const auto& r : rows) {
-        for (int i = r.first + 1; i <= r.second; ++i) v[i] = std::max(v[i], v[i - 1] - rate);
-        for (int i = r.second - 1; i >= r.first; --i) v[i] = std::max(v[i], v[i + 1] - rate);
-    }
-}
-
 double percentile(std::vector<double> v, double q) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
@@ -1675,9 +1667,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     for (size_t ri = 0; ri < rows.size(); ++ri)
         for (int i = rows[ri].first; i <= std::min(rows[ri].second, n - 1); ++i) rowOf[i] = (int)ri;
 
-    std::vector<char> stanceRow(rows.size(), 0);   // 该行方位是否被改判为「站位侧」
-    // ---- 进刀侧（方位角）逐行决策放在「阶段 2」之后 —— 必须先有真实倾角，
-    // 否则判的是 tilt0 那个位姿，而实际执行倾角常常大 20~30°，P0 结论会反号（见阶段 2 末尾）。
+    // ---- 姿态（倾角 + 进刀方位）的决策在「阶段 2」做，且作用域是「面组」而不是点：
+    // 同一个面上姿态恒定（工艺要求），只有换面时才允许改变。见阶段 2 的说明。
     int azStanceRows = 0;
 
     // ---- 阶段 1：每点的倾角需求（带 IK 种子连续性）
@@ -1739,173 +1730,325 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         for (auto& th : pool) th.join();
     }
 
-    // ---- 阶段 2：倾角平滑（只升不降）
-    g_prof.mark("阶段1 求倾角");
-    std::vector<double> finalTilt = need;
-    smoothOnlyUp(finalTilt, rows, p.tiltRateDeg);
+    // ---- 阶段 2：面级姿态常量（倾角 + 进刀方位）
+    //
+    // 工艺要求（用户口径）：**同一个面上喷涂的过程中，喷角即姿态尽量不要改变**。
+    // 旧口径是「逐点求最小可行倾角 + 只升不降的限幅平滑」，倾角是逐点自由量：
+    // 只要它逐点自由，就一定会随局部位姿抖动。开口盒子实测一笔 77 点里倾角从 30°
+    // 走到 55° 再落回 30°，相邻点 TCP 沿球面来回摆（位移可达 40mm），画出来是锯齿，
+    // 落盘执行是一路拧腕。
+    //
+    // 现在把「倾角 + 方位」一起升级成**面级常量**：相邻、法向一致、共面的行归成一个
+    // 面组，每个面组只允许一个 (倾角, 方位)，姿态因此只可能在换面时改变。
+    // 面内个别点在这个常量下过不了硬约束时，仍由阶段 3 退回本点最优并计入 reverted
+    // —— 那是物理上必须偏的点（否则就撞了），不是决策抖动。
+    //
+    // 候选倾角直接取该面内阶段 1 求出的 need 值（本来就在 tiltStepDeg 网格上）+ tilt0，
+    // 不另造一套网格：两套网格会让「打分用的倾角」和「执行用的倾角」悄悄分叉。
+    // 若这批候选全都有 P0（典型是"整面只有某个不直观的方位才够得着"），再做一轮
+    // 广搜（倾角 × 每 30° 方位）—— 面级常量只有一份，选错了整面都废，值得多花这点时间。
+    const double kSameFaceCos = std::cos(2.0 * kDeg);   // 行法向夹角 ≤2° 视为同一个面
+    const double kSameFacePlaneMm = 2.0;                // 共面判据：沿法向偏移 ≤2mm
 
-    // 方位：同一行内有任一点需要换方位 → 整行统一用该方位（否则倾斜方向逐点跳，姿态更乱）。
-    // 基准值取阶段 0 的行级决策（azStance=false 时恒为 0 = 向上，与旧口径逐字节一致）。
-    // 取该行出现次数最多的方位；并列时取较小的（与 numpy.unique+argmax 同口径）。
-    std::vector<double> azRow(rows.size(), 0.0);
-    for (size_t ri = 0; ri < rows.size(); ++ri) {
-        int a = rows[ri].first, b = rows[ri].second;
-        std::vector<double> vals;
-        for (int i = a; i <= b; ++i) {
-            // 旧口径只统计非零方位（0 是默认值，投它等于没投）；
-            // 站位口岸位非零，0 就变成了一个**有意义的候选**，必须一起投票。
-            if (std::fabs(azOf[i]) > 1e-9)
-                vals.push_back(std::round(azOf[i] * 1000.0) / 1000.0);
+    std::vector<int> groupOfRow(rows.size(), -1);
+    std::vector<std::pair<int, int>> groups;            // 每个面组的行区间 [r0, r1]
+    {
+        std::vector<V3> rowNrm(rows.size(), V3(0, 0, 0));
+        for (size_t r = 0; r < rows.size(); ++r) {
+            V3 s(0, 0, 0);
+            int c = 0;
+            for (int i = rows[r].first; i <= rows[r].second; ++i)
+                if (t.spray[i]) { s = s + t.normal(i); ++c; }
+            if (c) rowNrm[r] = unit(s);
         }
-        if (!vals.empty()) {
-            std::sort(vals.begin(), vals.end());
-            double bestV = vals[0];
-            int bestC = 0;
-            for (size_t k = 0; k < vals.size();) {
-                size_t k2 = k;
-                while (k2 < vals.size() && vals[k2] == vals[k]) ++k2;
-                int c = (int)(k2 - k);
-                if (c > bestC) {
-                    bestC = c;
-                    bestV = vals[k];
-                }
-                k = k2;
+        int g = -1;
+        for (size_t r = 0; r < rows.size(); ++r) {
+            bool same = false;
+            if (r > 0) {
+                int m0 = (rows[r - 1].first + rows[r - 1].second) / 2;
+                int m1 = (rows[r].first + rows[r].second) / 2;
+                V3 f0 = t.pos[m0] + t.gun[m0] * p.standoff;
+                V3 f1 = t.pos[m1] + t.gun[m1] * p.standoff;
+                same = dot(rowNrm[r], rowNrm[r - 1]) >= kSameFaceCos &&
+                       std::fabs(dot(rowNrm[r], f1 - f0)) <= kSameFacePlaneMm;
             }
-            azRow[ri] = bestV;
+            if (!same) { ++g; groups.push_back({(int)r, (int)r}); }
+            else groups.back().second = (int)r;
+            groupOfRow[r] = g;
         }
     }
 
-    // 说明：曾在这里加过"拿到真实倾角后复核方位"的一轮（阶段 2.5），实测是负收益，
-    // 已删。原因写在阶段 0 的注释里：复核用的是抽样，判断与阶段 3 的逐点复核
-    // 不一致时会整行被逐点回退 —— complex 上花了 15~20% 时间，
-    // 输出与旧口径逐字节相同。要真正按"最差点"决策，就必须整行逐点评估两个方位，
-    // 那是 2× 阶段 1 的开销（阶段 1 已占 84%），产线不接受。
-    // ---- 阶段 2.5：进刀侧（方位角）逐行决策
-    //
-    // 为什么必须放在这里（倾角已定之后），而不是更早：
-    // 早期版本在阶段 1 之前就定方位，只能用 tilt0 打分。实测 complex 上就是这么翻车的
-    // —— 那行执行倾角是 40~55°（倾角搜索为了躲碰撞自己加上去的），而 tilt0 只有 20°，
-    // 在 tilt0 上"向上撞、站位不撞"，到真倾角上完全不成立：换完方位冒出 110 点关节超限，
-    // 间隙从 77mm 掉到 37mm。**判 P0 必须判真正要执行的那个位姿。**
-    //
-    // 方位角只能是行级常量（它描述"枪从哪一侧压过来"，逐点变等于沿轨迹反复拧腕，
-    // 实机执行不了），所以决策也在行级：候选只有 0（向上，旧口径）与站位侧。
-    // 两者都不是先验正确的 —— 向上只是"重力上方通常空旷"的代理，内腔里上方常常正对
-    // 对面的壁；站位侧则可能隔着工件本体。所以按实测择优，并且：
-    //   1. 只在 P0（穿透 / 自碰撞 / 不可达）上严格改善才换；
-    //   2. 采样先稀后密，稀采样看不出优势就直接放弃，看出优势再密集确认。
-    // 于是"旧口径本来安全的样本"逐字节不变，方位只在旧口径真的撞了的行上动手。
+    std::vector<double> finalTilt = need;
+    std::vector<double> azRow(rows.size(), 0.0);
+    std::vector<double> faceTilt(groups.size(), 0.0), faceAz(groups.size(), 0.0);
     {
-        struct AzScore {
-            int hit = 0;        // 枪体/连杆 穿透点数
-            int selfHit = 0;    // 自碰撞点数
-            int unreach = 0;    // IK 解不出
-            int jointBad = 0;   // 超软限位 / 余量不足（只统计，不参与换方位决策）
-            int sing = 0;       // 近奇异（只统计）
+        // 面组 → 喷涂点索引（抽样打分用；过渡点位置可改，不参与姿态决策）
+        std::vector<std::vector<int>> gp(groups.size());
+        for (size_t g = 0; g < groups.size(); ++g)
+            for (int r = groups[g].first; r <= groups[g].second; ++r)
+                for (int i = rows[r].first; i <= rows[r].second; ++i)
+                    if (t.spray[i]) gp[g].push_back(i);
+
+        struct FaceScore {
+            int hit = 0;        // 枪体/连杆 穿透点云（P0）
+            int unreach = 0;    // IK 解不出（P0）
+            int selfHit = 0;    // 自碰撞（P0）
+            int shortClr = 0;   // 间隙 < safety 的点数（工艺软目标）
             double minClr = 1e300;
+            int p0() const { return hit + unreach + selfHit; }
         };
-        auto p0Wins = [](const AzScore& a, const AzScore& b) {
-            if (a.hit != b.hit) return a.hit < b.hit;
-            if (a.unreach != b.unreach) return a.unreach < b.unreach;
-            return a.selfHit < b.selfHit;
-        };
-        // 按**该点实际执行倾角** finalTilt[i] 打分
-        auto scoreAz = [&](int a, int b, double az, int S) {
-            AzScore s;
-            int len = b - a + 1;
-            S = std::min(S, len);
+
+        auto scoreFace = [&](size_t g, double tilt, double az, int S) -> FaceScore {
+            FaceScore s;
+            const std::vector<int>& P = gp[g];
+            int len = (int)P.size();
+            if (len <= 0) return s;
+            if (S > len) S = len;
             for (int k = 0; k < S; ++k) {
-                int i = (S <= 1) ? a : a + (int)((long long)k * (len - 1) / (S - 1));
-                if (t.spray[i] == 0) continue;          // 过渡点位置可改，不参与方位决策
+                int i = P[(S <= 1) ? 0 : (size_t)k * (len - 1) / (S - 1)];
                 V3 n = t.normal(i);
                 V3 face = t.pos[i] + t.gun[i] * p.standoff;
                 V3 axis, uUp;
                 tiltAxisAndDir(n, axis, uUp);
                 if (norm(uUp) < 1e-6) continue;
-                double tilt = finalTilt[i];
                 V3 d = dirOf(n, uUp, axis, tilt, az);
                 PR pr;
+                // 抽样本来就少，连杆一起查：抽错一次就是整面选错，省这点时间不划算
                 if (!ev.eval(face, d, nullptr, nullptr, tilt, az, true, pr)) { ++s.unreach; continue; }
                 if (pr.clrTool < 0.0 || pr.clrLink < 0.0) ++s.hit;
                 if (pr.selfGap < 0.0) ++s.selfHit;
-                if (pr.over || pr.margin < p.jointMarginMin) ++s.jointBad;
-                if (pr.cond > p.condMax) ++s.sing;
-                if (std::isfinite(pr.clearance) && pr.clearance < s.minClr) s.minClr = pr.clearance;
+                if (std::isfinite(pr.clearance)) {
+                    if (pr.clearance < p.safety) ++s.shortClr;
+                    if (pr.clearance < s.minClr) s.minClr = pr.clearance;
+                }
             }
             return s;
         };
-        auto decideRow = [&](size_t ri) {
-            int a = rows[ri].first, b = rows[ri].second;
-            if (b < a) return;
-            int im = a + (b - a) / 2;
-            V3 n = t.normal(im);
-            V3 face = t.pos[im] + t.gun[im] * p.standoff;
+
+        // 选优次序：致命点数少 > 不破工艺喷角 > 间隙不足点数少 > 倾角小 > 方位取 0（向上）
+        //
+        // 第一档必须比"撞/不可达/自碰撞"更粗：只按撞数排，会把"整面都不可达但一点不撞"
+        // 排在"大部分够得着、少数点蹭边"前面（开口盒子 +X 面就这么选错过）。
+        //
+        // 第二档（工艺喷角）单独拿出来是必须的：倾角就是喷角（= 枪轴与法向的夹角），
+        // 而间隙不足只是 P1 告警。若不设这一档，"整面把间隙从 8mm 拉到 20mm"会赢过
+        // "整面守住 30° 喷角"，代价是**整个面**常年超工艺喷角（实测 longstripe 从
+        // 30~35° 被抬到 59°，P0 反而多了 4 个）。面级常量只有一份，这种全局违规
+        // 不能为了软告警而接受：P0 该救就救，救完就退回工艺基准。
+        auto betterThan = [&](const FaceScore& a, double ta, double aza,
+                              const FaceScore& b, double tb, double azb) {
+            int pa = a.p0(), pb = b.p0();
+            if (pa != pb) return pa < pb;
+            bool oka = ta <= p.maxSprayAngleDeg + 1e-9;
+            bool okb = tb <= p.maxSprayAngleDeg + 1e-9;
+            if (oka != okb) return oka;
+            if (a.hit != b.hit) return a.hit < b.hit;
+            if (a.unreach != b.unreach) return a.unreach < b.unreach;
+            if (a.selfHit != b.selfHit) return a.selfHit < b.selfHit;
+            if (a.shortClr != b.shortClr) return a.shortClr < b.shortClr;
+            if (std::fabs(ta - tb) > 1e-6) return ta < tb;
+            return std::fabs(aza) < std::fabs(azb) - 1e-9;
+        };
+
+        struct Cand { double tilt, az; FaceScore s; };
+        auto cmpCand = [&](const Cand& a, const Cand& b) {
+            return betterThan(a.s, a.tilt, a.az, b.s, b.tilt, b.az);
+        };
+
+        auto decideGroup = [&](size_t g) {
+            const std::vector<int>& P = gp[g];
+            if (P.empty()) return;
+            int ra = groups[g].first, rb = groups[g].second;
+
+            V3 nsum(0, 0, 0);
+            for (int i : P) nsum = nsum + t.normal(i);
+            V3 nFace = unit(nsum);
             V3 axis, uUp;
-            tiltAxisAndDir(n, axis, uUp);
-            double azs = stanceAzDeg(n, face, ev.baseOrigin(), uUp, axis);
-            // 无倾向（基座在法向延长线上）或与当前方位几乎重合 → 不做无谓计算
-            if (!std::isfinite(azs) || std::fabs(azs - azRow[ri]) < 5.0) return;
-            // 候选必须包含**当前真正执行的方位**：它常常已经不是 0 —— 阶段 1 的兜底
-            // （azPref±30/60）会把整行投成 ±30。早期版本拿"0"当基准、见到非零就跳过，
-            // 结果最需要救的 longstripe 两行（azRow=±30）根本没进决策，阶段 2.5 只花 0.3ms。
-            std::vector<double> cands{azRow[ri]};
-            if (std::fabs(0.0 - azRow[ri]) >= 5.0) cands.push_back(0.0);
-            cands.push_back(azs);
-            int len = b - a + 1;
-            // 稀采样先筛：只有出现了"不是当前方位"的赢家才值得上密集采样
-            int best = 0;
-            AzScore bestS = scoreAz(a, b, cands[0], 5);
-            for (size_t k = 1; k < cands.size(); ++k) {
-                AzScore s = scoreAz(a, b, cands[k], 5);
-                if (p0Wins(s, bestS)) { bestS = s; best = (int)k; }
+            tiltAxisAndDir(nFace, axis, uUp);
+            bool degenerate = norm(uUp) < 1e-6;       // 朝上的面：倾角无意义，恒 0
+            double tilt0 = degenerate ? 0.0 : tiltNeedDeg(nFace, p);
+
+            // 候选倾角：tilt0 + 该面内阶段 1 实际需要过的倾角（都在网格上）
+            std::vector<double> tilts;
+            tilts.push_back(tilt0);
+            for (int i : P) {
+                double v = std::round(need[i] * 1000.0) / 1000.0;
+                if (std::fabs(v - tilt0) > 1e-6) tilts.push_back(v);
             }
-            if (best == 0) return;
-            int Sd = std::min(120, std::max(8, len / 20));
-            bestS = scoreAz(a, b, cands[0], Sd);
-            best = 0;
-            for (size_t k = 1; k < cands.size(); ++k) {
-                AzScore s = scoreAz(a, b, cands[k], Sd);
-                if (p0Wins(s, bestS)) { bestS = s; best = (int)k; }
+            std::sort(tilts.begin(), tilts.end());
+            tilts.erase(std::unique(tilts.begin(), tilts.end()), tilts.end());
+            if (degenerate) tilts.assign(1, 0.0);
+
+            // 候选方位：向上(0) + 站位侧 + 阶段 1 兜底投出来的方位（保持旧口径能救的行仍能救）
+            std::vector<double> azs;
+            azs.push_back(0.0);
+            auto pushAz = [&](double v) {
+                if (!std::isfinite(v)) return;
+                while (v <= -180.0) v += 360.0;
+                while (v > 180.0) v -= 360.0;
+                for (double e : azs) if (std::fabs(e - v) < 1e-6) return;
+                azs.push_back(v);
+            };
+            if (!degenerate && p.azStance) {
+                int im = P[P.size() / 2];
+                V3 fm = t.pos[im] + t.gun[im] * p.standoff;
+                pushAz(stanceAzDeg(nFace, fm, ev.baseOrigin(), uUp, axis));
             }
-            if (best != 0) {
-                azRow[ri] = cands[best];
-                // 只有把方位换成**站位侧**才记账；换成 0（向上）不算本层做了什么
-                stanceRow[ri] = (std::fabs(cands[best] - azs) < 1e-6) ? 1 : 0;
+            if (!degenerate && p.azFallback) {
+                for (int i : P) {
+                    if (std::fabs(azOf[i]) > 1e-9) {
+                        pushAz(azOf[i]);
+                        if (azs.size() >= 4) break;
+                    }
+                }
+            }
+            std::sort(azs.begin(), azs.end());
+            if (degenerate) azs.assign(1, 0.0);
+
+            // ---- 候选评估：每一档都只在**同一采样数**内做比较 ----
+            // 混着比会挑出"只在小样本上好看"的姿态：开口盒子 +X 面实测把 (55°,60°) 的 P0=10
+            // 让位给了 (30°,0°) 的"8 点全不可达"，最后整面 2103 点全部不可达。
+            const int S1 = 16;
+            std::vector<Cand> pool;
+            pool.reserve(tilts.size() * azs.size());
+            for (double tt : tilts)
+                for (double aa : azs) pool.push_back({tt, aa, scoreFace(g, tt, aa, S1)});
+            std::sort(pool.begin(), pool.end(), cmpCand);
+
+            // 常规候选全都过不了 P0 → 广搜：倾角整档 × 每 30° 方位。
+            // 实测开口盒子 +X 面就是这种情况：常规候选里要么整面够不着，要么整片穿透，
+            // 而"够得着且只蹭到几个点"的那个姿态 (55°, 方位 60°) 根本不在候选集里
+            // （阶段 1 的兜底只在需用倾角上试方位 ±30/±60，且从没试过 55° 与方位 60° 的组合）。
+            if (!degenerate && pool.front().s.p0() > 0) {
+                std::vector<Cand> wide;
+                for (double tt = tilt0; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg) {
+                    for (int a = -180; a < 180; a += 30) {
+                        double aa = (double)a;
+                        bool dup = false;
+                        for (const Cand& c : pool) {
+                            if (std::fabs(c.tilt - tt) < 1e-6 && std::fabs(c.az - aa) < 1e-6) { dup = true; break; }
+                        }
+                        if (dup) continue;
+                        wide.push_back({tt, aa, scoreFace(g, tt, aa, S1)});
+                    }
+                }
+                for (const Cand& c : wide) pool.push_back(c);   // 同为 S1，可直接同比
+                std::sort(pool.begin(), pool.end(), cmpCand);
+            }
+
+            // P0 差在"2% 抽样 + 2 点"以内的候选视为同一档。抽样噪声不该决定整面的姿态：
+            // 先把这一档捞到前面，再在档内按（工艺喷角 → 间隙 → 倾角）排；
+            // 否则一个大倾角的"碰巧少撞两点"会把小倾角的好候选挤出复核名单
+            // （longstripe 实测：整面 11290 点，59° P0=9、49° P0=4、30° 更差，
+            //  但 59° 让整面喷角超工艺上限 —— 这种整面违规不能由 1~2 个点的噪声决定）。
+            {
+                int minP0c = pool.front().s.p0();
+                for (const Cand& c : pool) minP0c = std::min(minP0c, c.s.p0());
+                int bandC = std::max(2, (int)(0.02 * S1 + 0.5));
+                std::stable_partition(pool.begin(), pool.end(), [&](const Cand& c) {
+                    return c.s.p0() <= minP0c + bandC;
+                });
+                std::sort(pool.begin(), pool.end(), cmpCand);
+            }
+
+            // 密集复核：粗采样分不出的差距，密集采样常常分得出来。
+            int keep = std::min<int>(8, (int)pool.size());
+            int Sfinal = std::min(96, (int)P.size());
+            if (Sfinal > S1) {
+                for (int k = 0; k < keep; ++k) pool[k].s = scoreFace(g, pool[k].tilt, pool[k].az, Sfinal);
+                std::sort(pool.begin(), pool.begin() + keep, cmpCand);
+            }
+            // 还有 P0 → 再上一档采样复核（只在同一档内部比较，量纲才一致）
+            if (pool[0].s.p0() > 0 && Sfinal < (int)P.size()) {
+                int Sbig = std::min(400, (int)P.size());
+                if (Sbig > Sfinal) {
+                    for (int k = 0; k < keep; ++k) pool[k].s = scoreFace(g, pool[k].tilt, pool[k].az, Sbig);
+                    std::sort(pool.begin(), pool.begin() + keep, cmpCand);
+                    Sfinal = Sbig;
+                }
+            }
+            // ---- 最终定档：同上，P0 在容忍带内视为同档，同档内先守工艺喷角
+            int minP0 = pool[0].s.p0();
+            for (int k = 1; k < keep; ++k) minP0 = std::min(minP0, pool[k].s.p0());
+            int band = std::max(2, (int)(0.02 * Sfinal + 0.5));
+            auto pickBetter = [&](const Cand& x, const Cand& y) {
+                int px = x.s.p0(), py = y.s.p0();
+                bool inx = px <= minP0 + band, iny = py <= minP0 + band;
+                if (inx != iny) return inx;
+                bool ox = x.tilt <= p.maxSprayAngleDeg + 1e-9;
+                bool oy = y.tilt <= p.maxSprayAngleDeg + 1e-9;
+                if (ox != oy) return ox;
+                if (x.s.shortClr != y.s.shortClr) return x.s.shortClr < y.s.shortClr;
+                if (px != py) return px < py;
+                if (std::fabs(x.tilt - y.tilt) > 1e-6) return x.tilt < y.tilt;
+                return std::fabs(x.az) < std::fabs(y.az) - 1e-9;
+            };
+            int bestK = 0;
+            for (int k = 1; k < keep; ++k)
+                if (pickBetter(pool[k], pool[bestK])) bestK = k;
+            if (bestK != 0) std::swap(pool[0], pool[bestK]);
+            faceTilt[g] = pool[0].tilt;
+            faceAz[g] = pool[0].az;
+            if (const char* dbgG = std::getenv("RS_DBG_FACE")) {
+                if (atoi(dbgG) == (int)g) {
+                    printf("[pool%zu] 候选池前 10（S=%d）:\n", g, Sfinal);
+                    for (int k = 0; k < (int)pool.size() && k < 10; ++k)
+                        printf("   tilt=%5.1f az=%7.1f P0=%4d 撞%4d 不可达%4d 自撞%3d 间隙不足%3d 最小%7.1f\n",
+                               pool[k].tilt, pool[k].az, pool[k].s.p0(), pool[k].s.hit,
+                               pool[k].s.unreach, pool[k].s.selfHit, pool[k].s.shortClr,
+                               pool[k].s.minClr);
+                    fflush(stdout);
+                }
+            }
+            for (int r = ra; r <= rb; ++r) {
+                azRow[r] = faceAz[g];
+                for (int i = rows[r].first; i <= rows[r].second; ++i)
+                    if (t.spray[i]) finalTilt[i] = faceTilt[g];
+            }
+            if (g_prof.on) {
+                std::fprintf(stderr, "  [face%2zu] 行 %3d..%3d 点%5d 倾角%5.1f 方位%7.1f | 抽%d: P0=%d(撞%d/不可达%d/自撞%d) 间隙不足%d 最小%6.1f\n",
+                             g, ra, rb, (int)P.size(), faceTilt[g], faceAz[g], Sfinal,
+                             pool[0].s.p0(), pool[0].s.hit, pool[0].s.unreach, pool[0].s.selfHit,
+                             pool[0].s.shortClr, pool[0].s.minClr);
             }
         };
-        if (p.azStance) {
-            if (nThreads <= 1) {
-                for (size_t ri = 0; ri < rows.size(); ++ri) decideRow(ri);
-            } else {
-                std::atomic<size_t> nextRow{0};
-                std::vector<std::thread> pool;
-                int nt = std::max(1, std::min<int>(nThreads, (int)rows.size()));
-                pool.reserve(nt);
-                for (int k = 0; k < nt; ++k) {
-                    pool.emplace_back([&] {
-                        for (;;) {
-                            size_t ri = nextRow.fetch_add(1);
-                            if (ri >= rows.size()) break;
-                            decideRow(ri);
-                        }
-                    });
-                }
-                for (auto& th : pool) th.join();
+
+        if (nThreads <= 1 || groups.size() <= 2) {
+            for (size_t g = 0; g < groups.size(); ++g) decideGroup(g);
+        } else {
+            std::atomic<size_t> nextGroup{0};
+            std::vector<std::thread> pool;
+            int nt = std::max(1, std::min<int>(nThreads, (int)groups.size()));
+            pool.reserve(nt);
+            for (int k = 0; k < nt; ++k) {
+                pool.emplace_back([&] {
+                    for (;;) {
+                        size_t g = nextGroup.fetch_add(1);
+                        if (g >= groups.size()) break;
+                        decideGroup(g);
+                    }
+                });
             }
+            for (auto& th : pool) th.join();
         }
     }
-    g_prof.mark("阶段2.5 进刀侧");
-    int azChangedRows = 0;
-    for (char c : stanceRow) if (c) ++azChangedRows;
-    if (g_prof.on) {
-        std::fprintf(stderr, "  [az] rows=%zu 非零方位行=%d :", rows.size(), azChangedRows);
-        for (size_t t = 0; t < azRow.size(); ++t)
-            if (std::fabs(azRow[t]) > 1e-9) std::fprintf(stderr, " r%zu=%.1f", t, azRow[t]);
-        int nonZeroPts = 0;
-        for (int i = 0; i < n; ++i) if (rowOf[i] >= 0 && std::fabs(azRow[rowOf[i]]) > 1e-9) ++nonZeroPts;
-        std::fprintf(stderr, " · 受影响点=%d\n", nonZeroPts);
-    }
+    g_prof.mark("阶段2 面级姿态");
 
+    int azChangedRows = 0;
+    for (size_t r = 0; r < azRow.size(); ++r)
+        if (std::fabs(azRow[r]) > 1e-9) ++azChangedRows;
+    if (g_prof.on) {
+        int nonZeroPts = 0;
+        for (int i = 0; i < n; ++i)
+            if (rowOf[i] >= 0 && std::fabs(azRow[rowOf[i]]) > 1e-9) ++nonZeroPts;
+        // 行内倾角最大步进：面级常量的直接验收指标，正常应恒为 0
+        double maxStep = 0.0;
+        for (size_t r = 0; r < rows.size(); ++r)
+            for (int i = rows[r].first + 1; i <= rows[r].second; ++i)
+                maxStep = std::max(maxStep, std::fabs(finalTilt[i] - finalTilt[i - 1]));
+        std::fprintf(stderr, "  [az] rows=%zu 面组=%zu 非零方位行=%d 受影响点=%d · 行内倾角最大步进=%.1f°\n",
+                     rows.size(), groups.size(), azChangedRows, nonZeroPts, maxStep);
+    }
     // ---- 阶段 3：按 final 重新求解 + 归集违规
     std::vector<PR> results(n);
     std::vector<char> hasResult(n, 0);
@@ -1964,6 +2107,9 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     PR bad;
                     bad.idx = i;
                     bad.tiltDeg = tilt;
+                    // 不可达点没有真实位姿，但"指令倾角"是确定值：写进去，别让 tilt_deg 列
+                    // 落成 0 —— 那会让"整行 60° 倾斜、其中 45 点不可达"看起来像"倾角在 0/60 之间跳"。
+                    bad.sprayAngle = tilt;
                     bad.clearance = -std::numeric_limits<double>::infinity();
                     // 自碰撞标 nan 而不是 inf：inf 经 %f 落到 CSV 会变成一个天文数字，
                     // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
@@ -1992,12 +2138,35 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 if (hasCache[i]) {
                     bool smoothHard = hardOk(pr, p.hardClearance);
                     if (!smoothHard) {
-                        bool cacheHard = hardOk(cache[i], p.hardClearance);
-                        if (cacheHard || hardCmp(pr, cache[i]) < 0) {
-                            pr = cache[i];
-                            pr.idx = i;
-                            pr.reverted = true;
-                            ++acc.reverted;
+                        // 先在「面级常量」附近找**偏离最小**的合法姿态（同方位，倾角 ±step/±2step/±3step）。
+                        // 直接退回本点最优的话，倾角可能从 60° 跳回 35°，TCP 一次甩出上百毫米
+                        // —— 那正是"修正后轨迹一团乱刺"的来源。物理上必须偏的点也要尽量少偏。
+                        bool fixed = false;
+                        for (int m = 1; m <= 3 && !fixed; ++m) {
+                            for (int sgn = -1; sgn <= 1 && !fixed; sgn += 2) {
+                                double t2 = tilt + sgn * m * p.tiltStepDeg;
+                                if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                                V3 d2 = dirOf(nrm, uUp, axis, t2, az);
+                                PR pr2;
+                                if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr, hasSeed ? prevTheta : nullptr,
+                                             t2, az, checkLinks, pr2)) continue;
+                                if (!hardOk(pr2, p.hardClearance)) continue;
+                                pr2.idx = i;
+                                pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                                pr2.reverted = true;
+                                pr = pr2;
+                                ++acc.reverted;
+                                fixed = true;
+                            }
+                        }
+                        if (!fixed) {
+                            bool cacheHard = hardOk(cache[i], p.hardClearance);
+                            if (cacheHard || hardCmp(pr, cache[i]) < 0) {
+                                pr = cache[i];
+                                pr.idx = i;
+                                pr.reverted = true;
+                                ++acc.reverted;
+                            }
                         }
                     }
                 }
@@ -2079,7 +2248,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         for (int i = 0; i < n; ++i) {
             if (rowOf[i] < 0) continue;
             int ri = rowOf[i];
-            if (!stanceRow[ri]) continue;
+            if (std::fabs(azRow[ri]) < 1e-9) continue;
             if (!results[i].reverted && std::fabs(results[i].azDeg - azRow[ri]) < 1e-6) applied[ri] = 1;
         }
         azStanceRows = 0;

@@ -17,14 +17,15 @@
    * 自碰撞  ：非相邻连杆胶囊两两之间（排除同一关节与其两根连杆）
    * 可达/限位/奇异：IK 解存在、关节角在软限位内、雅可比条件数不超限
 
-倾角的**连续性**（这是能不能上机的关键，不是可选项）：
+姿态的**面级常量**（这是能不能上机的关键，不是可选项）：
    逐点独立求出的倾角会在相邻点之间跳（20°→45°），100mm 外的枪位会甩出几十毫米，
-   真机跟不上 —— 与 master 里"6°/步限幅"同一个道理。所以：
-     ① 先求每点的**需求**倾角 need[i]；
-     ② 做**只升不降**的限幅平滑（每点最多变 3°）：final[i] = max(need[i], final[邻点] - rate)，
-        前向 + 后向各一遍，同时满足 final ≥ need 与 |Δfinal| ≤ rate；
-     ③ 再按 final 重新求解位姿。
-   这条"只升不降"是整个流程安全性的来源：平滑永远不会把倾角降到需求以下。
+   真机跟不上；更要紧的是**工艺要求同一个面上喷角不变**。所以：
+     ① 先求每点的**需求**倾角 need[i]（"这一点至少要多大的倾角才安全"）；
+     ② 把相邻、法向一致、共面的行归成「面组」，一个面组只取一个 (倾角, 方位)；
+     ③ 再按这个常量重新求解位姿；面内个别点若过不了硬约束，逐点退回本点最优并记
+        reverted —— 那是物理上必须偏的点，不是决策抖动。
+   早期做法是"只升不降的逐点限幅平滑"（每点最多变 3°），它能保证 |Δθ| ≤ 3°，
+   但保不住"同一个面上倾角不变"：实测一笔 77 点里能从 30° 走到 55° 再落回 30°。
 
 决策顺序（**最小修正原则**，改动量从小到大）：
    ① 基准倾角 ② 逐步加大 ③ 换倾斜方位（左右各 30°/60°）
@@ -55,7 +56,7 @@ class Params:
     up_threshold_deg: float = 45.0     # 已不参与倾角决策（倾角改线性），保留以对齐 C++ ABI
     tilt_max_deg: float = 60.0         # 倾角上限
     tilt_step_deg: float = 5.0
-    tilt_rate_deg_per_pt: float = 3.0  # 倾角沿轨迹每点最大变化（度）
+    tilt_rate_deg_per_pt: float = 3.0  # 已不参与姿态决策（改为面级常量）：仅用作姿态跳变告警阈值
     max_spray_angle_deg: float = 30.0  # 工艺允许的最大喷角（超出报工艺违规，不是碰撞违规）
     tool_len: float = robot.VS087_TOOL_LEN
     include_base: bool = False         # 点云里若有地面/底座，打开它
@@ -373,20 +374,36 @@ def _need_tilt(ev: Evaluator, traj: traj_mod.Traj, i: int, seed, ref_x, check_li
     return tilt0, 0.0, None
 
 
-def _smooth_only_up(need: list[float], rows: list[tuple[int, int]], rate: float) -> list[float]:
-    """只升不降的限幅平滑（见文件头「倾角的连续性」）。
+def _face_groups(traj: traj_mod.Traj, rows: list[tuple[int, int]],
+                 params: Params) -> list[tuple[int, int]]:
+    """把相邻、法向一致、共面的行归成一个「面组」，返回面组的行区间 [r0, r1]。
 
-    前向/后向各一遍：final[i] = max(need[i], final[邻点] - rate)。
-    两个不变式（都是硬要求）：
-      * final[i] >= need[i]             —— 平滑永远不会把倾角降到需求以下
-      * |final[i+1]-final[i]| <= rate   —— 姿态连续，真机跟得上
+    为什么需要它：工艺要求**同一个面上喷涂过程中喷角不变**。倾角如果逐点自由，
+    就一定会随局部位姿抖动（实测一笔 77 点里能从 30° 走到 55° 再落回 30°，
+    相邻点 TCP 沿球面来回摆几十毫米）。把姿态常量抬到「面」这一级，才有可能不变。
+
+    判据（与 C++ 同口径）：
+      · 行法向夹角 ≤ 2°      —— 同一张面（曲面会被自然切成多段，那是应该变的）
+      · 沿法向偏移 ≤ 2mm     —— 排除"平行但不共面"的两张面（如壁厚两侧）
     """
-    out = list(need)
+    normals, mids = [], []
     for a, b in rows:
-        for i in range(a + 1, b + 1):
-            out[i] = max(out[i], out[i - 1] - rate)
-        for i in range(b - 1, a - 1, -1):
-            out[i] = max(out[i], out[i + 1] - rate)
+        n = traj.normal[a:b + 1].mean(axis=0)
+        u = geom.norm(n)
+        normals.append(geom.unit(n) if u > 1e-12 else np.zeros(3))
+        m = (a + b) // 2
+        mids.append(traj.pos[m] + traj.gun[m] * params.standoff)
+    out: list[tuple[int, int]] = []
+    cos_lim = math.cos(math.radians(2.0))
+    for r in range(len(rows)):
+        same = False
+        if r > 0:
+            same = (float(np.dot(normals[r], normals[r - 1])) >= cos_lim
+                    and abs(float(np.dot(normals[r], mids[r] - mids[r - 1]))) <= 2.0)
+        if same:
+            out[-1] = (out[-1][0], r)
+        else:
+            out.append((r, r))
     return out
 
 
@@ -528,17 +545,44 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
         if verbose and n_pts > 600 and (i + 1) % 600 == 0:
             print(f"  [需求] {i + 1}/{n_pts} ...", flush=True)
 
-    # ---- 阶段 2：倾角平滑（只升不降）
-    final = _smooth_only_up(need, rows, params.tilt_rate_deg_per_pt)
-
-    # 方位：同一行内只要有一个点需要换方位，整行统一用该方位 —— 否则倾斜方向逐点跳，
-    # 姿态会比「不倾斜」还乱。取该行出现次数最多的非零方位。
+    # ---- 阶段 2：面级姿态常量（倾角 + 方位）
+    # 同一个面组只有一个 (倾角, 方位)：姿态因此只可能在换面时改变。
+    # 面内个别点在该常量下过不了硬约束，仍由阶段 3 退回本点最优（并记 reverted）——
+    # 那是"物理上必须偏"的点，不是决策抖动。
+    #
+    # 倾角取「面内各点需求的最大值」：保守但零额外开销。
+    # C++ 版（生产路径）在此之上做了抽样打分择优（同一面在别的倾角上碰撞余量可能更好），
+    # 两份实现的选择规则不完全一致，跨实现对数时请以「姿态是否面级常量」为准，
+    # 不要逐点比倾角数值。
+    groups = _face_groups(traj, rows, params)
+    final = list(need)
     az_row: dict[tuple[int, int], float] = {}
-    for a, b in rows:
-        vals = [az_of[i] for i in range(a, b + 1) if abs(az_of[i]) > 1e-9]
+    up = np.array([0.0, 0.0, 1.0])
+    for r0, r1 in groups:
+        pts = [i for r in range(r0, r1 + 1) for i in range(rows[r][0], rows[r][1] + 1)
+               if traj.spray[i] == 1]
+        if not pts:
+            continue
+        n_mean = geom.unit(traj.normal[pts].mean(axis=0))
+        alpha = math.degrees(math.acos(float(np.clip(n_mean[2], -1.0, 1.0))))
+        tilt0 = min(params.tilt_nonup_deg * (alpha / 90.0), params.tilt_max_deg)
+        if float(n_mean[2]) < -0.7:
+            tilt0 = 0.0
+        _, u_up, _ = geom.tilt_axis_and_dir(n_mean, up)
+        if geom.norm(u_up) < 1e-6:
+            tilt0 = 0.0
+        tilt = max([tilt0] + [need[i] for i in pts])
+        vals = [az_of[i] for i in pts if abs(az_of[i]) > 1e-9]
+        az = 0.0
         if vals:
             uniq, cnt = np.unique(np.round(vals, 3), return_counts=True)
-            az_row[(a, b)] = float(uniq[int(np.argmax(cnt))])
+            az = float(uniq[int(np.argmax(cnt))])
+        for r in range(r0, r1 + 1):
+            a, b = rows[r]
+            az_row[(a, b)] = az
+            for i in range(a, b + 1):
+                if traj.spray[i] == 1:
+                    final[i] = tilt
     row_of: dict[int, tuple[int, int]] = {}
     for a, b in rows:
         for i in range(a, b + 1):

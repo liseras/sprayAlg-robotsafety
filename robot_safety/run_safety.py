@@ -59,7 +59,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tilt-nonup", type=float, default=20.0, help="非朝上面的基准倾角（度）")
     ap.add_argument("--up-threshold", type=float, default=45.0, help="法向偏离竖直多少度算「非朝上」")
     ap.add_argument("--tilt-max", type=float, default=60.0, help="倾角上限（度）")
-    ap.add_argument("--tilt-rate", type=float, default=3.0, help="倾角沿轨迹每点最大变化（度）")
+    ap.add_argument("--tilt-rate", type=float, default=3.0,
+                    help="姿态跳变告警阈值（度/点）：面级常量下已不参与姿态决策，仅用于 P2 告警")
     ap.add_argument("--max-spray-angle", type=float, default=30.0, help="工艺允许的最大喷角（度）")
     ap.add_argument("--tool-len", type=float, default=robot.VS087_TOOL_LEN, help="法兰→喷嘴长度 mm")
     ap.add_argument("--include-base", action="store_true", help="把底座立柱也算碰撞体（点云含地面时用）")

@@ -33,7 +33,8 @@ typedef struct RobotSafetyParams {
     double upThresholdDeg;   // 已不参与倾角决策（倾角改为按法向线性给），保留字段仅为 ABI 稳定
     double tiltMaxDeg;       // 倾角上限（默认 60）
     double tiltStepDeg;      // 倾角搜索步长（默认 5）
-    double tiltRateDeg;      // 倾角沿轨迹每点最大变化（默认 3）
+    double tiltRateDeg;      // 已不参与倾角决策（姿态改为面级常量）：仅用作姿态跳变告警阈值
+                             // （= max(3×它, 10°)）。保留字段仅为 ABI 稳定。
     double maxSprayAngleDeg; // 工艺允许的最大喷角（默认 30；超出报工艺违规，不是碰撞违规）
     double jointMarginMin;   // 关节限位余量下限（默认 1.0°）
     double condMax;          // 归一化雅可比条件数上限（默认 30，只告警不阻断）
