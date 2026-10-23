@@ -1804,6 +1804,11 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             int len = (int)P.size();
             if (len <= 0) return s;
             if (S > len) S = len;
+            // 热种子链：阶段 3 是「接着上一点继续解」的，冷启动（全零种子）会把本来就够得着
+            // 的点判成不可达。开口盒子 +X 内壁整面 2104 点就是这么被判死的：所有候选都是
+            // 冷启动 400/400 不可达，选优只能退回「倾角最小」，整面 30° 全不可达。
+            double seed[6] = {0, 0, 0, 0, 0, 0};
+            bool hasSeed = false;
             for (int k = 0; k < S; ++k) {
                 int i = P[(S <= 1) ? 0 : (size_t)k * (len - 1) / (S - 1)];
                 V3 n = t.normal(i);
@@ -1814,7 +1819,13 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 V3 d = dirOf(n, uUp, axis, tilt, az);
                 PR pr;
                 // 抽样本来就少，连杆一起查：抽错一次就是整面选错，省这点时间不划算
-                if (!ev.eval(face, d, nullptr, nullptr, tilt, az, true, pr)) { ++s.unreach; continue; }
+                if (!ev.eval(face, d, nullptr, hasSeed ? seed : nullptr, tilt, az, true, pr)) {
+                    ++s.unreach;
+                    hasSeed = false;      // 断链后重新冷启，别拿远处的解硬顶
+                    continue;
+                }
+                for (int q = 0; q < 6; ++q) seed[q] = pr.theta[q];
+                hasSeed = true;
                 if (pr.clrTool < 0.0 || pr.clrLink < 0.0) ++s.hit;
                 if (pr.selfGap < 0.0) ++s.selfHit;
                 if (std::isfinite(pr.clearance)) {
@@ -1983,9 +1994,63 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 if (std::fabs(x.tilt - y.tilt) > 1e-6) return x.tilt < y.tilt;
                 return std::fabs(x.az) < std::fabs(y.az) - 1e-9;
             };
+            // ---- 抽样打分毕竟不是真解：对前 3 名再做一次「连续段热种子复核」
+            //
+            // 抽样点彼此间隔上百毫米，"接着上一个抽样点当种子"和阶段 3 里"接着上一个真实点
+            // 当种子"根本不是一回事。这一步的代价是实测出来的：`longwide` 单层 12476 点，
+            // 抽样口径下 10° 优于 20°，但真解里 10° 有 15 点不可达（HEAD 是 PASS，它变
+            // REJECT）。所以前 3 名各取 3 段 64 个连续点，按阶段 3 的方式解一遍，硬约束
+            // 全过的优先；都不全过就仍按抽样排序取第一（不因为复核失败而放弃整面）。
+            auto verifyFace = [&](double vt, double vz) -> int {
+                const std::vector<int>& Q = gp[g];
+                const int len2 = (int)Q.size();
+                if (len2 <= 0) return 0;
+                const int kW = 64;
+                int fails = 0;
+                for (int w = 0; w < 3; ++w) {
+                    int c = (len2 <= kW) ? 0 : (int)((long long)len2 * (w * 2 + 1) / 6);
+                    int a2 = std::max(0, std::min(len2 - kW, c - kW / 2));
+                    if (len2 <= kW) a2 = 0;
+                    int b2 = std::min(len2 - 1, a2 + kW - 1);
+                    double seed2[6] = {0, 0, 0, 0, 0, 0};
+                    bool has2 = false;
+                    for (int k = a2; k <= b2; ++k) {
+                        int i = Q[k];
+                        V3 n = t.normal(i);
+                        V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                        V3 axis, uUp;
+                        tiltAxisAndDir(n, axis, uUp);
+                        if (norm(uUp) < 1e-6) continue;
+                        V3 d = dirOf(n, uUp, axis, vt, vz);
+                        PR pr;
+                        if (!ev.eval(face, d, nullptr, has2 ? seed2 : nullptr, vt, vz, true, pr)) {
+                            ++fails;
+                            has2 = false;
+                            continue;
+                        }
+                        if (!hardOk(pr, p.hardClearance)) ++fails;
+                        for (int q = 0; q < 6; ++q) seed2[q] = pr.theta[q];
+                        has2 = true;
+                    }
+                }
+                return fails;
+            };
+
             int bestK = 0;
             for (int k = 1; k < keep; ++k)
                 if (pickBetter(pool[k], pool[bestK])) bestK = k;
+
+            std::vector<int> order(keep);
+            for (int k = 0; k < keep; ++k) order[k] = k;
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int x, int y) { return pickBetter(pool[x], pool[y]); });
+            int verifyFail = -1, verified = 0;
+            for (int t2 = 0; t2 < std::min(3, keep); ++t2) {
+                int vf = verifyFace(pool[order[t2]].tilt, pool[order[t2]].az);
+                ++verified;
+                if (t2 == 0) verifyFail = vf;
+                if (vf == 0) { bestK = order[t2]; verifyFail = 0; break; }
+            }
             if (bestK != 0) std::swap(pool[0], pool[bestK]);
             faceTilt[g] = pool[0].tilt;
             faceAz[g] = pool[0].az;
@@ -2006,10 +2071,10 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     if (t.spray[i]) finalTilt[i] = faceTilt[g];
             }
             if (g_prof.on) {
-                std::fprintf(stderr, "  [face%2zu] 行 %3d..%3d 点%5d 倾角%5.1f 方位%7.1f | 抽%d: P0=%d(撞%d/不可达%d/自撞%d) 间隙不足%d 最小%6.1f\n",
+                std::fprintf(stderr, "  [face%2zu] 行 %3d..%3d 点%5d 倾角%5.1f 方位%7.1f | 抽%d: P0=%d(撞%d/不可达%d/自撞%d) 间隙不足%d 最小%6.1f | 复核%d名 首选失败%d\n",
                              g, ra, rb, (int)P.size(), faceTilt[g], faceAz[g], Sfinal,
                              pool[0].s.p0(), pool[0].s.hit, pool[0].s.unreach, pool[0].s.selfHit,
-                             pool[0].s.shortClr, pool[0].s.minClr);
+                             pool[0].s.shortClr, pool[0].s.minClr, verified, verifyFail);
             }
         };
 
@@ -2124,28 +2189,53 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                   tilt, az, checkLinks, pr);
                 ++acc.recomputed;
                 if (!ok) {
-                    // 所有候选倾角都解不出逆解 → 不可达（P0）
-                    PR bad;
-                    bad.idx = i;
-                    bad.tiltDeg = tilt;
-                    // 不可达点没有真实位姿，但"指令倾角"是确定值：写进去，别让 tilt_deg 列
-                    // 落成 0 —— 那会让"整行 60° 倾斜、其中 45 点不可达"看起来像"倾角在 0/60 之间跳"。
-                    bad.sprayAngle = tilt;
-                    bad.clearance = -std::numeric_limits<double>::infinity();
-                    // 自碰撞标 nan 而不是 inf：inf 经 %f 落到 CSV 会变成一个天文数字，
-                    // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
-                    bad.selfGap = std::numeric_limits<double>::quiet_NaN();
-                    bad.ikOk = false;
-                    // 位置写「本该倾斜到的 TCP」= face + d·standoff，不写原始未倾斜点。
-                    // 写成 t.pos[i] 会与相邻的倾斜点差 2·standoff·sin(tilt/2)（60° 时
-                    // 整整 100mm），一条轨迹被拆成「倾斜壳」和「原始壳」两套，画出来
-                    // 全是长刺，落盘执行时也是一串不可插补的突跳。
-                    bad.pos = face + d * p.standoff;
-                    bad.gun = -d;
-                    bad.viol = RS_VIOL_IK_FAIL;
-                    results[i] = bad;
-                    hasResult[i] = 1;
-                    continue;   // 违规位在输出阶段按 pr.viol 统一统计，这里不必重复累加
+                    // ---- 面级姿态在这个点解不出逆解：先按「同方位、倾角最小偏离」救援，
+                    // 再判不可达。面级常量是工艺要求，但不该让个别点直接失去可涂性。
+                    // 实测 longwide（单层 12476 点）：面级 10° 下有 15 点解不出，20° 下全好；
+                    // 抽样打分看不见 0.12% 的失败（400 抽样期望命中 0.5 个），只能在逐点解时救。
+                    bool rescued = false;
+                    for (int m = 1; m <= 3 && !rescued; ++m) {
+                        for (int sgn = 1; sgn >= -1 && !rescued; sgn -= 2) {
+                            double t2 = tilt + sgn * m * p.tiltStepDeg;
+                            if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                            V3 d2 = dirOf(nrm, uUp, axis, t2, az);
+                            PR pr2;
+                            if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
+                                         hasSeed ? prevTheta : nullptr, t2, az, checkLinks, pr2))
+                                continue;
+                            if (!hardOk(pr2, p.hardClearance)) continue;
+                            pr2.idx = i;
+                            pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                            pr2.reverted = true;
+                            pr = pr2;
+                            ++acc.reverted;
+                            rescued = true;
+                        }
+                    }
+                    if (!rescued) {
+                        // 所有候选倾角都解不出逆解 → 不可达（P0）
+                        PR bad;
+                        bad.idx = i;
+                        bad.tiltDeg = tilt;
+                        // 不可达点没有真实位姿，但"指令倾角"是确定值：写进去，别让 tilt_deg 列
+                        // 落成 0 —— 那会让"整行 60° 倾斜、其中 45 点不可达"看起来像"倾角在 0/60 之间跳"。
+                        bad.sprayAngle = tilt;
+                        bad.clearance = -std::numeric_limits<double>::infinity();
+                        // 自碰撞标 nan 而不是 inf：inf 经 %f 落到 CSV 会变成一个天文数字，
+                        // 看着像"量到了"，实际是没测（没有位姿就没有碰撞体）。
+                        bad.selfGap = std::numeric_limits<double>::quiet_NaN();
+                        bad.ikOk = false;
+                        // 位置写「本该倾斜到的 TCP」= face + d·standoff，不写原始未倾斜点。
+                        // 写成 t.pos[i] 会与相邻的倾斜点差 2·standoff·sin(tilt/2)（60° 时
+                        // 整整 100mm），一条轨迹被拆成「倾斜壳」和「原始壳」两套，画出来
+                        // 全是长刺，落盘执行时也是一串不可插补的突跳。
+                        bad.pos = face + d * p.standoff;
+                        bad.gun = -d;
+                        bad.viol = RS_VIOL_IK_FAIL;
+                        results[i] = bad;
+                        hasResult[i] = 1;
+                        continue;   // 违规位在输出阶段按 pr.viol 统一统计，这里不必重复累加
+                    }
                 }
                 pr.idx = i;
                 // ---- 平滑回退：只回退硬约束，不再“差一点就回退”
