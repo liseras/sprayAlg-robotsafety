@@ -1037,6 +1037,9 @@ namespace SprayTrajViewer
             sb.AppendLine(sum.baseAuto != 0
                 ? $"基座：自动假设 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0}) —— 未标定，可达率仅作预判"
                 : $"基座：手动 ({sum.basePose[3]:F0}, {sum.basePose[7]:F0}, {sum.basePose[11]:F0})");
+            // 算法库构建时间：改完 C++ 却忘了同步 SprayTraj.dll 时，界面会安静地跑旧算法，
+            // 现象就是"明明改了还是老样子"。把这一行摆出来，一眼能对上是哪一版。
+            sb.AppendLine($"算法库：{LibStamp()}");
 
             ShowSafetyCard(verdict, vColor, $"耗时 {sw.ElapsedMilliseconds} ms", sb.ToString().TrimEnd());
 
@@ -1153,6 +1156,18 @@ namespace SprayTrajViewer
             App.Log("SAFETY/DRAW", null,
                 $"风险点 红={red.Count} 橙={orange.Count} 黄={nYellowDraw}/{yellowAll.Count}（抽稀）；" +
                 $"修正轨迹线段={(_fixedVisual?.Points.Count ?? 0) / 2}");
+        }
+
+        /// <summary>当前加载的 SprayTraj.dll 的构建时间（旧库没有这个导出 → 明确告诉用户）。</summary>
+        static string LibStamp()
+        {
+            try
+            {
+                IntPtr p = Native.robot_safety_build_stamp();
+                return p == IntPtr.Zero ? "未知" : (Marshal.PtrToStringAnsi(p) ?? "未知");
+            }
+            catch (EntryPointNotFoundException) { return "旧版库（无构建戳，请同步 SprayTraj.dll）"; }
+            catch { return "未知"; }
         }
 
         void ChkShowRisk_Changed(object sender, RoutedEventArgs e) => ApplyRiskVisibility();

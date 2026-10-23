@@ -138,6 +138,12 @@ typedef struct RobotSafetyResult {
 // 默认参数（standoff=100 safety=20 search=120 toolLen=150 ...）
 SPRAYTRAJ_API RobotSafetyParams robot_safety_default_params(void);
 
+// 安全层的构建时间戳（如 "Oct 23 2026 13:20:05"），静态字符串、无需释放。
+// 存在理由：WPF 程序用的是 bin 目录里的那份 SprayTraj.dll，C++ 改完后若忘了
+// 同步（或程序开着导致 PostBuild 拷贝失败），界面会安静地跑旧算法 —— 现象是
+// "明明改了，怎么还是老样子"。界面上把这一行显示出来，一眼就能判断用的是哪一版。
+SPRAYTRAJ_API const char* robot_safety_build_stamp(void);
+
 // 主入口：对一条轨迹做可执行性校验 + 倾角修正
 //   pts       : 轨迹点（spray_traj_generate 的输出，8 个字段）
 //   cloudXyz  : 原始点云 xyz（3*n 个 double），必须与轨迹同坐标系

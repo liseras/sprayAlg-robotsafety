@@ -1475,6 +1475,8 @@ bool rayStandoff(const CloudIndex& cloud, const V3& p, const V3& gun, double tub
 
 // ================================================================ C ABI
 
+const char* robot_safety_build_stamp(void) { return __DATE__ " " __TIME__; }
+
 RobotSafetyParams robot_safety_default_params(void) {
     RobotSafetyParams p;
     std::memset(&p, 0, sizeof(p));
@@ -2271,8 +2273,35 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                             }
                         }
                         if (!fixed) {
-                            bool cacheHard = hardOk(cache[i], p.hardClearance);
-                            if (cacheHard || hardCmp(pr, cache[i]) < 0) {
+                            // 退回「逐点最优」只在两种情况下做，且都不许白退：
+                            //
+                            // 1) 先试「面级方位 + 该点最优倾角」。方位不变，位移只有倾角那一点
+                            //    （2·standoff·sin(Δ/2)，5° → 8.7mm）。
+                            // 2) 缓存原样退回，但**只认方位相同的**，而且必须真过得了硬约束。
+                            //
+                            // 为什么卡这么死：方位是"从哪一侧进枪"，翻一次 TCP 就绕面点转
+                            // 2·standoff·sin(Δaz/2)（60° → 100mm），画出来是长刺，落盘是一串
+                            // 不可插补的突跳。而实测开口盒子 7070..7075 这 6 个点，面级姿态的
+                            // self_gap 是 −0.38~−0.55、7072 的连杆还穿进去 −20.3mm —— 缓存原样
+                            // 退回也只是把"撞"换成"另一种撞"（间隙 0.25~1.15mm，自碰撞照样不过），
+                            // 却为此付出了 71mm 的甩腕。既然两个都过不了硬约束，就保持面级姿态：
+                            // 姿态规整、违规照实报，由站位/基座去解决，而不是在这里甩姿态。
+                            double cTilt = cache[i].tiltDeg;
+                            if (std::fabs(cache[i].azDeg - az) > 1e-6) {
+                                V3 d2 = dirOf(nrm, uUp, axis, cTilt, az);
+                                PR pr2;
+                                if (ev.eval(face, d2, hasRefX ? &prevX : nullptr,
+                                            hasSeed ? prevTheta : nullptr, cTilt, az, checkLinks, pr2) &&
+                                    hardOk(pr2, p.hardClearance)) {
+                                    pr2.idx = i;
+                                    pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                                    pr2.reverted = true;
+                                    pr = pr2;
+                                    ++acc.reverted;
+                                    fixed = true;
+                                }
+                            }
+                            if (!fixed && hardOk(cache[i], p.hardClearance)) {
                                 pr = cache[i];
                                 pr.idx = i;
                                 pr.reverted = true;

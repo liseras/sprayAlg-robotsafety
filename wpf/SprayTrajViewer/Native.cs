@@ -240,6 +240,9 @@ namespace SprayTrajViewer
         public static extern void robot_safety_free(ref RobotSafetyResult res);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern IntPtr robot_safety_build_stamp();
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern IntPtr robot_safety_rule_name(uint bit);
     }
 }
