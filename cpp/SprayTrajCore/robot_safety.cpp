@@ -2064,6 +2064,27 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         double standoffMaxErr = 0.0;
     };
 
+    // 违规位单点判定。阶段 3 和后面的「回退段统一姿态」都会改位姿，两处必须同口径，
+    // 所以集中在这里算一次，别各写一份。
+    auto setViolBits = [&](PR& pr) {
+        const unsigned int kMask = RS_VIOL_IK_FAIL | RS_VIOL_TOOL_HIT | RS_VIOL_LINK_HIT |
+                                   RS_VIOL_CLEARANCE | RS_VIOL_SELF_COLLISION |
+                                   RS_VIOL_JOINT_LIMIT | RS_VIOL_SPRAY_ANGLE |
+                                   RS_VIOL_NEAR_SINGULAR;
+        pr.viol &= ~kMask;
+        if (!pr.ikOk) { pr.viol |= RS_VIOL_IK_FAIL; return; }
+        // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
+        // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
+        // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
+        if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
+        if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
+        if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
+        if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
+        if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
+        if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
+        if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
+    };
+
     auto runRange3 = [&](int a, int b, Acc3& acc) {
         double prevTheta[6] = {0, 0, 0, 0, 0, 0};
         bool hasSeed = false;
@@ -2174,16 +2195,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
             acc.standoffMaxErr = std::max(acc.standoffMaxErr, pr.standoffErr);
 
-            // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
-            // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
-            // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
-            if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
-            if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
-            if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
-            if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
-            if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
-            if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
-            if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
+            setViolBits(pr);
 
             if (pr.ikOk) ++acc.reachable;
             results[i] = pr;
@@ -2237,6 +2249,127 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             reachable += a.reachable;
             standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
         }
+    }
+
+    // ---- 阶段 3.5：回退段统一姿态（把「阶梯」压成「平台」）
+    //
+    // 逐点回退是必要的（硬约束不通过就得偏），但它会在同一个面上造出阶梯：开口盒子实测
+    // 1417 个回退点落在 81 段里，其中 18 段在十几个点内连着出现 30°→40°→55°→30° 三种姿态。
+    // 视觉上仍是刺，节拍上仍是连续甩腕 —— 而要求是「同一个面喷涂过程中姿态尽量不要变」。
+    //
+    // 所以把相邻回退点（允许夹 ≤2 个非回退点、且不跨行）归成一段，段内只用一个姿态：
+    // 候选 = 段内逐点用过的姿态 + 面级姿态；按「段内硬约束失败点数 → 偏离面级姿态的大小」
+    // 择优。只在硬约束层面取舍：仍有失败点的那些点保留各自的最佳位姿，绝不为了整齐而降标准。
+    int segUnified = 0;
+    {
+        const int kGap = 2;
+        auto isRev = [&](int k) { return hasResult[k] && results[k].reverted; };
+        int i = 0;
+        while (i < n) {
+            if (!isRev(i)) { ++i; continue; }
+            const int a = i;
+            const int ri = rowOf[a];
+            int b = i;
+            while (b + 1 < n) {
+                int k = b + 1;
+                while (k < n && !isRev(k)) ++k;
+                if (k < n && k - b - 1 <= kGap && rowOf[k] == ri) b = k;
+                else break;
+            }
+            i = b + 1;
+            if (b - a < 1) continue;   // 单点段没有阶梯可压
+
+            const double faceTilt = finalTilt[a];
+            const double faceAz = (ri >= 0) ? azRow[ri] : 0.0;
+            std::vector<std::pair<double, double>> cands;
+            auto addCand = [&](double t2, double z2) {
+                for (const auto& c : cands)
+                    if (std::fabs(c.first - t2) < 1e-9 && std::fabs(c.second - z2) < 1e-9) return;
+                cands.emplace_back(t2, z2);
+            };
+            for (int k = a; k <= b; ++k)
+                if (isRev(k)) addCand(results[k].tiltDeg, results[k].azDeg);
+            addCand(faceTilt, faceAz);
+
+            int bestCi = -1, bestFail = n + 1;
+            double bestDev = 1e300;
+            for (int ci = 0; ci < (int)cands.size(); ++ci) {
+                int fail = 0;
+                // 不能提前 break：bestFail 降到 0 之后再"只在 fail<bestFail 时评估"等于
+                // 把后面所有候选都当成 0 失败（没评估），于是按"偏离最小"挑回了面级姿态 ——
+                // 那恰恰是过不了硬约束才对退的那个。必须每个候选都完整评一遍。
+                for (int k = a; k <= b; ++k) {
+                    V3 nrm = t.normal(k);
+                    V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
+                    V3 ax, up;
+                    tiltAxisAndDir(nrm, ax, up);
+                    if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+                    V3 d2 = dirOf(nrm, up, ax, cands[ci].first, cands[ci].second);
+                    bool checkLinks = (k % std::max(1, p.linkStride) == 0);
+                    const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta : nullptr;
+                    PR tmp;
+                    if (!ev.eval(fpt, d2, nullptr, seed, cands[ci].first, cands[ci].second,
+                                 checkLinks, tmp) ||
+                        !hardOk(tmp, p.hardClearance))
+                        ++fail;
+                }
+                double dev = std::fabs(cands[ci].first - faceTilt) +
+                             0.5 * std::fabs(cands[ci].second - faceAz);
+                if (fail < bestFail || (fail == bestFail && dev < bestDev)) {
+                    bestCi = ci; bestFail = fail; bestDev = dev;
+                }
+            }
+            // 段内允许极少数点仍过不了硬约束（那几点保留自己的位姿，见下面的逐点兜底）；
+            // 容忍带与面组择优同口径：2% 段长 + 1 点。全段都必须过才算统一，会一段都统一不了 ——
+            // 因为"阶梯"本身就是逐点需求单调变化造成的，最长那段 187 点里必然有几个点要更高倾角。
+            const int band = std::max(1, (int)(0.02 * (b - a + 1) + 0.5));
+            if (std::getenv("RS_DBG_SEG"))
+                std::fprintf(stderr, "  [seg] %d..%d 长%d 候选%zu 最优失败%d 容忍%d\n",
+                             a, b, b - a + 1, cands.size(), bestFail, band);
+            if (bestCi < 0 || bestFail > band) continue;
+
+            const double bTilt = cands[bestCi].first;
+            const double bAz = cands[bestCi].second;
+            int applied = 0;
+            for (int k = a; k <= b; ++k) {
+                V3 nrm = t.normal(k);
+                V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
+                V3 ax, up;
+                tiltAxisAndDir(nrm, ax, up);
+                if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+                V3 d2 = dirOf(nrm, up, ax, bTilt, bAz);
+                bool checkLinks = (k % std::max(1, p.linkStride) == 0);
+                const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta : nullptr;
+                PR tmp;
+                if (!ev.eval(fpt, d2, nullptr, seed, bTilt, bAz, checkLinks, tmp) ||
+                    !hardOk(tmp, p.hardClearance)) {
+                    continue;   // 这一点在本段姿态下过不了硬约束：原样保留，不动它
+                }
+                const bool moved = norm(tmp.pos - results[k].pos) > 1e-6;
+                tmp.idx = k;
+                tmp.sprayAngle = angleBetweenDeg(-tmp.gun, nrm);
+                tmp.reverted = (std::fabs(bTilt - faceTilt) > 1e-6 ||
+                                std::fabs(bAz - faceAz) > 1e-6);
+                setViolBits(tmp);
+                results[k] = tmp;
+                if (moved) ++applied;
+            }
+            // 只要有一段真的改了位姿就计一段；段内个别点没跟上（见上面的 continue）不算失败，
+            // 那些点仍各自满足硬约束 —— 这里绝不为整齐牺牲硬约束。
+            if (applied > 0) ++segUnified;
+        }
+
+        // 段统一之后，回退点数与可达点数都得按最终位姿重数一遍，否则报的是"过程账"。
+        reverted = 0;
+        reachable = 0;
+        for (int k = 0; k < n; ++k) {
+            if (!hasResult[k]) continue;
+            if (results[k].reverted) ++reverted;
+            if (results[k].ikOk) ++reachable;
+        }
+        if (g_prof.on)
+            std::fprintf(stderr, "  [seg] 回退段统一=%d 段 · 回退点=%d 可达=%d\n",
+                         segUnified, reverted, reachable);
     }
 
     // 生效行数：只有"确实改变了个点位姿"的行才计入 azStanceRows。
