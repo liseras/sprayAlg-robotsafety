@@ -1795,6 +1795,16 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             int hit = 0;        // 枪体/连杆 穿透点云（P0）
             int unreach = 0;    // IK 解不出（P0）
             int selfHit = 0;    // 自碰撞（P0）
+            // 关节超出限位。**只统计、不参与择优**，原因写在下面（这行是刻意的，别"修"）。
+            //
+            // 看起来它该进 P0：hardOk 把 over 当硬约束。但实测把 over 计入 P0 之后，
+            // 开口盒子 face3 会从 (60°, 0°) 换成 (60°, −60°) —— 关节超限点数确实从
+            // 1111 降到 835，代价是整面 2080 点的枪轴方位歪 60°：与相邻面组差 60°、
+            // 交界处 TCP 一次甩 100mm（选 −120° 时是 152mm），而且喷涂膜厚会沿面倾斜。
+            // 也就是说，"减少逐点回退"的唯一手段是让整面斜着进枪，这在工艺上是硬伤。
+            // 关节超限是个点级的腕部问题，换 5~10° 倾角就能救（位移只有 9mm），
+            // 交给阶段 3 逐点处理，比让整面歪掉便宜得多。
+            int over = 0;
             int shortClr = 0;   // 间隙 < safety 的点数（工艺软目标）
             double minClr = 1e300;
             int p0() const { return hit + unreach + selfHit; }
@@ -1830,6 +1840,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 hasSeed = true;
                 if (pr.clrTool < 0.0 || pr.clrLink < 0.0) ++s.hit;
                 if (pr.selfGap < 0.0) ++s.selfHit;
+                if (pr.over) ++s.over;
                 if (std::isfinite(pr.clearance)) {
                     if (pr.clearance < p.safety) ++s.shortClr;
                     if (pr.clearance < s.minClr) s.minClr = pr.clearance;
@@ -1895,10 +1906,18 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             // 候选方位：向上(0) + 站位侧 + 阶段 1 兜底投出来的方位（保持旧口径能救的行仍能救）
             std::vector<double> azs;
             azs.push_back(0.0);
+            // 方位候选的白名单边界：**工艺上「上翻方向」的左右极限是 ±60°**。
+            // 为什么必须卡：方位决定枪从哪一侧进，超过 90° 就是"从侧面/下面斜插"，
+            // 开口盒子 face3 实测会选出方位 −120° 的姿态 —— 它的关节超限点数确实最少
+            // （S=400 下 107，方位 0 是 162），但整面 2080 点的 TCP 要绕面点转 120°，
+            // 与相邻面组（方位 0）交界处一次甩 152mm，比它省下的那点关节余量贵得多。
+            // 可涂性可以用倾角换，不该用"整面歪着进"换。
+            const double kAzLimitDeg = 60.0;
             auto pushAz = [&](double v) {
                 if (!std::isfinite(v)) return;
                 while (v <= -180.0) v += 360.0;
                 while (v > 180.0) v -= 360.0;
+                if (std::fabs(v) > kAzLimitDeg + 1e-9) return;
                 for (double e : azs) if (std::fabs(e - v) < 1e-6) return;
                 azs.push_back(v);
             };
@@ -1921,7 +1940,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             // ---- 候选评估：每一档都只在**同一采样数**内做比较 ----
             // 混着比会挑出"只在小样本上好看"的姿态：开口盒子 +X 面实测把 (55°,60°) 的 P0=10
             // 让位给了 (30°,0°) 的"8 点全不可达"，最后整面 2103 点全部不可达。
-            const int S1 = 16;
+            const int S1 = 32;
             std::vector<Cand> pool;
             pool.reserve(tilts.size() * azs.size());
             for (double tt : tilts)
@@ -1937,6 +1956,8 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 for (double tt = tilt0; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg) {
                     for (int a = -180; a < 180; a += 30) {
                         double aa = (double)a;
+                        // 与 pushAz 同一条工艺边界：只允许"上翻方向左右 60° 内"
+                        if (std::fabs(aa) > kAzLimitDeg + 1e-9) continue;
                         bool dup = false;
                         for (const Cand& c : pool) {
                             if (std::fabs(c.tilt - tt) < 1e-6 && std::fabs(c.az - aa) < 1e-6) { dup = true; break; }
@@ -1965,7 +1986,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             }
 
             // 密集复核：粗采样分不出的差距，密集采样常常分得出来。
-            int keep = std::min<int>(8, (int)pool.size());
+            //
+            // keep 必须足够宽。开口盒子 face3 的候选池里，真正的第一名是
+            // `(55°, 30°)`（S=400 下 P0=6），但它在 S=16 粗筛时是 6/16 失败、
+            // 排到第 9 —— 而终选只在 keep 名前挑，于是选走了 (60°, −120°)
+            // （P0=107，整面斜着进、和相邻面组差 120°，最大突跳 152mm）。
+            // 采样越少，"失败 6 个"这种绝对数越不可比；把粗筛抬到 32、复核扩到 16
+            // 名，就是为了让这类候选有机会被同一把尺子重新量一次。
+            int keep = std::min<int>(16, (int)pool.size());
             int Sfinal = std::min(96, (int)P.size());
             if (Sfinal > S1) {
                 for (int k = 0; k < keep; ++k) pool[k].s = scoreFace(g, pool[k].tilt, pool[k].az, Sfinal);
@@ -2058,12 +2086,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             faceAz[g] = pool[0].az;
             if (const char* dbgG = std::getenv("RS_DBG_FACE")) {
                 if (atoi(dbgG) == (int)g) {
-                    printf("[pool%zu] 候选池前 10（S=%d）:\n", g, Sfinal);
+                    printf("[pool%zu] 候选池前 10（前 %d 名按 S=%d 复核，其余仍是 S=%d 粗筛，两者不可比）:\n",
+                           g, keep, Sfinal, S1);
                     for (int k = 0; k < (int)pool.size() && k < 10; ++k)
-                        printf("   tilt=%5.1f az=%7.1f P0=%4d 撞%4d 不可达%4d 自撞%3d 间隙不足%3d 最小%7.1f\n",
+                        printf("   [S=%3d] tilt=%5.1f az=%7.1f P0=%4d 撞%4d 不可达%4d 自撞%3d 关节%4d 间隙不足%3d 最小%7.1f\n",
+                               (k < keep ? Sfinal : S1),
                                pool[k].tilt, pool[k].az, pool[k].s.p0(), pool[k].s.hit,
-                               pool[k].s.unreach, pool[k].s.selfHit, pool[k].s.shortClr,
-                               pool[k].s.minClr);
+                               pool[k].s.unreach, pool[k].s.selfHit, pool[k].s.over,
+                               pool[k].s.shortClr, pool[k].s.minClr);
                     fflush(stdout);
                 }
             }
@@ -2129,6 +2159,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     struct Acc3 {
         int recomputed = 0, reverted = 0, reachable = 0;
         double standoffMaxErr = 0.0;
+        // 面级姿态在这些点上「为什么过不了硬约束」的分类。
+        // 用来回答一个反复被问的问题：逐点回退到底是「真撞了不得不救」，
+        // 还是「只差一点余量就被当成撞」。分类互斥，按严重度优先计入一条。
+        int ffPierce = 0;   // 间隙 < 0：真的穿进去了
+        int ffSelf = 0;     // 自碰撞（胶囊近似间的重叠）
+        int ffClr = 0;      // 0 <= 间隙 < hardClearance：只是余量不足，没撞
+        int ffJoint = 0;    // 关节超限
+        int ffIk = 0;       // 解不出逆解
     };
 
     // 违规位单点判定。阶段 3 和后面的「回退段统一姿态」都会改位姿，两处必须同口径，
@@ -2251,6 +2289,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 if (hasCache[i]) {
                     bool smoothHard = hardOk(pr, p.hardClearance);
                     if (!smoothHard) {
+                        // 按严重度归类「面级姿态为什么过不了」，互斥计数。
+                        // 口径与 hardOk 严格一致：margin < jointMarginMin 只是 P1 软告警，
+                        // 不触发回退，所以不能算进来（否则会把软告警说成"必须救"）。
+                        if (!pr.ikOk) ++acc.ffIk;
+                        else if (pr.clearance < 0.0) ++acc.ffPierce;
+                        else if (pr.selfGap < 0.0) ++acc.ffSelf;
+                        else if (pr.over) ++acc.ffJoint;
+                        else if (pr.clearance < p.hardClearance) ++acc.ffClr;
                         // 先在「面级常量」附近找**偏离最小**的合法姿态（同方位，倾角 ±step/±2step/±3step）。
                         // 直接退回本点最优的话，倾角可能从 60° 跳回 35°，TCP 一次甩出上百毫米
                         // —— 那正是"修正后轨迹一团乱刺"的来源。物理上必须偏的点也要尽量少偏。
@@ -2362,12 +2408,19 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             });
         }
         for (auto& th : pool) th.join();
+        int ffPierce = 0, ffSelf = 0, ffClr = 0, ffJoint = 0, ffIk = 0;
         for (const auto& a : accs) {
             recomputed += a.recomputed;
             reverted += a.reverted;
             reachable += a.reachable;
             standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
+            ffPierce += a.ffPierce; ffSelf += a.ffSelf; ffClr += a.ffClr;
+            ffJoint += a.ffJoint;   ffIk += a.ffIk;
         }
+        if (g_prof.on)
+            std::fprintf(stderr, "  [fb] 面级姿态过不了硬约束 %d 点：穿透 %d · 自碰撞 %d · 间隙不足 %d · 关节 %d · IK %d\n",
+                         ffPierce + ffSelf + ffClr + ffJoint + ffIk,
+                         ffPierce, ffSelf, ffClr, ffJoint, ffIk);
     }
 
     // ---- 阶段 3.5：回退段统一姿态（把「阶梯」压成「平台」）
