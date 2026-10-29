@@ -3867,6 +3867,35 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             for(int k : s.inl) (dot(Pf[k]-c0, n) < hMid ? lo : hi).push_back(k);
             if(lo.size() < 30 || hi.size() < 30){ s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue; }
 
+            // 少数侧必须"铺得开"：面内两个方向的包围盒都要达到多数侧的 25% 以上。
+            // 单层大面的边缘小团（本次用户件 36 点，仅 5.3x5.0x2.9mm）排序后也会
+            // 出现 3.98mm 的"最大间隙"；若把它当成另一层壁，29 万点的主面就会被
+            // 误标成内壁、翻转法向，再被"朝下 >130°"整面跳过——界面上就只剩边缘
+            // 两条线。真双层两面共享同一块投影区域（norim 两面 ext 比 >90%，
+            // rim 的稀疏层也铺满整个 400x300 底面），25% 不会误伤。
+            const Vec3 bu = norm(cross(n, std::fabs(n.z) < 0.9 ? Vec3{0,0,1} : Vec3{1,0,0}));
+            const Vec3 bv = cross(n, bu);
+            auto ext2 = [&](const std::vector<int>& v, double& eu, double& ev){
+                double u0=1e300,u1=-1e300,v0=1e300,v1=-1e300;
+                for(int k : v){
+                    const double a=dot(Pf[k],bu), b=dot(Pf[k],bv);
+                    u0=std::min(u0,a); u1=std::max(u1,a);
+                    v0=std::min(v0,b); v1=std::max(v1,b);
+                }
+                eu = (v.empty()? 0.0 : u1-u0);
+                ev = (v.empty()? 0.0 : v1-v0);
+            };
+            double lu,lv,hu,hv;
+            ext2(lo,lu,lv); ext2(hi,hu,hv);
+            const double coverU = std::min(lu,hu) / std::max(1e-9, std::max(lu,hu));
+            const double coverV = std::min(lv,hv) / std::max(1e-9, std::max(lv,hv));
+            if(std::min(coverU,coverV) < 0.25){
+                if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                    fprintf(stderr,"[split] seg%zu 少侧覆盖不足 %.1f%%x%.1f%%，按单层处理\n",
+                            si2, 100.0*coverU, 100.0*coverV);
+                s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue;
+            }
+
             // 双峰路径的防误拆校验：两片必须各自薄而平，且互相平行。
             // 判据一拆出来的不加这道校验（原来能拆的一律保持原样，避免回归漂移）。
             if(viaPeak){
@@ -5430,8 +5459,12 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             Vec3 X0 = pl.c + u*q0.x + v*q0.y;
             Vec3 pStart = X0 + pl.n*params->standoff;
 
-            auto pushMove=[&](const Vec3& p){
-                allPts.push_back({p.x,p.y,p.z, gun.x,gun.y,gun.z, params->speed, 0});
+            // 姿态必须跟着"腿"走：退出腿仍是上一面姿态，进入腿才是本面姿态。
+            // 原来所有过渡点一律用 gun（本面），退枪点就提前换了姿态 —— 开口盒子实测
+            // 退枪段 0~100mm 内枪轴翻 90°~180°（#13654→#13655 位置不动、姿态翻 180°），
+            // 真机上等于原地猛拧手腕。空移是关枪过渡，姿态应在安全高度上空慢慢转。
+            auto pushMove=[&](const Vec3& p, const Vec3& nrm){
+                allPts.push_back({p.x,p.y,p.z, -nrm.x,-nrm.y,-nrm.z, params->speed, 0});
             };
             // ① 直线可达就直接连（见 segClearOK 的说明）。
             //    spray 是"段属性"（两端都为 1 才是喷涂段），所以必须在中间插一个
@@ -5444,7 +5477,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
                     fprintf(stderr, "[trans] 面%zu 直连 pEnd=(%.1f,%.1f,%.1f) pStart=(%.1f,%.1f,%.1f)\n",
                             si, pEnd.x,pEnd.y,pEnd.z, pStart.x,pStart.y,pStart.z);
-                pushMove(pEnd + (pStart - pEnd)*0.5);
+                pushMove(pEnd + (pStart - pEnd)*0.5, prevNormal);
             } else {
                 const Vec3 Top{pStart.x, pStart.y, zSafe};
                 auto legOK=[&](const Vec3& w0, const Vec3& w1){
@@ -5477,9 +5510,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                                 si, exitScore, gunClearEff);
                     }
                 }
-                pushMove(L1);
+                pushMove(L1, prevNormal);              // ② 退出腿：保持上一面姿态（不再提前转向）
                 // ③ 抬到全局安全高度（最高面上二者等高，不会出现"先冲高再回落"）
-                pushMove({L1.x, L1.y, zSafe});
+                pushMove({L1.x, L1.y, zSafe}, prevNormal);
                 // ④ 在安全高度上平移到本面首点正上方，再降落。
                 //    垂直降落会穿件的情形：首点正上方有凸台、或首点在腔内/凸台下
                 //    （complex 实测 204mm 直降穿过工件，最差 0.38mm，且这一段
@@ -5489,7 +5522,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 //    原来只查了垂直腿，complex 上进入腿沿法向走 100mm，中途擦过
                 //    一个凸台（实测最差 0.35mm，12 个点 <20mm），因为没人查。
                 if(legOK(Top, pStart)){
-                    pushMove(Top);
+                    pushMove(Top, pl.n);               // ④ 到顶空才转到本面姿态
                 } else {
                     // 候选落点：沿法向由近到远 3 档 + 面内 8 个横向方位，逐条两腿验。
                     // 都不干净时取"最小净空最大"的那个 —— 宁可绕远，也不留一段 0.2mm
@@ -5512,8 +5545,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                         consider(pStart + (inPlane*std::cos(th) + inPlane2*std::sin(th))*base);
                     }
                     const Vec3 Wtop{bestW.x, bestW.y, zSafe};
-                    pushMove(Wtop);
-                    if(len(bestW - pStart) > 1e-6) pushMove(bestW);
+                    pushMove(Wtop, pl.n);
+                    if(len(bestW - pStart) > 1e-6) pushMove(bestW, pl.n);
                     if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
                         fprintf(stderr, "[trans] 面%zu 降落改道 W=(%.1f,%.1f,%.1f) 最小净空 %.1f\n",
                                 si, bestW.x, bestW.y, bestW.z, bestScore);
@@ -5713,6 +5746,291 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             fprintf(stderr, "[转角] 删零长段 %d 个，密集区重采样 %d 点，删探出点 %d 个，发卡弯倒角 %d 处\n",
                     nDup, nRe, nSpur, nChamf);
         allPts.swap(q);
+    }
+
+    // ================= 空移段整段重规划（第二十一轮，2026-10-29） =================
+    // 用户口径：空移段不是"两点直线、交给控制器插补"，而是由本算法把整条路径插补出来，
+    //   姿态沿弧长从上一面末点平滑转到下一面首点（每步转角有上限）；
+    //   插补出来的点要能验安全（点云净空 + 不穿面），不安全就换一条途经重新验，
+    //   全都不行才退回原路径并告警（留给 safety 层兜底）。
+    // 候选途径（按代价从低到高）：直连 / 反向退出 / 抬升三档 / 左右各 3 档侧绕。
+    // 绕行长度上限 = 原路径长度 × 2（用户 2026-10-29 拍板），超限视为不可达，不做无限绕远。
+    {
+        double mvStep = pstep;
+        if(const char* e = std::getenv("SPRAYTRAJ_MOVE_STEP")){
+            double v = atof(e);
+            if(v > 0.5) mvStep = v;
+        }
+        const double kStepDeg   = 5.0;   // 空移相邻点姿态转角上限（度/点）
+        double kMaxDetour = 2.0;         // 换途经的长度上限系数（用户 2026-10-29 拍板 2 倍）
+        if(const char* e = std::getenv("SPRAYTRAJ_MOVE_DETOUR")){
+            double v = atof(e);
+            if(v >= 1.0) kMaxDetour = v;   // 现场可放宽（短段被 2 倍卡住时可调到 2.5~3）
+        }
+        // 几何安全门槛用「枪体安全半径」而不是 moveClear：moveClear=0.25×standoff=25mm 是
+        // "直线可达"的宽松判据，而开口盒子这类内腔空移的几何极限就是 20mm 出头，
+        // 用 25mm 当门槛会把本来合格的路径判成"无可行途经"（实测 4 段全误报）。
+        // 现场可用 SPRAYTRAJ_MOVE_NEED 抬高门槛（越大越保守、越容易换途经）。
+        double kSafeNeed = std::max(6.0, gunClearEff);
+        if(const char* e = std::getenv("SPRAYTRAJ_MOVE_NEED")){
+            double v = atof(e);
+            if(v > 0.5) kSafeNeed = v;
+        }
+
+        auto pathLen = [&](const std::vector<Vec3>& v)->double{
+            double s = 0.0;
+            for(size_t k = 1; k < v.size(); ++k) s += len(v[k] - v[k-1]);
+            return s;
+        };
+        // 整条折线的几何安全分：返回最小净空；任一段穿面直接 0。
+        auto pathScore = [&](const std::vector<Vec3>& v)->double{
+            double mn = 1e30;
+            for(size_t k = 1; k < v.size(); ++k){
+                if(segCrossFace(v[k-1], v[k])) return 0.0;
+                mn = std::min(mn, segMinClear(v[k-1], v[k]));
+            }
+            return mn;
+        };
+        // 单位向量球面插值（姿态）：两端近似反向时绕固定轴转，避免过零退化。
+        auto slerpU = [&](const Vec3& a, const Vec3& b, double t)->Vec3{
+            double c = std::max(-1.0, std::min(1.0, dot(a, b)));
+            const double th = std::acos(c);
+            Vec3 r;
+            if(th < 1e-6){
+                r = a;
+            } else if(th > 3.141592653589793 - 1e-3){
+                Vec3 ax = norm(cross(a, (std::fabs(a.z) < 0.9) ? Vec3{0,0,1} : Vec3{1,0,0}));
+                const double an = 3.141592653589793 * t;
+                r = a*std::cos(an) + ax*std::sin(an);
+            } else {
+                const double s = std::sin(th);
+                r = a*(std::sin((1.0 - t)*th)/s) + b*(std::sin(t*th)/s);
+            }
+            return norm(r);
+        };
+        // 沿折线按弧长插值；**逐段插值、强制保留每个折线顶点**。
+        // 不能做"整段等距重采样"：等距点会跳过直角拐点，把"退出→抬升→平移→下降"
+        // 折成一条斜线，等于把避障路径拉直（可能直接穿件）。
+        auto resample = [&](const std::vector<Vec3>& v, double step,
+                            std::vector<Vec3>& out, std::vector<double>& ts)->double{
+            const size_t nv = v.size();
+            std::vector<double> cum(nv, 0.0);
+            for(size_t k = 1; k < nv; ++k) cum[k] = cum[k-1] + len(v[k] - v[k-1]);
+            const double L = cum.back();
+            if(L < 1e-9){ out.assign(1, v.front()); ts.assign(1, 0.0); return 0.0; }
+            out.clear(); ts.clear();
+            out.push_back(v.front()); ts.push_back(0.0);
+            for(size_t k = 1; k < nv; ++k){
+                const double sl = cum[k] - cum[k-1];
+                if(sl < 1e-9){ out.push_back(v[k]); ts.push_back(cum[k] / L); continue; }
+                const int m = std::max(1, (int)std::ceil(sl / std::max(0.5, step)));
+                for(int t = 1; t <= m; ++t){
+                    const double f = (double)t / (double)m;
+                    out.push_back(v[k-1] + (v[k] - v[k-1]) * f);
+                    ts.push_back((cum[k-1] + sl*f) / L);
+                }
+            }
+            return L;
+        };
+
+        std::vector<SprayTrajPoint> merged;
+        merged.reserve(allPts.size()*2);
+        int nSeg = 0, nReplan = 0, nFail = 0;
+        double minClearAll = 1e30, maxStepDeg = 0.0, maxDetourRatio = 1.0;
+        long long nIns = 0;
+
+        size_t i = 0;
+        while(i < allPts.size()){
+            if(allPts[i].spray != 0){ merged.push_back(allPts[i]); ++i; continue; }
+            size_t j = i;
+            while(j < allPts.size() && allPts[j].spray == 0) ++j;
+            const bool hasPrev = (i > 0);
+            const bool hasNext = (j < allPts.size());
+            if(!hasPrev || !hasNext){                     // 首/末段没有两端喷涂点：原样保留
+                for(size_t k = i; k < j; ++k) merged.push_back(allPts[k]);
+                i = j; continue;
+            }
+            ++nSeg;
+            const SprayTrajPoint& P0 = allPts[i-1];       // 起点 = 上一面喷涂末点
+            const SprayTrajPoint& P1 = allPts[j];         // 终点 = 下一面喷涂首点
+            const Vec3 A{P0.x,P0.y,P0.z}, B{P1.x,P1.y,P1.z};
+            const Vec3 ijkA{P0.i,P0.j,P0.k}, ijkB{P1.i,P1.j,P1.k};
+            const Vec3 nA{-ijkA.x,-ijkA.y,-ijkA.z}, nB{-ijkB.x,-ijkB.y,-ijkB.z};
+
+            std::vector<Vec3> orig;
+            orig.push_back(A);
+            for(size_t k = i; k < j; ++k) orig.push_back({allPts[k].x, allPts[k].y, allPts[k].z});
+            orig.push_back(B);
+            const double L0 = std::max(1.0, pathLen(orig));
+            const double c0 = pathScore(orig);
+
+            std::vector<Vec3> best = orig;
+            double bestClear = c0, bestLen = pathLen(orig);
+            const char* tag = "原路径";
+
+            // 原路径几何不合格 → 换途经：短→长依次试，取"净空最大者，同净空取最短"。
+            if(c0 < kSafeNeed){
+                std::vector<std::vector<Vec3>> C;
+                C.push_back({A, B});                                   // 0 直连
+                {                                                     // 1 反向退出（沿工件外方向退）
+                    const Vec3 E = A - nA*clear;
+                    const Vec3 Et{E.x, E.y, std::max(zSafe, E.z)};
+                    C.push_back({A, E, Et, {B.x, B.y, Et.z}, B});
+                }
+                for(double h : {0.0, 0.6*params->standoff, 1.5*params->standoff}){  // 2~4 抬升三档
+                    const double zH = zSafe + h;
+                    const Vec3 L1 = A + nA*clear;
+                    const Vec3 L1t{L1.x, L1.y, std::max(zH, L1.z)};
+                    C.push_back({A, L1, L1t, {B.x, B.y, L1t.z}, B});
+                }
+                const Vec3 hz{B.x-A.x, B.y-A.y, 0.0};                 // 5~10 左右各 3 档侧绕
+                const double span = std::max(1.0, len(hz));
+                const Vec3 hd = (len(hz) < 1e-6) ? Vec3{1,0,0} : norm(hz);
+                const Vec3 side = norm(cross(hd, Vec3{0,0,1}));
+                for(double sgn : {-1.0, 1.0})
+                    for(double off : {0.6, 1.2, 2.0}){
+                        const Vec3 M{(A.x+B.x)*0.5 + side.x*sgn*span*off,
+                                     (A.y+B.y)*0.5 + side.y*sgn*span*off,
+                                     zSafe};
+                        C.push_back({A, M, {B.x, B.y, M.z}, B});
+                    }
+                const bool dbg = std::getenv("SPRAYTRAJ_MOVE_DBG") != nullptr;
+                if(dbg) fprintf(stderr, "[mvdbg] A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f) 原路径 L=%.1f 净空=%.1f 门槛=%.1f\n",
+                                A.x,A.y,A.z,B.x,B.y,B.z,L0,c0,kSafeNeed);
+                for(const auto& cand : C){
+                    const double Lc = pathLen(cand);
+                    const double sc = pathScore(cand);
+                    if(dbg) fprintf(stderr, "  [mvdbg] cand L=%.1f 净空=%.1f%s\n", Lc, sc,
+                                    (Lc > kMaxDetour * L0) ? " (超长丢弃)" : "");
+                    if(Lc > kMaxDetour * L0) continue;                // 用户口径：不做无限绕远
+                    if(sc < kSafeNeed) continue;
+                    const bool better = (sc > bestClear + 1e-6) ||
+                                        (std::fabs(sc - bestClear) <= 1e-6 && Lc < bestLen);
+                    if(better){ best = cand; bestClear = sc; bestLen = Lc; tag = "换途经"; }
+                }
+                if(std::string(tag) == "换途经") ++nReplan; else ++nFail;
+            }
+            minClearAll = std::min(minClearAll, bestClear);
+            maxDetourRatio = std::max(maxDetourRatio, bestLen / L0);
+
+            // 整段插补：位置按弧长等距，姿态按弧长比例 slerp，单步转角超限则加密点。
+            std::vector<Vec3> rs; std::vector<double> ts;
+            const double L = resample(best, mvStep, rs, ts);
+            const double thTot = std::acos(std::max(-1.0, std::min(1.0, dot(ijkA, ijkB)))) * 57.29577951308232;
+            const int need = (int)std::ceil(thTot / kStepDeg) + 1;
+            if(need > (int)rs.size() && L > 1e-6)
+                resample(best, std::max(0.3, L / (double)(need - 1)), rs, ts);
+
+            if(rs.size() <= 2){                                   // 太短：保留原折线，不抹掉拐点
+                for(size_t k = i; k < j; ++k) merged.push_back(allPts[k]);
+                i = j; continue;
+            }
+            Vec3 prevG = ijkA;
+            for(size_t k = 1; k + 1 < rs.size(); ++k){
+                const Vec3 g = slerpU(ijkA, ijkB, ts[k]);
+                const double dg = std::acos(std::max(-1.0, std::min(1.0, dot(prevG, g)))) * 57.29577951308232;
+                maxStepDeg = std::max(maxStepDeg, dg);
+                prevG = g;
+                merged.push_back({rs[k].x, rs[k].y, rs[k].z, g.x, g.y, g.z, P0.speed, 0});
+                ++nIns;
+            }
+            i = j;
+        }
+
+        if(nSeg > 0){
+            fprintf(stderr, "[空移规划] %d 段：换途经 %d 段，无可行途经 %d 段；"
+                            "最小净空 %.1fmm，最大单步转角 %.2f°，最长绕行 %.2f×原路径，插补 %lld 点\n",
+                    nSeg, nReplan, nFail, minClearAll, maxStepDeg, maxDetourRatio, nIns);
+            allPts.swap(merged);
+        }
+    }
+
+    // ================= 空移段等距细分（第二十轮） =================
+    // 病灶：空移段只保留**拐点**，两点之间靠控制器直线插补走完。实测（行距 80）：
+    //   开口盒子 8 个空移段，A→B 跨 583mm 的那段只有 3 个点，相邻间距 600mm；
+    //   复杂点云有一整段只有 **1 个哨兵点**、跨 634mm。
+    //   ⇒ 上位机/模拟器看到的空移是"瞬移"，中间到底撞不撞件完全无从判断，
+    //     robot_safety 的逐点检查（IK / 连杆 / 自碰撞 / 间隙）也覆盖不到这些区间。
+    // 处理：凡"两端至少有一端是 spray=0"的相邻点对，沿 A→B 直线按点距等距插点，
+    //   一律 spray=0（落枪/抬枪的进出位移也算空移，所以同样铺点）。
+    //   **只加标记、不改几何**：插点严格落在这条直线上，物理路径与原来逐点一致。
+    //   枪方向用 nlerp 插值（两点反向时退化为各自端值，避免过零向量）；
+    //   速度沿用前一点，不引入新的速度语义。
+    // 顺序很关键：必须在转角平滑/去重/重采样**之后**做 —— 平滑要按原始拐点算曲率，
+    //   先铺密点会让平滑误判"这里有一串点"，把整条空移线拉弯。
+    // 可用 SPRAYTRAJ_MOVE_STEP 覆盖空移点距（mm），默认 = 喷涂点距。
+    {
+        double mvStep = pstep;
+        if(const char* e = std::getenv("SPRAYTRAJ_MOVE_STEP")){
+            double v = atof(e);
+            if(v > 0.5) mvStep = v;
+        }
+        const int kMaxInsPerGap = 4000;      // 单段插点上限，防病态数据炸内存
+        std::vector<SprayTrajPoint> dense;
+        dense.reserve(allPts.size() * 2);
+        long long nIns = 0;
+        int nGap = 0;
+        for(size_t k = 0; k < allPts.size(); ++k){
+            const SprayTrajPoint& A = allPts[k];
+            dense.push_back(A);
+            if(k + 1 >= allPts.size()) break;
+            const SprayTrajPoint& B = allPts[k + 1];
+            if(A.spray != 0 && B.spray != 0) continue;      // 纯喷涂段：本来就密，不动
+            const double dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+            const double d = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if(!(d > 1.5 * mvStep)) continue;               // 已经够密（或零长）
+            int m = (int)std::floor(d / mvStep);
+            if(m > kMaxInsPerGap) m = kMaxInsPerGap;
+            if(m < 1) continue;
+            ++nGap;
+            // 枪轴插值必须用 slerp：nlerp 在两端反向（cosθ<=0）时退化成"全部沿用 A 端"，
+            // 于是 180° 的翻转被压到最后一个 1.5mm 的点上（开口盒子 A1 段实测 180°/1.46mm），
+            // 与修复前的"原地翻腕"等价。反向(antipodal)时用固定轴（A 的任意垂线）转过去，
+            // 保证每一步转角 = 180°/插点数，而不是一步到位。
+            double cosAB = A.i*B.i + A.j*B.j + A.k*B.k;
+            if(cosAB > 1.0) cosAB = 1.0;
+            if(cosAB < -1.0) cosAB = -1.0;
+            const double thAB = std::acos(cosAB);
+            const bool antipodal = (thAB > 3.141592653589793 - 1e-3);
+            Vec3 ax{0,0,0};
+            if(antipodal){
+                const Vec3 a{A.i, A.j, A.k};
+                const Vec3 ref = (std::fabs(a.z) < 0.9) ? Vec3{0,0,1} : Vec3{1,0,0};
+                ax = norm(cross(a, ref));
+            }
+            for(int t = 1; t <= m; ++t){
+                const double f = (double)t * mvStep / d;
+                if(f >= 1.0 - 1e-9) break;                  // 不要盖住 B 本身
+                double ii, jj, kk;
+                if(antipodal){
+                    const double a0 = 3.141592653589793 * f;
+                    ii = A.i*std::cos(a0) + ax.x*std::sin(a0);
+                    jj = A.j*std::cos(a0) + ax.y*std::sin(a0);
+                    kk = A.k*std::cos(a0) + ax.z*std::sin(a0);
+                } else if(thAB > 1e-6){
+                    const double s = std::sin(thAB);
+                    const double w0 = std::sin((1.0 - f) * thAB) / s;
+                    const double w1 = std::sin(f * thAB) / s;
+                    ii = A.i*w0 + B.i*w1;
+                    jj = A.j*w0 + B.j*w1;
+                    kk = A.k*w0 + B.k*w1;
+                } else {
+                    ii = A.i; jj = A.j; kk = A.k;
+                }
+                const double nn = std::sqrt(ii*ii + jj*jj + kk*kk);
+                if(nn > 1e-9){ ii /= nn; jj /= nn; kk /= nn; }
+                else         { ii = A.i; jj = A.j; kk = A.k; }
+                dense.push_back({ A.x + dx * f, A.y + dy * f, A.z + dz * f,
+                                  ii, jj, kk, A.speed, 0 });
+                ++nIns;
+            }
+        }
+        if(nIns > 0){
+            fprintf(stderr, "[空移] 铺满 %d 段空移路径，补 %lld 个 spray=0 点（点距 %.1fmm），"
+                            "总点数 %zu → %zu\n",
+                    nGap, nIns, mvStep, allPts.size(), dense.size());
+            allPts.swap(dense);
+        }
     }
 
     if(allPts.empty()){
