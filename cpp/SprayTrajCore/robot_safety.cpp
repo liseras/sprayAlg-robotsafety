@@ -685,6 +685,26 @@ struct Seg {
     int kind;      // RS_SEG_*，用于把「最近部位」报成人能看懂的名字
 };
 
+// 只造工具段（握把 + 细管 + 喷嘴）。
+// 为什么单独抽出来：**枪体的位置由「目标 TCP + 枪轴」解析确定，与机器人型号/基座/IK 全都无关**
+// —— 法兰就在 TCP 沿枪轴退 toolLen 的地方。所以"枪会不会戳进工件"这一条在
+// 「要求可达」和「不要求可达」两种模式下是同一个判据、同一份几何，不依赖 IK 解。
+// buildSegments 也从这里取工具段，避免两处各写一份（改一处漏一处的老坑）。
+// 用「法兰点 + TCP 点」而不是「TCP + 轴向 + 长度」：FK 那条路必须原样用 f.flange.t，
+// 自己按轴向反推法兰会引入 1ulp 差异，等距时最近的段名会串（工具细管 ↔ 工具握把），
+// 让"改动前后逐字节一致"这条回归红线失效。
+void buildToolSegs(const V3& flange, const V3& tcp, const Sizing& sz, std::vector<Seg>& out) {
+    V3 d = tcp - flange;
+    double L = norm(d);
+    if (L <= 0.5) return;
+    V3 u = d * (1.0 / L);
+    V3 neck = flange + u * (L * kGripFraction);
+    V3 tip = tcp + u * (L * kNozzleFraction);
+    out.push_back({flange, neck, sz.gripR, SG_TOOL, -1, -1, "工具握把", RS_SEG_GRIP});
+    out.push_back({neck, tcp, sz.toolPipeR, SG_TOOL, -1, -1, "工具细管", RS_SEG_PIPE});
+    out.push_back({tcp, tip, sz.nozzleR, SG_TOOL, -1, -1, "喷嘴", RS_SEG_NOZZLE});
+}
+
 void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vector<Seg>& out) {
     out.clear();
     if (includeBase) {
@@ -700,17 +720,8 @@ void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vect
             out.push_back({f.origins[i], f.origins[i + 1], rr, SG_LINK, i, i + 1, "连杆", RS_SEG_LINK});
         }
     }
-    V3 flange = f.flange.t, tcp = f.tcp.t;
-    V3 d = tcp - flange;
-    double L = norm(d);
-    if (L > 0.5) {
-        V3 u = d * (1.0 / L);
-        V3 neck = flange + u * (L * kGripFraction);
-        V3 tip = tcp + u * (L * kNozzleFraction);
-        out.push_back({flange, neck, sz.gripR, SG_TOOL, -1, -1, "工具握把", RS_SEG_GRIP});
-        out.push_back({neck, tcp, sz.toolPipeR, SG_TOOL, -1, -1, "工具细管", RS_SEG_PIPE});
-        out.push_back({tcp, tip, sz.nozzleR, SG_TOOL, -1, -1, "喷嘴", RS_SEG_NOZZLE});
-    }
+    // 工具段：法兰→TCP 的方向就是工具 +Z，展开成握把/细管/喷嘴三段
+    buildToolSegs(f.flange.t, f.tcp.t, sz, out);
 }
 
 // 部位名（含关节号），给控制台/CSV/界面用
@@ -1031,7 +1042,7 @@ struct Params {
     double hardClearance = 2.0;    // 绝对安全距离（硬约束，低于它才回退）
     double search = 120.0;
     double toolLen = kDefaultToolLen;
-    double tiltNonUpDeg = 30.0;      // α=90°（竖直侧壁）时的倾角，实际按 α/90 线性缩放
+    double tiltNonUpDeg = 60.0;      // δ=90°（竖直侧壁）时的倾角，实际按 δ/90 线性缩放（2026-10-26 由 30 改 60）
     double upThresholdDeg = 45.0;    // 保留字段（倾角已改线性，不再依赖阈值判"非朝上"）
     double tiltMaxDeg = 60.0;
     double tiltStepDeg = 5.0;
@@ -1047,6 +1058,28 @@ struct Params {
     bool includeBase = false;
     bool fixTransit = true;
     bool azFallback = true;
+    // false = 不要求可达：跳过 IK / 连杆 / 自碰撞 / 关节限位，只留几何层。
+    // 判据分家见 robot_safety.h 里 requireReach 的注释。
+    bool requireReach = true;
+    // true = 单次逆解（fast）：姿态纯解析、每点只解 1 次 IK、不回退不救援。
+    // 与 requireReach 正交：fast + requireReach 就是"查安全、但只解一次"。
+    bool fastPose = false;
+    // true = 倾角逐点连续：倾角只由该点法向决定（tilt = tiltNonUpDeg × δ/90），
+    // 不做面级常量。见 robot_safety.h 里 RS_POSE_TILT_PERP 的说明。
+    bool tiltPerPoint = false;
+    // 点云系里的「重力向上」单位向量。**默认 (0,0,1) = 旧口径，逐字节不变**。
+    //
+    // 为什么需要显式给：倾角口径里"正位置/朝上"是相对**重力**定义的，而点云是相机系，
+    // 相机 +Z 是光轴不是重力。举本次实测的煤气灶背板：主面法向与点云 +Z 夹角只有 5°，
+    // 旧口径判它"基本朝上、只需 3.3° 倾角"；但工件是立着挂的，真实 α=86°，
+    // 需求 57.5°。差的不是精度，是整条口径的前提。
+    V3 upW = V3(0, 0, 1);
+    // 倾角基准方向（点云系单位向量）。**不是**重力，见上面 tiltAxisAndDir 前的说明。
+    // 默认与 upW 同值，基座位姿已知时在 impl 里改成基座 ±X。**每点倾角只读这一个**。
+    V3 tiltRefW = V3(0, 0, 1);
+    // 平放面倾角方向（基座系）：0=不指定（按法向自动选 ±X）；+1=往基座 +X 倾；−1=往基座 −X 倾。
+    // 只在基座位姿已知时生效，见 impl 里对 tiltRefW 的赋值。
+    double tiltSideX = 0.0;
 };
 
 struct PR {
@@ -1075,36 +1108,42 @@ struct PR {
 
 // 位姿优劣（越大越好）：自碰撞通过 > 间隙大 > 关节余量大。
 // 碰撞(P0) 永远压过姿态连续(P2)，所以 selfGap<0 直接判负。
-inline int poseCmp(const PR& a, const PR& b) {
-    int oa = (a.selfGap >= 0.0) ? 1 : 0, ob = (b.selfGap >= 0.0) ? 1 : 0;
-    if (oa != ob) return oa < ob ? -1 : 1;
+// requireReach=false 时没有自碰撞可言，直接比间隙。
+inline int poseCmp(const PR& a, const PR& b, bool requireReach) {
+    if (requireReach) {
+        int oa = (a.selfGap >= 0.0) ? 1 : 0, ob = (b.selfGap >= 0.0) ? 1 : 0;
+        if (oa != ob) return oa < ob ? -1 : 1;
+    }
     if (a.clearance != b.clearance) return a.clearance < b.clearance ? -1 : 1;
-    if (a.margin != b.margin) return a.margin < b.margin ? -1 : 1;
+    if (requireReach && a.margin != b.margin) return a.margin < b.margin ? -1 : 1;
     return 0;
 }
 
 // 硬约束：IK 成功、不自碰撞、间隙不低于绝对安全距离、关节不超限。
 // 注意 margin < jointMarginMin 只是 P1 软告警，不在这里判死；over（真正超限）才是硬约束。
-inline bool hardOk(const PR& q, double hardClearance) {
-    return q.ikOk
-        && q.selfGap >= 0.0
-        && q.clearance >= hardClearance
-        && !q.over;
+// requireReach=false：只剩「间隙不低于绝对安全距离」——这里的 clearance 此时就是
+// min(枪体)，因为连杆/关节根本没建碰撞体（见 eval 的 requireReach 分支）。
+inline bool hardOk(const PR& q, const Params& pp) {
+    if (!(q.clearance >= pp.hardClearance)) return false;
+    if (!pp.requireReach) return true;
+    return q.ikOk && q.selfGap >= 0.0 && !q.over;
 }
 
 // 两个“都不满足硬约束”的位姿二选一：先比硬约束通过项，再比自间隙/间隙/关节余量。
 // 与 poseCmp 的区别：selfGap<0 时还要比谁的负值更小；关节真正超限（over）
 // 也单独判负，不能因为另一个位姿间隙大就选一个关节超限的位姿。
-inline int hardCmp(const PR& a, const PR& b) {
-    int ia = a.ikOk ? 1 : 0, ib = b.ikOk ? 1 : 0;
-    if (ia != ib) return ia < ib ? -1 : 1;
-    int sa = (a.selfGap >= 0.0) ? 1 : 0, sb = (b.selfGap >= 0.0) ? 1 : 0;
-    if (sa != sb) return sa < sb ? -1 : 1;
-    int oa = a.over ? 0 : 1, ob = b.over ? 0 : 1;
-    if (oa != ob) return oa < ob ? -1 : 1;
-    if (a.selfGap != b.selfGap) return a.selfGap < b.selfGap ? -1 : 1;
+inline int hardCmp(const PR& a, const PR& b, bool requireReach) {
+    if (requireReach) {
+        int ia = a.ikOk ? 1 : 0, ib = b.ikOk ? 1 : 0;
+        if (ia != ib) return ia < ib ? -1 : 1;
+        int sa = (a.selfGap >= 0.0) ? 1 : 0, sb = (b.selfGap >= 0.0) ? 1 : 0;
+        if (sa != sb) return sa < sb ? -1 : 1;
+        int oa = a.over ? 0 : 1, ob = b.over ? 0 : 1;
+        if (oa != ob) return oa < ob ? -1 : 1;
+        if (a.selfGap != b.selfGap) return a.selfGap < b.selfGap ? -1 : 1;
+    }
     if (a.clearance != b.clearance) return a.clearance < b.clearance ? -1 : 1;
-    if (a.margin != b.margin) return a.margin < b.margin ? -1 : 1;
+    if (requireReach && a.margin != b.margin) return a.margin < b.margin ? -1 : 1;
     return 0;
 }
 
@@ -1125,6 +1164,8 @@ public:
     }
 
     V3 toBaseP(const V3& p) const { return m3mul(baseRT_, p - baseT_); }
+    // 方向向量：点云系 → 基座系（只转不平移）。toCloudR 的反向。
+    V3 toBaseV(const V3& v) const { return m3mul(baseRT_, v); }
     M3 toBaseR(const M3& R) const { return m3mul(baseRT_, R); }
     V3 toCloudP(const V3& p) const { return m3mul(baseR_, p) + baseT_; }
     // 方向向量：基座系 → 点云系（只有旋转，不平移）。refX 这类「来自 FK 的轴」必须过这一步。
@@ -1141,6 +1182,52 @@ public:
         ++g_prof.evals;
         V3 zTool = -unit(d);
         V3 pC = face + d * p_.standoff;
+
+        // ---- 不要求可达：不解 IK，只查枪体与点云的间隙
+        //
+        // 这一步是"点云不适配这台机器人"时的唯一正确口径：枪体的三个碰撞体由
+        // 「TCP + 枪轴」解析确定（法兰 = TCP − toolLen·枪轴），**与机器人无关**，
+        // 所以它不是"省略了检查"，而是把与型号无关的那部分单独算准。
+        // 不解 IK 的副作用全是正向的：没有解支噪声 → 面级姿态不会被"这个点冷启解不出"
+        // 带偏；省掉 8 组种子 × 90 次迭代 → 19k 点从半分钟降到几秒。
+        if (!p_.requireReach) {
+            std::vector<Seg> segs;
+            // 碰撞段一律建在**基座系**：后面的 toCloudP 只负责 基座系→点云系。
+            // 这里踩过一次：直接把点云系的 TCP/枪轴喂进 buildToolSegs，再被 toCloudP
+            // 变换一次，等于整根枪被平移了一个基座偏移（自动基座是 −252,150,−197），
+            // 于是"枪体撞了 1512 点、最深 −21.2mm"，全是假的。
+            buildToolSegs(toBaseP(pC) - toBaseV(zTool) * p_.toolLen, toBaseP(pC), sz_, segs);
+            double worstTool = 1e300;
+            const Seg* segTool = nullptr;
+            for (const Seg& s : segs) {
+                double limit = std::min(p_.search, (worstTool < 1e299) ? worstTool + s.r : p_.search);
+                double surface = cloud_.segmentDist(toCloudP(s.a), toCloudP(s.b), limit) - s.r;
+                if (surface < worstTool) { worstTool = surface; segTool = &s; }
+            }
+            out.idx = -1;
+            out.tiltDeg = tiltDeg;
+            out.azDeg = azDeg;
+            out.clearance = worstTool;
+            out.clrTool = worstTool;
+            out.clrLink = 1e300;              // 没建连杆碰撞体，别报 0 让人以为量到了
+            out.part = segTool ? segTool->part : "";
+            out.partKind = segTool ? segTool->kind : -1;
+            out.partJ0 = segTool ? segTool->j0 : -1;
+            out.partJ1 = segTool ? segTool->j1 : -1;
+            out.linkKind = -1; out.linkJ0 = -1; out.linkJ1 = -1;   // -1 = 没查连杆
+            out.ikOk = false;                 // 如实：没有解过 IK
+            out.over = false;
+            out.margin = 0.0;
+            out.cond = 0.0;
+            for (int i = 0; i < 6; ++i) out.theta[i] = 0.0;
+            out.pos = pC;
+            out.gun = -d;
+            out.sprayAngle = 0.0;
+            out.standoffErr = std::fabs(norm(pC - face) - p_.standoff);
+            out.selfGap = 1e300;
+            return true;
+        }
+
         M3 Rc = frameFromZ(zTool);
         if (refX) {
             // refX 来自上一点 fk() 的工具 x 轴，是**基座系**的；zTool 是**点云系**的。
@@ -1246,10 +1333,25 @@ inline V3 dirOf(const V3& n, const V3& uUp, const V3& axis, double tiltDeg, doub
 //   先 unit 再比阈值是错的（unit 之后恒为 1，判据永不成立）。这个 bug 的表现很有欺骗性：
 //   平整朝上的面被判成"非朝上"，于是往切平面里的噪声方向扳，倾角加到 40°、枪位横甩，
 //   而喷距仍然守恒 —— 数字上一切"正常"。
-inline void tiltAxisAndDir(const V3& nIn, V3& axis, V3& uUp) {
+//
+// 倾角基准方向（"正对工件"的那个正方向），与「重力向上」分开。
+//
+// ⚠ 这是本文件唯一一处会把两者搞混的地方，务必分清：
+//   · Params::upW      = 重力向上。抬枪沿它、自动猜基座靠它定"下方"，**不是**倾角基准。
+//   · Params::tiltRefW = 倾角基准 = 「基座 → 工件」那条轴线，基座系里就是 ±X。
+// 为什么要拆：槽型盘悬挂实测，枪轴 n=(1.00,0.01,-0.03) 本来正对工件（与 +X 差 1.97°），
+// 但旧代码拿重力 +Z 当基准，量出 acos(n·Z)=91.88°，判定"这是竖直侧壁"，
+// 于是按 tiltNonUpDeg=60 给出 61.3° 倾角，把枪扳到与 +X 差 59.4°（IJK 变成
+// [0.509,0.005,-0.861]，整条修正轨迹变成斜的、整体下坠）。基准换成 +X 后
+// 同一个点算出 60×1.97/90 = 1.3°，实测倾斜 0 点、倾角均值 0.0°，枪保持正对。
+//
+// 取值：基座位姿已知 → 基座 ±X（符号由主法向自动选，tiltSideX 可强制）；否则退回重力向上
+// （自动假设的基座是猜的，拿它当基准等于把猜测当标定；此时重力向上是唯一可信的"上"）。
+
+inline void tiltAxisAndDir(const V3& nIn, const V3& ref, V3& axis, V3& uUp) {
     V3 n = unit(nIn);
-    V3 up(0, 0, 1);
-    V3 u = up - n * dot(up, n);
+    V3 u = ref - n * dot(ref, n);
+    // ⚠ 退化判据必须用归一化之前的长度 |u| = sin(n 与 ref 的夹角)。
     if (norm(u) < std::sin(5.0 * kDeg)) {
         axis = V3(0, 0, 0);
         uUp = V3(0, 0, 0);
@@ -1259,16 +1361,21 @@ inline void tiltAxisAndDir(const V3& nIn, V3& axis, V3& uUp) {
     axis = unit(cross(n, uUp));
 }
 
-// 该法向**需要多大倾角**（0 = 正朝上，α=90° 侧壁时给满 tiltNonUpDeg）。
+// 该法向**需要多大倾角**（0 = 正对基准方向，α=90° 侧壁时给满 tiltNonUpDeg）。
 // 抽成独立函数是因为行级方位打分也要用它 —— 两处若各写一份，
 // 打分用的倾角和真正执行的倾角会悄悄分叉，A/B 结论就不可信了。
-inline double tiltNeedDeg(const V3& nIn, const Params& p) {
+//
+// α 与"悬垂面"都用 dot(n, ref)，不再写死 n.z。ref=(0,0,1) 时两者逐位等价。
+// ref 传的是**倾角基准**（Params::tiltRefW），不是重力向上 —— 见上面 tiltRefW 的说明。
+inline double tiltNeedDeg(const V3& nIn, const V3& ref, const Params& p) {
     V3 n = unit(nIn);
-    double alphaDeg = std::acos(std::max(-1.0, std::min(1.0, n.z))) * kRad;
+    double c = dot(n, ref);
+    c = std::max(-1.0, std::min(1.0, c));
+    double alphaDeg = std::acos(c) * kRad;
     double t = p.tiltNonUpDeg * (alphaDeg / 90.0);
     if (t > p.tiltMaxDeg) t = p.tiltMaxDeg;
-    // 朝下的悬垂面：往上扳会把枪顶进工件本体，这条路物理上不成立，不做线性外推
-    if (n.z < -0.7) t = 0.0;
+    // 背离基准方向的面：扳过去会把枪顶进工件本体，这条路物理上不成立，不做线性外推
+    if (c < -0.7) t = 0.0;
     return t;
 }
 
@@ -1319,16 +1426,19 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     V3 face = t.pos[i] + t.gun[i] * p.standoff;
 
     // 倾角需求按法向**线性**给，而不是"非朝上就一律 ±20°"的阶梯：
-    //   α = 法向与 +Z 的夹角（0° = 正朝上，90° = 竖直侧壁，180° = 完全倒挂）
-    //   tilt0 = tiltNonUpDeg · (α / 90°)，封顶 tiltMaxDeg
+    //   δ = 法向与 +Z（"正位置"，即采集/相机拍过去的方向）的夹角
+    //       （0° = 正朝上，90° = 竖直侧壁，180° = 完全倒挂）
+    //   tilt0 = tiltNonUpDeg · (δ / 90°)，封顶 tiltMaxDeg
+    // 系数 2026-10-26 由 30 提到 60（用户口径"60°×δ/90"）：侧壁（δ=90）直接给满 60°，
+    // 即"把枪尽量扳到正位置再压下去"；δ<45 的面仍只给 <30° 的轻微补偿。
     // 取 90° 作满量程锚点是因为它物理上就是"面立起来了"的界限：此时给满基准倾角，
-    // 比侧壁更倒挂的面（α>90°）继续线性增长，直到上限。
+    // 比侧壁更倒挂的面（δ>90°）继续线性增长，直到上限。
     // 阶梯做法在 45° 边界上产生 20° 的阶跃，反映到轨迹上就是相邻点倾角突跳，
-    // 实机过不了；线性化之后法向连续 → α 连续 → 倾角需求连续。
-    double tilt0 = tiltNeedDeg(n, p);
+    // 实机过不了；线性化之后法向连续 → δ 连续 → 倾角需求连续。
+    double tilt0 = tiltNeedDeg(n, p.tiltRefW, p);
 
     V3 axis, uUp;
-    tiltAxisAndDir(n, axis, uUp);
+    tiltAxisAndDir(n, p.tiltRefW, axis, uUp);
     bool degenerate = norm(uUp) < 1e-6;
     if (degenerate) {
         axis = V3(0, 0, 0);
@@ -1485,7 +1595,7 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.hardClearance = 2.0;   // 绝对安全距离：只在这个硬下限被破坏时才回退
     p.search = 120.0;
     p.toolLen = kDefaultToolLen;
-    p.tiltNonUpDeg = 30.0;   // α=90°（竖直侧壁）时的倾角 = 工艺上限。见 needTilt 的说明
+    p.tiltNonUpDeg = 60.0;   // δ=90°（竖直侧壁）时的倾角。30→60 见 needTilt 的说明
     p.upThresholdDeg = 45.0;
     p.tiltMaxDeg = 60.0;
     p.tiltStepDeg = 5.0;
@@ -1501,9 +1611,11 @@ RobotSafetyParams robot_safety_default_params(void) {
     p.includeBase = 0;
     p.fixTransit = 1;
     p.azFallback = 1;
-    p.maxCloudPoints = 0;
+    // 默认要求可达（= 完整口径）。关掉它只影响"谁来对结果负责"，不影响几何判据。
+    p.requireReach = 1;
     p.threads = 1;           // 默认单线程：结果可复现，便于对拍/回归
     p.azMode = 0;            // 默认「按站位逐行择优」；1 = 只用向上（旧口径）
+    p.fastPose = 0;          // 默认完整搜索；1 = 单次逆解（见 fastPose 注释）
     return p;
 }
 
@@ -1519,6 +1631,7 @@ const char* robot_safety_rule_name(unsigned int bit) {
         case RS_VIOL_TILT_JUMP: return "TILT_JUMP";
         case RS_VIOL_LINK_HIT: return "LINK_HIT";
         case RS_VIOL_TOOL_HIT: return "TOOL_HIT";
+        case RS_VIOL_STEP_JUMP: return "STEP_JUMP";
         default: return nullptr;
     }
 }
@@ -1534,10 +1647,34 @@ void robot_safety_free(RobotSafetyResult* res) {
     res->count = 0;
 }
 
+// 真实实现在这里：比公开入口多一个 upCloud。公开的 robot_safety_check 转手调它并传 NULL,
+// 这样 RobotSafetyParams 的布局一个字节都不用动（sizeof 仍 152），旧调用方二进制兼容。
+static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int n,
+                                                 const double* cloudXyz, int cloudCount,
+                                                 const double* basePose16,
+                                                 const RobotSafetyParams* paramsIn,
+                                                 const double* upCloud);
+
 RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                      const double* cloudXyz, int cloudCount,
                                      const double* basePose16,
                                      const RobotSafetyParams* paramsIn) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, nullptr);
+}
+
+RobotSafetyResult robot_safety_check_up(const SprayTrajPoint* pts, int n,
+                                        const double* cloudXyz, int cloudCount,
+                                        const double* basePose16,
+                                        const RobotSafetyParams* paramsIn,
+                                        const double* upCloud) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud);
+}
+
+static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int n,
+                                                 const double* cloudXyz, int cloudCount,
+                                                 const double* basePose16,
+                                                 const RobotSafetyParams* paramsIn,
+                                                 const double* upCloud) {
     RobotSafetyResult R;
     std::memset(&R, 0, sizeof(R));
     R.minClearanceMm = std::numeric_limits<double>::infinity();
@@ -1581,8 +1718,24 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         p.fixTransit = s.fixTransit != 0;
         p.azFallback = s.azFallback != 0;
         p.threads = s.threads > 0 ? s.threads : d.threads;
+        // 语义：0 才是「不要求可达」；非 0（含 default_params 给的 1）= 完整口径。
+        p.requireReach = (s.requireReach != 0);
         // 语义：0（含零初始化结构）= 默认＝按站位择优；只有显式填 1 才退回旧口径
         p.azStance = (s.azMode != 1);
+        p.fastPose = (s.fastPose & RS_POSE_FAST) != 0;
+        p.tiltPerPoint = (s.fastPose & RS_POSE_TILT_PERP) != 0;
+        p.tiltSideX = s.tiltSideX;
+    }
+
+    // ---- 重力向上方向（点云系）
+    // NULL / 零向量 / 长度过小 ⇒ 保持旧的 (0,0,1)，旧调用方结果逐字节不变。
+    // 给了就归一化：允许调用方传未归一化的方向（例如从矩阵行直接取），不要求它先算模长。
+    if (upCloud) {
+        V3 u(upCloud[0], upCloud[1], upCloud[2]);
+        double L = norm(u);
+        // 阈值取 1e-6 而不是 0：界面上"没填"常是 0,0,0，而 1e-12 这种残值更可能是
+        // 单位换算留下的垃圾。两者都该退回默认，不该被当成"朝某个方向"。
+        if (L > 1e-6) p.upW = u * (1.0 / L);
     }
 
     // ---- 点云索引
@@ -1626,6 +1779,19 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     computeRows(t, rows);
 
     // ---- 基座位姿：T_base_in_cloud
+    // 喷涂点法向的均值（归一化）。两处要用：自动猜基座时定"外侧"，定倾角基准时选 ±X。
+    V3 nMean = V3(0, 0, 1);
+    {
+        V3 nm(0, 0, 0);
+        int cnt = 0;
+        for (int i = 0; i < n; ++i)
+            if (t.spray[i]) {
+                nm = nm + t.normal(i);
+                ++cnt;
+            }
+        if (cnt && norm(nm) > 1e-9) nMean = unit(nm);
+    }
+
     Pose base;
     bool baseAuto = false;
     if (basePose16) {
@@ -1637,27 +1803,71 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         baseAuto = true;
         // 猜法：基座沿工件外侧退 0.50·reach、下沉 0.35·reach，让工件质心落在基座系
         // (0.5·reach, 0, 0.35·reach) 的舒适区。⚠ 这是假设，不是标定值。
-        V3 nm(0, 0, 0);
-        int cnt = 0;
-        for (int i = 0; i < n; ++i)
-            if (t.spray[i]) {
-                nm = nm + t.normal(i);
-                ++cnt;
-            }
-        V3 nMean = cnt ? unit(nm) : V3(0, 0, 1);
-        V3 h(nMean.x, nMean.y, 0.0);
-        if (norm(h) < 0.2) h = V3(1, 0, 0);
+        //
+        // 「外侧」与「下方」都相对**重力**定义：基座立在地面上，工件在它前方上方。
+        // 所以水平投影必须去掉 up 方向的分量，下沉沿 -up —— up=(0,0,1) 时与旧版逐位一致。
+        V3 h = nMean - p.upW * dot(nMean, p.upW);   // 水平投影（去掉重力分量）
+        if (norm(h) < 0.2) h = V3(1, 0, 0) - p.upW * dot(V3(1, 0, 0), p.upW);
+        if (norm(h) < 1e-6) h = V3(0, 1, 0) - p.upW * dot(V3(0, 1, 0), p.upW);
         h = unit(h);
-        V3 origin = cloud.centroid - h * (0.50 * kReach);
-        origin.z = cloud.centroid.z - 0.35 * kReach;
+        V3 origin = cloud.centroid - h * (0.50 * kReach) - p.upW * (0.35 * kReach);
         V3 x = unit(cloud.centroid - origin);
-        V3 z(0, 0, 1);
+        V3 z = p.upW;                                // 基座 +Z = 重力向上
         V3 y = unit(cross(z, x));
         x = unit(cross(y, z));
         base.R.setCol(0, x);
         base.R.setCol(1, y);
         base.R.setCol(2, z);
         base.t = origin;
+    }
+
+    // ---- 竖直向上 & 倾角方向：安全层是在**基座系**里算的
+    // 基座位姿已知（手眼 / 恒等 / 手动）时，基座 +Z 就是竖直向上，倾角大小（δ）必须以它
+    // 为准。此前这里沿用界面在**点云系**里填的方向，而那个方向是相机姿态的函数：
+    // 相机侧装/仰视时它和真实竖直差 90° 以上，表现为"平放件被当成倒挂天花板"——
+    // δ 判成 174°，tiltNeedDeg 命中 c<−0.7 直接给 0 倾角，整条倾角口径反了。
+    if (basePose16) {
+        p.upW = unit(base.R.col(2));
+        if (std::getenv("RS_DBG_UP"))
+            std::fprintf(stderr, "[safety] 竖直向上取基座 +Z = (%.3f,%.3f,%.3f)（点云系）\n",
+                         p.upW.x, p.upW.y, p.upW.z);
+    }
+    // ---- 倾角基准：基座 ±X（"基座 → 工件"那条轴线），**不是**重力 +Z。
+    // 上文 p.upW 仍是重力向上（抬枪、判"下方"要用），两者从此分家。
+    //
+    // 为什么默认就必须是 ±X：安全层是在基座系里算的，"枪正对工件"这个正方向在基座系里
+    // 就是 X 轴（工件在基座 +X 方向、挂在前面）。拿重力 +Z 当基准等于问"枪是否朝上"，
+    // 而工件是立着挂的、枪是横着打的，两者天然差 90° —— 每个点都会被判成"竖直侧壁"，
+    // 一律给满 tiltNonUpDeg，整条轨迹被扳歪（实测枪轴从 [0.999,0.010,-0.033] 扳到
+    // [0.509,0.005,-0.861]，与 +X 差 59.4°，轨迹整体下坠）。
+    //
+    // 符号（+X 还是 −X）：取与主法向更"同向"的那一侧，使"正对"落在 0° 而不是 180°。
+    //   工件挂在基座 +X 侧时主法向≈+X，选 +X → α≈0 → 倾角 0，正对，符合预期；
+    //   若某件主面朝 −X（背面朝基座），选 −X → 同样 α≈0，不会被误判成"背离"（c<−0.7 归零）。
+    // tiltSideX 非 0 时按用户强制，不自动判。
+    p.tiltRefW = p.upW;
+    if (basePose16) {
+        V3 ax = unit(base.R.col(0));
+        double side = 1.0;
+        if (std::fabs(p.tiltSideX) > 1e-9) {
+            side = (p.tiltSideX > 0 ? 1.0 : -1.0);
+        } else if (dot(nMean, ax) < 0.0) {
+            // 主法向朝 −X：基准跟着翻，否则 α 会算成 180°−ε 而命中 c<−0.7 归零
+            side = -1.0;
+        }
+        p.tiltRefW = ax * side;
+        if (std::getenv("RS_DBG_UP"))
+            std::fprintf(stderr, "[safety] 倾角基准 = 基座 %cX = (%.3f,%.3f,%.3f)（点云系）"
+                                 " %s；重力向上 = (%.3f,%.3f,%.3f)\n",
+                         side > 0 ? '+' : '-', p.tiltRefW.x, p.tiltRefW.y, p.tiltRefW.z,
+                         std::fabs(p.tiltSideX) > 1e-9 ? "用户强制" : "按主法向自动选侧",
+                         p.upW.x, p.upW.y, p.upW.z);
+    } else {
+        // 没有基座位姿时退回重力向上：自动假设的基座是猜的，不能拿它的 X 轴当标定。
+        p.tiltRefW = p.upW;
+        if (std::getenv("RS_DBG_UP"))
+            std::fprintf(stderr, "[safety] 无基座位姿，倾角基准退回重力向上 = (%.3f,%.3f,%.3f)\n",
+                         p.tiltRefW.x, p.tiltRefW.y, p.tiltRefW.z);
     }
 
     Evaluator ev(cloud, base, p);
@@ -1694,6 +1904,15 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             double tilt = 0.0, az = 0.0;
             PR pr;
             bool has = false;
+            // ---- 单次逆解模式 / 逐点连续倾角：倾角取**纯几何需求**（法向线性），
+            // 不解 IK、不试方位、不留缓存。代价是"这个倾角到底解不解得出来"要等阶段 3 才知道；
+            // 收益是这里一次 IK 都不花。这一句就是 fast 模式省掉 60% 时间的全部原因
+            // （阶段 1 原本占 58.4s/83s）。tiltPerPoint 走同一条：它的倾角同样与 IK 无关。
+            if (p.fastPose || p.tiltPerPoint) {
+                need[i] = tiltNeedDeg(t.normal(i), p.tiltRefW, p);
+                azOf[i] = 0.0;
+                continue;
+            }
             // 阶段 1 一律按「向上」找倾角：方位要等倾角定下来才谈得上（见阶段 2 末尾）。
             // 这也保证了"旧口径安全的样本"在阶段 1 得到与旧版完全相同的倾角与缓存。
             needTilt(ev, p, t, i, hasSeed ? prevTheta : nullptr, hasRefX ? &prevX : nullptr,
@@ -1781,9 +2000,32 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     }
 
     std::vector<double> finalTilt = need;
+    // 空移点（spray=0）：倾角恒为 0，姿态就是轨迹自带的 IJK，一列都不许改。
+    // 理由：空移时枪是关的，"为了更好解而倾转"没有工艺意义，反而会把算法自己设计好的
+    // 避障路径（抬到安全高度、沿法向退出）扭成另一条 —— 实测开口盒子 1958 个空移点里
+    // 1669 个被倾转（最大 30°），IJK 变化到 0.87，等于换了一条空移路径。
+    // 置 0 后 dirOf(nrm,uUp,axis,0,az) == nrm == -gun，逐位回到原轨迹姿态。
+    for (int i = 0; i < n; ++i)
+        if (!t.spray[i]) finalTilt[i] = 0.0;
     std::vector<double> azRow(rows.size(), 0.0);
     std::vector<double> faceTilt(groups.size(), 0.0), faceAz(groups.size(), 0.0);
-    {
+    if (p.tiltPerPoint) {
+        // ---- 逐点连续口径（RS_POSE_TILT_PERP）
+        //
+        // 倾角只由**该点法向**决定：δ = 法向与「正位置」(+Z，即采集/相机拍过去的方向)的夹角，
+        // tilt = tiltNonUpDeg × δ/90，封顶 tiltMaxDeg。法向连续 ⟹ 倾角连续，
+        // 一圈桶壁就是一条平滑的倾角曲线，不会再出现 0°/25° 两块台阶。
+        //
+        // 为什么不走面级择优：面级常量的唯一好处是"面内姿态绝对不动"，代价是**换面即跳变**。
+        // 垃圾桶实测（面级口径）：tilt 只有 0°(306 点)/25°(95)/19.7°(69)/20.5°(50) 几个离散值，
+        // 相邻点枪轴夹角最大 48.7°、>5° 的有 17 段；槽型盘 348 点全 0°、其余侧 23~35°。
+        // 用户口径明确：「法向偏离正位置越大就倾得越大，线性给差值」—— 要的是连续，
+        // 不是面内恒定。安全性交给阶段 3 逐点兜底（±1 步倾角救援 + 过不了照实报 P0），
+        // 不再靠"整面一起歪"去救个别点。
+        for (int i = 0; i < n; ++i)
+            if (t.spray[i]) finalTilt[i] = tiltNeedDeg(t.normal(i), p.tiltRefW, p);
+        azRow.assign(rows.size(), 0.0);   // 方位固定「向上」，与倾角同一条连续规则
+    } else {
         // 面组 → 喷涂点索引（抽样打分用；过渡点位置可改，不参与姿态决策）
         std::vector<std::vector<int>> gp(groups.size());
         for (size_t g = 0; g < groups.size(); ++g)
@@ -1826,7 +2068,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 V3 n = t.normal(i);
                 V3 face = t.pos[i] + t.gun[i] * p.standoff;
                 V3 axis, uUp;
-                tiltAxisAndDir(n, axis, uUp);
+                tiltAxisAndDir(n, p.tiltRefW, axis, uUp);
                 if (norm(uUp) < 1e-6) continue;
                 V3 d = dirOf(n, uUp, axis, tilt, az);
                 PR pr;
@@ -1861,14 +2103,19 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         // 不能为了软告警而接受：P0 该救就救，救完就退回工艺基准。
         auto betterThan = [&](const FaceScore& a, double ta, double aza,
                               const FaceScore& b, double tb, double azb) {
-            int pa = a.p0(), pb = b.p0();
+            // 不要求可达时，"不可达/自碰撞"这两个计数恒为 0，P0 退化成纯粹的
+            // 「枪体撞了几点」。这正是"只要不撞、姿态越规整越好"的那把尺子。
+            int pa = p.requireReach ? a.p0() : a.hit;
+            int pb = p.requireReach ? b.p0() : b.hit;
             if (pa != pb) return pa < pb;
             bool oka = ta <= p.maxSprayAngleDeg + 1e-9;
             bool okb = tb <= p.maxSprayAngleDeg + 1e-9;
             if (oka != okb) return oka;
             if (a.hit != b.hit) return a.hit < b.hit;
-            if (a.unreach != b.unreach) return a.unreach < b.unreach;
-            if (a.selfHit != b.selfHit) return a.selfHit < b.selfHit;
+            if (p.requireReach) {
+                if (a.unreach != b.unreach) return a.unreach < b.unreach;
+                if (a.selfHit != b.selfHit) return a.selfHit < b.selfHit;
+            }
             if (a.shortClr != b.shortClr) return a.shortClr < b.shortClr;
             if (std::fabs(ta - tb) > 1e-6) return ta < tb;
             return std::fabs(aza) < std::fabs(azb) - 1e-9;
@@ -1884,13 +2131,94 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             if (P.empty()) return;
             int ra = groups[g].first, rb = groups[g].second;
 
+            // ---- 单次逆解模式：面级姿态用「轻量择优」定，不做抽样打分池、不做广搜、不做密集复核。
+            //
+            // 为什么不能纯解析（倾角 = 法向需求）：实测开口盒子，纯解析时整件最大倾角 30°，
+            // 但 +X 内壁在 30° 下 2104 点一个都解不出（这面需要 60° 才能把腕部翻进去），
+            // 可达率从 99.3% 掉到 89.0%。倾角需求是**几何**需求，能不能解是**运动学**问题，
+            // 两者在深腔件上差 30°。所以这里保留"试几个倾角、看哪个解得出"，只是把
+            // 采样从 S=32/96/400 三档（约 3.5 万次 eval）压到每组 ≤7 倾角 × ≤8 点（约 500 次）。
+            //
+            // 打分是词典型的：**先看 ikOk 数**（解不出 = 这点根本执行不了，权重最高），
+            // 再看 hardOk 数（够得着但撞了 = 站位/尺寸问题，不是倾角能救的），
+            // 平手取小倾角（工艺喷角小、膜厚更均匀）。方位仍只用「向上」——
+            // 翻方位一次 TCP 要绕面点转 2·standoff·sin(Δaz/2)（60° 时 100mm），fast 模式不开这个口子。
+            if (p.fastPose) {
+                double need0 = 0.0;
+                for (int i : P) need0 = std::max(need0, need[i]);
+                std::vector<double> cand;
+                cand.push_back(need0);
+                double g0 = std::ceil(need0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg;
+                if (g0 <= need0 + 1e-9) g0 += p.tiltStepDeg;   // 网格首档严格大于需求（同 needTilt 口径）
+                for (double tt = g0; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg)
+                    cand.push_back(tt);
+
+                int K = std::min<int>(24, (int)P.size());
+                int bestC = 0, bestIk = -1, bestHard = -1;
+                double bestClr = -1e300;
+                for (int c = 0; c < (int)cand.size(); ++c) {
+                    int ikN = 0, hardN = 0;
+                    double minClr = 1e300;
+                    double seed[6] = {0, 0, 0, 0, 0, 0};
+                    bool hasSeed = false;
+                    V3 prevX;
+                    bool hasRefX = false;
+                    for (int k = 0; k < K; ++k) {
+                        int i = P[K > 1 ? (int)((long long)(P.size() - 1) * k / (K - 1)) : 0];
+                        V3 nrm = t.normal(i);
+                        V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                        V3 axis, uUp;
+                        tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+                        if (norm(uUp) < 1e-6) { axis = V3(0, 0, 0); uUp = V3(0, 0, 0); }
+                        V3 d = dirOf(nrm, uUp, axis, cand[c], 0.0);
+                        PR pr;
+                        if (!ev.eval(face, d, hasRefX ? &prevX : nullptr,
+                                     hasSeed ? seed : nullptr, cand[c], 0.0, true, pr)) {
+                            hasSeed = false;
+                            continue;
+                        }
+                        ++ikN;
+                        if (hardOk(pr, p)) ++hardN;
+                        minClr = std::min(minClr, pr.clearance);
+                        for (int q = 0; q < 6; ++q) seed[q] = pr.theta[q];
+                        hasSeed = true;
+                        FkOut f;
+                        fk(pr.theta, p.toolLen, f);
+                        prevX = f.tcp.R.col(0);
+                        hasRefX = true;
+                    }
+                    // 词序比较：解得出 > 过得了硬约束 > 间隙大 > 倾角小（倾角小由 bestC 先到先得保证）
+                    if (ikN > bestIk ||
+                        (ikN == bestIk && (hardN > bestHard ||
+                                           (hardN == bestHard && minClr > bestClr + 1e-9)))) {
+                        bestIk = ikN;
+                        bestHard = hardN;
+                        bestClr = minClr;
+                        bestC = c;
+                    }
+                }
+                double faceT = cand[bestC];
+                faceTilt[g] = faceT;
+                faceAz[g] = 0.0;
+                for (int r = ra; r <= rb; ++r) {
+                    azRow[r] = 0.0;
+                    for (int i = rows[r].first; i <= rows[r].second; ++i)
+                        if (t.spray[i]) finalTilt[i] = faceT;
+                }
+                if (g_prof.on) {
+                    std::fprintf(stderr, "  [face%2zu] fast 行 %3d..%3d 点%5d 倾角%5.1f 候选%zu 采样%d ikOk%d hardOk%d 最小%7.1f\n",
+                                 g, ra, rb, (int)P.size(), faceT, cand.size(), K, bestIk, bestHard, bestClr);
+                }
+                return;
+            }
+
             V3 nsum(0, 0, 0);
             for (int i : P) nsum = nsum + t.normal(i);
             V3 nFace = unit(nsum);
             V3 axis, uUp;
-            tiltAxisAndDir(nFace, axis, uUp);
+            tiltAxisAndDir(nFace, p.tiltRefW, axis, uUp);
             bool degenerate = norm(uUp) < 1e-6;       // 朝上的面：倾角无意义，恒 0
-            double tilt0 = degenerate ? 0.0 : tiltNeedDeg(nFace, p);
+            double tilt0 = degenerate ? 0.0 : tiltNeedDeg(nFace, p.tiltRefW, p);
 
             // 候选倾角：tilt0 + 该面内阶段 1 实际需要过的倾角（都在网格上）
             std::vector<double> tilts;
@@ -2049,7 +2377,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                         V3 n = t.normal(i);
                         V3 face = t.pos[i] + t.gun[i] * p.standoff;
                         V3 axis, uUp;
-                        tiltAxisAndDir(n, axis, uUp);
+                        tiltAxisAndDir(n, p.tiltRefW, axis, uUp);
                         if (norm(uUp) < 1e-6) continue;
                         V3 d = dirOf(n, uUp, axis, vt, vz);
                         PR pr;
@@ -2058,7 +2386,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                             has2 = false;
                             continue;
                         }
-                        if (!hardOk(pr, p.hardClearance)) ++fails;
+                        if (!hardOk(pr, p)) ++fails;
                         for (int q = 0; q < 6; ++q) seed2[q] = pr.theta[q];
                         has2 = true;
                     }
@@ -2146,6 +2474,215 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         std::fprintf(stderr, "  [az] rows=%zu 面组=%zu 非零方位行=%d 受影响点=%d · 行内倾角最大步进=%.1f°\n",
                      rows.size(), groups.size(), azChangedRows, nonZeroPts, maxStep);
     }
+    // ---- 阶段 2.5：倾角的连续性收尾
+    //
+    // 这一步存在的唯一理由：**倾斜会移动位置**。倾斜 ≡ 保持面点、保持喷距、把枪轴向
+    // 「正位置」扳 tilt 度，于是 TCP = 面点 + 枪轴·standoff 必然被推出去
+    // standoff·2sin(tilt/2)（standoff=100、tilt=43° → 73.5mm）。原始轨迹的 TCP 本来就
+    // 落在面点上，所以"手腕原地翻"在 raw 里几乎不动位置；一旦倾斜，它就变成绕面点走
+    // 半径 standoff·sin(tilt) 的球面，**raw 的姿态噪声被 1:1 放大成位置噪声**。
+    //
+    // 垃圾桶实测（734 点）：raw 相邻步长中位 4.00、最大 5.08，一条跳点都没有；
+    // 修正后出现 30 段 >10mm、最大 74.90mm。两个来源：
+    //   ① 换段边界：喷涂末点被推出 73.5mm，紧邻的空移点按设计 tilt 恒 0、位置一字不动
+    //      （空移点不倾斜是刻意的，见上文"置 0 后逐位回到原轨迹姿态"），一步 74.9mm。
+    //   ② 桶底 Ø9mm 锥形小坑：raw 沿坑壁绕一圈，位置只走 3mm 但枪轴逐点翻 20~58°、
+    //      方位绕满 360°（枪轴 z 分量全程恒定 -0.450，是锥面无疑）。倾斜后 TCP 落到
+    //      Ø110mm 的圈上，步长 22~55mm。
+    //
+    // 两处都不撞件（步长 >10mm 的 30 段，段到点云最小距离 73.2mm 起），是节拍/关节
+    // 平滑问题，不是碰撞问题。所以下面只做"让轨迹连续"这一件事，不改任何安全结论。
+    //
+    // RS_NO_CONT=1 可关掉整段（**只用于 A/B 回归**：同一份二进制跑出"收尾前/后"两组，
+    // 否则对比只能跨版本比，机型/参数一变动结论就不可信）。生产不要设这个变量。
+
+    // 枪体专用评估器：requireReach=0 → 只解析计算「TCP + 枪体三段碰撞体」与点云的间隙，
+    // 不解 IK（闸门用）。与机器人构型无关，天然无解支噪声。仅供阶段 2.5 的闸门使用。
+    Params pTool = p;
+    pTool.requireReach = 0;
+    Evaluator evTool(cloud, base, pTool);
+    if (std::getenv("RS_NO_CONT") == nullptr) {
+        // 喷涂连续段：**全局**按 spray 序列切，不能按行切。
+        // onepass 模式下整条轨迹是一条连续喷涂路径（行与行之间没有空移点），
+        // 按行切会把一条连续线切成 17 段，于是每段首尾各做一次 ramp ——
+        // 实测垃圾桶 #88~#102 上直接出现 V 形低谷（tilt 40→6.6→21），
+        // 本来连续的一条线被人为压成锯齿。空移点才是真正的分段依据。
+        std::vector<std::pair<int, int>> runs;
+        for (int i = 0; i < n;) {
+            while (i < n && !t.spray[i]) ++i;
+            if (i >= n) break;
+            const int a = i;
+            while (i < n && t.spray[i]) ++i;
+            runs.push_back({a, i - 1});
+        }
+        const double Sw = p.standoff > 1e-6 ? p.standoff : 100.0;
+        const double kStepBudget = 12.0;   // 相邻点 TCP 位移预算 mm
+        // 把"位移预算"折成"允许的倾角步长"：倾斜矢量模 = 2·standoff·sin(tilt/2)
+        const double dTiltCap = (kStepBudget < 2.0 * Sw)
+                                    ? 2.0 * std::asin(0.5 * kStepBudget / Sw) * kRad
+                                    : 90.0;
+
+        const std::vector<double> origTilt = finalTilt;   // 闸门要用
+
+        // ① 步长预算（默认关，RS_SHRINK=1 才启用）：按「法向变化率」反解每点的倾角上限，
+        //    再对倾角序列做双向限速。
+        //
+        // 位移的准确表达式只有一个：TCP = pos + standoff·(d − n)，所以
+        //     ΔTCP = Δpos + standoff·Δ(d − n)
+        // 前一项是 raw 的步长（本来就平滑，垃圾桶中位 4.00mm）；后一项是**倾斜矢量**
+        // v = standoff·(d − n) 的变化，它有两部分：
+        //   模：|v| = standoff·2sin(tilt/2)  —— 随倾斜本身长出来
+        //   方向：跟着法向方位转，转角 Δφ 与法向完全相同
+        // 所以 |Δv| ≈ standoff·sin(tilt)·Δφ + standoff·Δtilt。**两个方向都是 tilt 越小越好**：
+        // tilt→0 时 v→0，TCP 逐位回到 raw 位置（pos + 0 = 原始轨迹点，而原始轨迹是平滑的）。
+        //
+        // **默认关闭**的原因：倾角在这台臂上很多时候不只是"扳正"，它就是抬枪避让的手段。
+        // 18 件 A/B 实测，无条件收缩会把间隙整片搞坏（垃圾桶 32.5→2.4mm、
+        // 开口盒子 −14.2→−32.2mm、槽型盘 20.6→6.8mm），而且逐点收缩会在序列上
+        // 打出台阶，反而造出新的步长跳。边界斜坡（②）没有这个问题 —— 它只动喷涂段
+        // 首尾，那些点间隙通常很空，而且下面有整段闸门兜底。
+        //
+        // ⚠ 也不要改成"抬高倾角"。抬 tilt 会让 d 更贴近竖直、d 的夹角变小，看着像在
+        //   变平滑，但倾斜矢量反而更大、TCP 被推得更远 —— 实测把 #96 抬到 60° 后它
+        //   比 raw 偏了 100mm，段内最大位移从 66mm 涨到 71mm，越修越糟。
+        int shrunkPts = 0;
+        if (std::getenv("RS_SHRINK") != nullptr) {
+            for (const auto& rn : runs) {
+                const int a = rn.first, b = rn.second;
+                // a) 按法向转角反解倾角上限：standoff·sin(t)·Δφ ≤ budget
+                for (int i = a + 1; i <= b; ++i) {
+                    const double dphi = angleBetweenDeg(t.normal(i), t.normal(i - 1)) * kDeg;
+                    if (dphi < 1e-6) continue;
+                    const double s = kStepBudget / (Sw * dphi);
+                    const double capT = (s >= 1.0) ? 90.0 : std::asin(s) * kRad;
+                    if (finalTilt[i] > capT) {
+                        if (finalTilt[i] - capT > 0.5) ++shrunkPts;
+                        finalTilt[i] = capT;
+                    }
+                }
+                // b) 双向限速（先前向再后向，等价于对"V 形低谷"做两侧斜坡）
+                for (int i = a + 1; i <= b; ++i)
+                    finalTilt[i] = std::min(finalTilt[i], finalTilt[i - 1] + dTiltCap);
+                for (int i = b - 1; i >= a; --i)
+                    finalTilt[i] = std::min(finalTilt[i], finalTilt[i + 1] + dTiltCap);
+            }
+        }
+
+        // ② 边界斜坡：每个喷涂段首尾强制 tilt=0，再用 ±dTiltCap 双向限速生成斜坡。
+        //
+        // 为什么不是"削掉首尾各 N 点、中间用 smoothstep"：N 是按 tmax/dTiltCap 算的，
+        // 短段根本装不下 N 个点，于是出现「首点削到 1.7°、第二点还是 49.67°」——
+        // 实测复杂点云 #1540→#1541 反而从 74.10mm 涨到 81.40mm，比不修还差。
+        // 「首尾置 0 + 双向限速」自动适应段长：
+        //   长段 → 斜坡-平台-斜坡，中间倾角一字不动；
+        //   短段 → 整体被压成三角形，峰值 = dTiltCap × 段长/2，绝不会出台阶。
+        //
+        // tilt=0 的点位置 = 面点 + n·standoff = raw 位置，与紧邻的空移点（tilt 恒 0、
+        // 位置一字不动）天然接上 —— 换段那一跳就是这么消掉的。实测垃圾桶
+        // #309→#310 从 74.91mm 消掉（#303~#309 七点 43→0 渐变，间隙 63.5→66.0 反而变好）。
+        //
+        // ⚠ 轨迹首点/末点**不做斜坡**：它们前面/后面没有空移点要衔接，削了纯属白削。
+        // 实测过反例：垃圾桶 #0 被削到 21°，连杆间隙 46.6→6.9mm —— 桶腔里枪更竖直
+        // 意味着手腕要探得更深。斜坡的收益只存在于「喷涂段 ↔ 空移段」的接缝上。
+        int rampRuns = 0, rampPts = 0, raisedPts = 0;
+        for (const auto& rn : runs) {
+            const int a = rn.first, b = rn.second;
+            if (b - a < 1) continue;
+            const std::vector<double> keep(finalTilt.begin() + a, finalTilt.begin() + b + 1);
+            const bool rampA = (a > 0);         // a>0 时 t.spray[a-1] 必为 0（run 是极大喷涂段）
+            const bool rampB = (b < n - 1);
+            if (rampA) finalTilt[a] = 0.0;
+            if (rampB) finalTilt[b] = 0.0;
+            for (int i = a + 1; i <= b; ++i)
+                finalTilt[i] = std::min(finalTilt[i], finalTilt[i - 1] + dTiltCap);
+            for (int i = b - 1; i >= a; --i)
+                finalTilt[i] = std::min(finalTilt[i], finalTilt[i + 1] + dTiltCap);
+
+            // 闸门（逐点，口径 = **枪体间隙**，用 requireReach=0 的轻量评估器）：
+            //
+            // ⚠ 为什么要闸门：tilt=0 的点位置 = raw 位置、枪轴 = raw 枪轴，但**枪体不一定安全**
+            // ——垃圾桶就是现成的反例：空腔件里枪沿法向伸进去，枪身会蹭到对面桶壁，
+            // #0 的 raw 姿态枪体间隙 −20.7mm，阶段 2 给的 41° 倾角恰恰是把枪从桶里拉出来。
+            // 所以「斜坡把端点 tilt 归 0」在这个件上天然行不通，必须逐点验枪体。
+            //
+            // ⚠ 为什么只查枪体、不解 IK：第一版用全位姿评估（冷启 IK + frameFromZ 正则手腕），
+            // 同一个 #0 被报 −20.7mm「穿件」之外还多了一层假阳性——冷启选了另一支肘。
+            // 手臂构型是「连续种子」的领地（阶段 3），这里插手只会用阶段 3 根本不会
+            // 采用的构型否决正确的斜坡。枪体三段碰撞体由「TCP+枪轴」解析确定，
+            // 与机器人无关，是这里唯一可信的口径。
+            //
+            // 处理方式不是整段回滚（实测过：回滚会在序列上留台阶，反而造新跳），
+            // 而是**就地二分上搜**：在 [目标值, 原值] 里找能过安全线的最小倾角。
+            // 间隙随倾角基本单调（倾角越大枪越出腔），原值是阶段 2 选的、必然过线，
+            // 所以二分必有解；找到的就是「安全前提下最贴近斜坡目标」的值。
+            int changed = 0, raisedPts = 0;
+            for (int i = a; i <= b; ++i) {
+                const double o = keep[i - a];
+                if (std::fabs(finalTilt[i] - o) < 1e-6) continue;
+                const V3 nrm = t.normal(i);
+                const V3 face = t.pos[i] + t.gun[i] * Sw;
+                V3 axis, uUp;
+                tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+                if (norm(uUp) < 1e-6) continue;   // 法向退化时 dirOf 恒返回 n，tilt 无效
+                ++changed;
+                const double az = (rowOf[i] >= 0) ? azRow[rowOf[i]] : 0.0;
+                auto clrAt = [&](double tt) {
+                    PR pr;
+                    evTool.eval(face, dirOf(nrm, uUp, axis, tt, az),
+                                nullptr, nullptr, tt, az, false, pr);
+                    return pr.clearance;
+                };
+                // 地板：最多花 2mm 余量，且不许低于 min(原值, safety)。
+                // 第一版只用了 min(原值, safety)，18 件实测暴露出它太松：
+                // 12-34-54 #1146 原本 71.7mm 的枪体间隙被削到 22.4mm（贴着 safety=20 的地板）——
+                // 为节拍/观感花掉 49mm 安全余量是烂交易，平滑是锦上添花，余量是保命钱。
+                // 收紧成 clrA−2 后，二分会自动把倾角顶回「间隙刚好还剩 clrA−2」的位置：
+                // 平滑改善保留能白拿的部分（垃圾桶 #303~#309 削倾角间隙反而 63.5→66.0，全保留），
+                // 要花钱的部分自动放弃（那一跳留给 STEP_JUMP 如实报出来）。
+                const double clrA = clrAt(o);
+                const double floorClr = std::max(std::min(clrA, p.safety), clrA - 2.0);
+                if (clrAt(finalTilt[i]) < floorClr) {
+                    double lo = finalTilt[i], hi = o;   // 不变量：lo 过不了线，hi 过得了
+                    for (int it = 0; it < 20; ++it) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (clrAt(mid) < floorClr) lo = mid;
+                        else hi = mid;
+                    }
+                    finalTilt[i] = hi;
+                    ++raisedPts;
+                }
+            }
+            if (changed > 0) {
+                ++rampRuns;
+                rampPts += changed;
+            }
+        }
+        if (g_prof.on) {
+            double maxStep = 0.0;
+            for (const auto& rn : runs) {
+                bool hasPrev = false;
+                V3 prevT(0, 0, 0);
+                for (int i = rn.first; i <= rn.second; ++i) {
+                    const V3 nrm = t.normal(i);
+                    const double az = (rowOf[i] >= 0) ? azRow[rowOf[i]] : 0.0;
+                    V3 axis, uUp;
+                    tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+                    if (norm(uUp) < 1e-6) { hasPrev = false; continue; }
+                    const V3 dd = dirOf(nrm, uUp, axis, finalTilt[i], az);
+                    const V3 T = t.pos[i] + (dd - nrm) * Sw;
+                    if (hasPrev) maxStep = std::max(maxStep, norm(T - prevT));
+                    prevT = T;
+                    hasPrev = true;
+                }
+            }
+            std::fprintf(stderr,
+                         "  [cont] 喷涂段=%zu 生效斜坡=%d 段/%d 点 安全回抬=%d 点 收缩=%d 点 · "
+                         "段内相邻位移 max %.1fmm（预算 %.1f）\n",
+                         runs.size(), rampRuns, rampPts, raisedPts, shrunkPts, maxStep, kStepBudget);
+        }
+    }
+    g_prof.mark("阶段2.5 连续性收尾");
+
     // ---- 阶段 3：按 final 重新求解 + 归集违规
     std::vector<PR> results(n);
     std::vector<char> hasResult(n, 0);
@@ -2171,22 +2708,38 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
 
     // 违规位单点判定。阶段 3 和后面的「回退段统一姿态」都会改位姿，两处必须同口径，
     // 所以集中在这里算一次，别各写一份。
-    auto setViolBits = [&](PR& pr) {
+    //
+    // isSpray=false（空移点）：只判「撞不撞、走不走得到」——IK / 工具撞 / 连杆撞 /
+    // 自碰撞 / 关节限位 / 奇异。**不判** CLEARANCE（喷距）与 SPRAY_ANGLE（喷角）：
+    // 这两个是"喷出来的膜厚对不对"，而空移段枪是关的，报出来全是假告警
+    // （实测开口盒子空移点被误报 SPRAY_ANGLE 636 点、CLEARANCE 一整片）。
+    auto setViolBits = [&](PR& pr, bool isSpray) {
         const unsigned int kMask = RS_VIOL_IK_FAIL | RS_VIOL_TOOL_HIT | RS_VIOL_LINK_HIT |
                                    RS_VIOL_CLEARANCE | RS_VIOL_SELF_COLLISION |
                                    RS_VIOL_JOINT_LIMIT | RS_VIOL_SPRAY_ANGLE |
                                    RS_VIOL_NEAR_SINGULAR;
         pr.viol &= ~kMask;
+        // 不要求可达：IK_FAIL / SELF_COLLISION / JOINT_LIMIT / LINK_HIT 这四位一律不置。
+        // 它们全都是「这台机器人 + 这条站位」的结论，点云本身没有对错。
+        // 几何层照旧：枪体碰撞、间隙不足、工艺喷角都还照实报（这三条换任何机器人都成立）。
+        if (!p.requireReach) {
+            if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
+            if (isSpray) {
+                if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
+                if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
+            }
+            return;
+        }
         if (!pr.ikOk) { pr.viol |= RS_VIOL_IK_FAIL; return; }
         // 穿透按部位细分：连杆/关节撞 与 枪体/喷嘴撞 是两类完全不同的现场问题
         // （前者要改站位或姿态，后者只要抬高喷距/换角度），混在一个 COLLISION 里没法决策。
         // RS_VIOL_COLLISION 保留定义但不再置位，避免 byRule 重复计数。
         if (pr.clrTool < 0.0) pr.viol |= RS_VIOL_TOOL_HIT;
         if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
-        if (pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
+        if (isSpray && pr.clearance >= 0.0 && pr.clearance < p.safety) pr.viol |= RS_VIOL_CLEARANCE;
         if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
         if (pr.over || pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
-        if (pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
+        if (isSpray && pr.sprayAngle > p.maxSprayAngleDeg + 1e-9) pr.viol |= RS_VIOL_SPRAY_ANGLE;
         if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
     };
 
@@ -2202,7 +2755,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             double az = rowOf[i] >= 0 ? azRow[rowOf[i]] : 0.0;
 
             V3 axis, uUp;
-            tiltAxisAndDir(nrm, axis, uUp);
+            tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
             if (norm(uUp) < 1e-6) {
                 axis = V3(0, 0, 0);
                 uUp = V3(0, 0, 0);
@@ -2234,7 +2787,23 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     // 实测 longwide（单层 12476 点）：面级 10° 下有 15 点解不出，20° 下全好；
                     // 抽样打分看不见 0.12% 的失败（400 抽样期望命中 0.5 个），只能在逐点解时救。
                     bool rescued = false;
-                    for (int m = 1; m <= 3 && !rescued; ++m) {
+                    // 单次逆解模式（fastPose）：救援只试**一步**（±1 个倾角步长），
+                    // 保证每点最多 2 次 IK。完整的 ±1/±2/±3 三级搜救是质量优化，
+                    // 不属于安全判定 —— 关掉不影响任何一条违规的判据。
+                    // 空移点（spray=0）不救援：mMax=0 让循环直接不跑。
+                    // 它的姿态是轨迹生成器为避障算好的，靠倾转"救"成可解等于把避障路径改掉
+                    // （可能直接撞件）。解不出就照实报 IK_FAIL。
+                    // 逐点连续口径下救援给到**上限**：线性值只是"法向要求的姿态"，
+                    // 个别点过不了时允许单独往上抬（最多到 tiltMax），否则长板这类件
+                    // 实测 P0 会从 93 涨到 825 —— 倾角在这些件上不只是工艺量，还是避障手段。
+                    int mMax = 0;
+                    if (t.spray[i]) {
+                        if (p.fastPose) mMax = 1;
+                        else if (p.tiltPerPoint)
+                            mMax = (int)std::floor((p.tiltMaxDeg - tilt) / p.tiltStepDeg + 1e-9);
+                        else mMax = 3;
+                    }
+                    for (int m = 1; m <= mMax && !rescued; ++m) {
                         for (int sgn = 1; sgn >= -1 && !rescued; sgn -= 2) {
                             double t2 = tilt + sgn * m * p.tiltStepDeg;
                             if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
@@ -2243,7 +2812,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                             if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
                                          hasSeed ? prevTheta : nullptr, t2, az, checkLinks, pr2))
                                 continue;
-                            if (!hardOk(pr2, p.hardClearance)) continue;
+                            if (!hardOk(pr2, p)) continue;
                             pr2.idx = i;
                             pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
                             pr2.reverted = true;
@@ -2286,8 +2855,63 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 //   · 只有硬约束被破坏，且本点最优更安全时，才退回本点最优。
                 // 注意：margin < jointMarginMin 仍只是 P1 软告警，不触发回退；
                 //       safety（默认 20mm）也只影响报告标橙，不再是回退阈值。
-                if (hasCache[i]) {
-                    bool smoothHard = hardOk(pr, p.hardClearance);
+                if (p.fastPose || p.tiltPerPoint) {
+                    // ---- 单次逆解 / 逐点倾角逐点救援：姿态过不了硬约束时，**只**在同方位上
+                    // 试 ±1 个倾角步长（最多 2 次额外 eval），不做 ±2/±3、不退回本点最优、不翻方位。
+                    //
+                    // 逐点倾角模式的救援幅度同样是 ±1 步：倾角本来就是法向的连续函数，
+                    // 大范围搜救会把"线性给的差值"改回台阶，正是这次要消灭的东西。
+                    //
+                    // 为什么保留这一步：开口盒子实测，完全不救援时 P0 从 868 涨到 4013
+                    // （这些点的冲突是"换 5° 就能避开"的，不是几何死结）；加上 ±1 步回到可接受范围，
+                    // 代价仍然每点 ≤2 次 IK。±2/±3 的收益递减、甩腕风险递增，fast 模式明确不做。
+                    // 空移点（spray=0）**不救援**：它的姿态是轨迹生成器的避障结果，
+                    // 靠倾转让它"更好解"等于换一条空移路径 —— 实测开口盒子 819 个空移点
+                    // 就是这样被退回 35°/55° 的倾斜位姿（TCP 偏 57~105mm，还导致喷角假告警）。
+                    // 真的撞就交给下面的「过渡点抬升」按 +Z 抬枪解决，姿态一列不改。
+                    if (!hardOk(pr, p) && t.spray[i]) {
+                        // fast 模式的救援：同方位、倾角 ±1/±2 步（最多 4 次 eval，只在失败点上花）。
+                        //
+                        // 为什么给到 ±2：面级姿态是**抽样**选的（每组 ≤8 点），单点级别的冲突
+                        // （典型是 1 个点的自碰撞）抽样根本看不见。开口盒子实测 ±1 步 P0≈3969、
+                        // ±1..±3 步 3869（多花 0.8s 只换 100 点，不值）；但槽型盘只有 1 个点自碰撞，
+                        // ±1 步救不到（差 10°），±2 步正好够 —— 这是"非 REJECT 变 REJECT"的差别，
+                        // 99% 的时间里用不上，用上了就值。
+                        //
+                        // 仍然不做：退回阶段 1 的逐点最优姿态（那必须先把每个点都解一遍）。
+                        // 逐点连续口径：允许一路抬到 tiltMax —— 线性值只决定"起手姿态"，
+                        // 这个点真过不了（自碰撞/连杆撞件）就单独往上抬，别为了一行连续
+                        // 让整条轨迹不可用（长板实测：只 ±2 步时 P0=825，面级常量时 93）。
+                        const int mMax2 = p.tiltPerPoint
+                            ? (int)std::floor((p.tiltMaxDeg - tilt) / p.tiltStepDeg + 1e-9)
+                            : 2;
+                        for (int m = 1; m <= mMax2; ++m) {
+                            bool fixed = false;
+                            for (int sgn = -1; sgn <= 1 && !fixed; sgn += 2) {
+                                double t2 = tilt + sgn * m * p.tiltStepDeg;
+                                if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                                V3 d2 = dirOf(nrm, uUp, axis, t2, az);
+                                PR pr2;
+                                if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
+                                             hasSeed ? prevTheta : nullptr, t2, az, checkLinks, pr2))
+                                    continue;
+                                if (!hardOk(pr2, p)) continue;
+                                pr2.idx = i;
+                                pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                                pr2.reverted = true;
+                                pr = pr2;
+                                ++acc.reverted;
+                                fixed = true;
+                            }
+                            if (fixed) break;
+                        }
+                    }
+                }
+                else if (hasCache[i] && t.spray[i]) {
+                    // 空移点不参与这条"退回本点最优"的回退链：cache[i] 是阶段 1 用
+                    // 面级需求倾角算的解，退回去等于把避障姿态换成喷涂姿态（见上一条注释）。
+                    // 空移点的 saf 修正只走「过渡点抬升」，位置改变、姿态不变。
+                    bool smoothHard = hardOk(pr, p);
                     if (!smoothHard) {
                         // 按严重度归类「面级姿态为什么过不了」，互斥计数。
                         // 口径与 hardOk 严格一致：margin < jointMarginMin 只是 P1 软告警，
@@ -2309,7 +2933,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                 PR pr2;
                                 if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr, hasSeed ? prevTheta : nullptr,
                                              t2, az, checkLinks, pr2)) continue;
-                                if (!hardOk(pr2, p.hardClearance)) continue;
+                                if (!hardOk(pr2, p)) continue;
                                 pr2.idx = i;
                                 pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
                                 pr2.reverted = true;
@@ -2338,7 +2962,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                 PR pr2;
                                 if (ev.eval(face, d2, hasRefX ? &prevX : nullptr,
                                             hasSeed ? prevTheta : nullptr, cTilt, az, checkLinks, pr2) &&
-                                    hardOk(pr2, p.hardClearance)) {
+                                    hardOk(pr2, p)) {
                                     pr2.idx = i;
                                     pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
                                     pr2.reverted = true;
@@ -2347,7 +2971,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                     fixed = true;
                                 }
                             }
-                            if (!fixed && hardOk(cache[i], p.hardClearance)) {
+                            if (!fixed && hardOk(cache[i], p)) {
                                 pr = cache[i];
                                 pr.idx = i;
                                 pr.reverted = true;
@@ -2360,7 +2984,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
             pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
             acc.standoffMaxErr = std::max(acc.standoffMaxErr, pr.standoffErr);
 
-            setViolBits(pr);
+            setViolBits(pr, t.spray[i] != 0);
 
             if (pr.ikOk) ++acc.reachable;
             results[i] = pr;
@@ -2435,7 +3059,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     int segUnified = 0;
     {
         const int kGap = 2;
-        auto isRev = [&](int k) { return hasResult[k] && results[k].reverted; };
+        auto isRev = [&](int k) { return hasResult[k] && results[k].reverted && t.spray[k]; };
         int i = 0;
         while (i < n) {
             if (!isRev(i)) { ++i; continue; }
@@ -2474,7 +3098,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     V3 nrm = t.normal(k);
                     V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
                     V3 ax, up;
-                    tiltAxisAndDir(nrm, ax, up);
+                    tiltAxisAndDir(nrm, p.tiltRefW, ax, up);
                     if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
                     V3 d2 = dirOf(nrm, up, ax, cands[ci].first, cands[ci].second);
                     bool checkLinks = (k % std::max(1, p.linkStride) == 0);
@@ -2482,7 +3106,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                     PR tmp;
                     if (!ev.eval(fpt, d2, nullptr, seed, cands[ci].first, cands[ci].second,
                                  checkLinks, tmp) ||
-                        !hardOk(tmp, p.hardClearance))
+                        !hardOk(tmp, p))
                         ++fail;
                 }
                 double dev = std::fabs(cands[ci].first - faceTilt) +
@@ -2507,14 +3131,14 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 V3 nrm = t.normal(k);
                 V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
                 V3 ax, up;
-                tiltAxisAndDir(nrm, ax, up);
+                tiltAxisAndDir(nrm, p.tiltRefW, ax, up);
                 if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
                 V3 d2 = dirOf(nrm, up, ax, bTilt, bAz);
                 bool checkLinks = (k % std::max(1, p.linkStride) == 0);
                 const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta : nullptr;
                 PR tmp;
                 if (!ev.eval(fpt, d2, nullptr, seed, bTilt, bAz, checkLinks, tmp) ||
-                    !hardOk(tmp, p.hardClearance)) {
+                    !hardOk(tmp, p)) {
                     continue;   // 这一点在本段姿态下过不了硬约束：原样保留，不动它
                 }
                 const bool moved = norm(tmp.pos - results[k].pos) > 1e-6;
@@ -2522,7 +3146,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                 tmp.sprayAngle = angleBetweenDeg(-tmp.gun, nrm);
                 tmp.reverted = (std::fabs(bTilt - faceTilt) > 1e-6 ||
                                 std::fabs(bAz - faceAz) > 1e-6);
-                setViolBits(tmp);
+                setViolBits(tmp, true);   // isRev 已过滤掉空移点，这里必然是喷涂点
                 results[k] = tmp;
                 if (moved) ++applied;
             }
@@ -2564,39 +3188,94 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     g_prof.mark("阶段3 重解");
     int lifted = 0;
     if (p.fixTransit) {
+        // 逐点独立抬升会把空移线抬成锯齿：开口盒子实测 A1 段 139 个点的 lift 在
+        // 45~56mm 之间逐点跳，z 每步变 2~4mm，整段像波浪；相邻点 lift 差最大 57.5mm
+        // （一步之内垂直跳 57mm）。空移是关枪过渡，同一段内应该用**同一个抬升量**：
+        // 路径仍是原来那条折线，只是整体抬高，机器人不会上下抖。
+        // 做法：先算出每点需要的 lift，再把"连续被抬的点串"统一到串内最大值。
+        std::vector<double> need(n, 0.0);
         for (int i = 0; i < n; ++i) {
             PR& pr = results[i];
             if (!hasResult[i] || t.spray[i] != 0) continue;
             if (!std::isfinite(pr.clearance) || pr.clearance >= p.safety) continue;
-            double lift = std::min(p.transitLiftMax, p.safety - pr.clearance + 5.0);
-            pr.pos = pr.pos + V3(0, 0, lift);
-            pr.lifted = lift;
-            pr.clearance += lift;
+            need[i] = std::min(p.transitLiftMax, p.safety - pr.clearance + 5.0);
+        }
+        for (int i = 0; i < n;) {
+            if (need[i] <= 0.0) { ++i; continue; }
+            int j = i;
+            double mx = need[i];
+            while (j + 1 < n && need[j + 1] > 0.0) { ++j; mx = std::max(mx, need[j]); }
+            for (int k = i; k <= j; ++k) need[k] = mx;
+            i = j + 1;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (need[i] <= 0.0) continue;
+            PR& pr = results[i];
+            // 抬升沿重力反向（远离地面/工件），不是沿点云 +Z —— 相机系里 +Z 是光轴，
+            // 沿它抬等于把空移点横着推出工件，间隙数字变好了但实际没抬离。
+            pr.pos = pr.pos + p.upW * need[i];
+            pr.lifted = need[i];
+            pr.clearance += need[i];
             // 分组距离必须同步抬升，否则总结论（已避开）与"连杆最小距离"（还是抬升前）
             // 会自相矛盾 —— curved 上就出现过 clearance=20.02 而 clrTool=11.39。
-            if (pr.clrTool < 1e299) pr.clrTool += lift;
-            if (pr.clrLink < 1e299) pr.clrLink += lift;
+            if (pr.clrTool < 1e299) pr.clrTool += need[i];
+            if (pr.clrLink < 1e299) pr.clrLink += need[i];
             pr.viol &= ~(RS_VIOL_COLLISION | RS_VIOL_CLEARANCE | RS_VIOL_LINK_HIT | RS_VIOL_TOOL_HIT);
             ++lifted;
         }
     }
 
-    // ---- 姿态跳变：平滑回退的代价，必须报出来（P2，速度/加速度风险，不是碰撞）
+    // ---- 姿态跳变 / 位置跳变：都是"平滑性"的代价，必须报出来（P2，速度/加速度风险）
+    //
+    // 两条都**不再限制在行内**。原来只在 `r.first+1..r.second` 里比，恰好漏掉了最容易
+    // 出问题的那一对：某条喷涂线的最后一点 → 下一条空移线的第一点。垃圾桶实测
+    // #309(喷涂末点, tilt 43.15°) → #310(空移首点, tilt 0)，raw 相距 4.00mm，
+    // 修正后 74.90mm，全程 VERDICT=PASS —— 因为这一对跨行，根本没进循环。
+    // 步长阈值要跟"本件自己的点距"比，不能写死：row80 稀疏件点距本身就 40mm+，
+    // 按固定 12mm 报会把整条轨迹刷满假告警；反过来点距 3mm 的密件，
+    // 12mm 已经是一次 4 倍的位移突变。
+    //
+    // 下限取 15 而不是 12：阶段 2.5 的限速本身就允许「每点 Δtilt ≤ dTiltCap」，
+    // 折成位移正好是 12mm 量级，再加上本点自己的 Δpos 就是 13~18mm。
+    // 这些是**设计内的斜坡步长**，不是跳点；把它们一起报出来，只会让
+    // "修完之后告警更多了"这种误判发生（实测 12 阈值下 38 段，其中 30 段是斜坡）。
+    // thrStep 放在 if 外面：下面"步长硬上限插点"用同一个阈值——报出来之前
+    // 先 try 一次插点消掉，消不掉才报，两处口径必须一致。
+    std::vector<double> gaps;
+    gaps.reserve(n);
+    for (int i = 1; i < n; ++i)
+        if (hasResult[i] && hasResult[i - 1])
+            gaps.push_back(norm(results[i].pos - results[i - 1].pos));
+    double medGap = 0.0;
+    if (!gaps.empty()) {
+        std::vector<double> g2 = gaps;
+        std::nth_element(g2.begin(), g2.begin() + g2.size() / 2, g2.end());
+        medGap = g2[g2.size() / 2];
+    }
+    const double thrStep = std::max(15.0, 3.0 * medGap);
+
     if (p.tiltRateDeg > 0) {
-        double thr = std::max(3.0 * p.tiltRateDeg, 10.0);
-        for (const auto& r : rows) {
-            for (int i = r.first + 1; i <= r.second; ++i) {
-                // 不可达点没有位姿，谈"倾角跳变"没有意义，别让它再刷一条违规
-                if (!results[i].ikOk || !results[i - 1].ikOk) continue;
-                double dlt = std::fabs(results[i].sprayAngle - results[i - 1].sprayAngle);
-                if (dlt > thr) results[i].viol |= RS_VIOL_TILT_JUMP;
-            }
+        const double thrTilt = std::max(3.0 * p.tiltRateDeg, 10.0);
+        for (int i = 1; i < n; ++i) {
+            // 没有位姿的点（IK 失败）谈跳变没有意义，别让它再刷一条违规。
+            // 注意判 hasResult 而不是 ikOk：不要求可达时 ikOk 恒为 0，但位姿是有的，
+            // 跳变（换面/回退/换段造成）恰恰是那时候最该报的东西。
+            if (!hasResult[i] || !hasResult[i - 1]) continue;
+            // 姿态：用枪轴 3D 夹角。只比 tiltDeg 会漏掉整类问题 —— 逐点口径下
+            // 方位翻转时倾角可以一个字都不变（垃圾桶桶底小坑那段全程 42.1~42.2°，
+            // 方位绕满一圈，相邻枪轴夹角却有 18~58°）。
+            if (angleBetweenDeg(results[i].gun, results[i - 1].gun) > thrTilt)
+                results[i].viol |= RS_VIOL_TILT_JUMP;
+            // 位置：直线步长。换段处不抬枪、不补偿，是这条判据的主战场。
+            if (norm(results[i].pos - results[i - 1].pos) > thrStep)
+                results[i].viol |= RS_VIOL_STEP_JUMP;
         }
     }
 
     // ---- L0 输入层自检（这一层不通，后面所有几何结论都是废的）
     int l0Issues = 0;
-    {
+    if (p.requireReach) {
+        // 只有要求可达时，"法兰→面点"的总长才必须落在臂展内
         double reachNeed = p.standoff + p.toolLen;
         double limit = kReach * 0.90;
         if (reachNeed > limit) ++l0Issues;
@@ -2621,16 +3300,134 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         }
     }
 
+    // ---- 步长硬上限：相邻点位移超预算的段落插补过渡点（"千万不能跳点"）
+    //
+    // 倾斜修正会把「枪轴绕小特征扫一圈」放大成 TCP 的大回摆：垃圾桶桶底 Ø9mm 小坑，
+    // raw 枪轴 7 点扫满 360°、TCP 每点只走 3mm；加 42° 倾角后，73.5mm 的倾斜矢量
+    // 跟着枪轴一起绕圈，TCP 被甩到 Ø110mm 圆上，每点 22~55mm。
+    // 倾角调度救不了它——喷这个坑就必然要扫这一圈（枪轴极角恒定、方位转满 360° 是
+    // raw 的真实几何），倾斜矢量从 71.7mm 收到 12mm 要径向走 60mm，快速自旋区里
+    // 这 60mm 无论怎么摊都至少 30mm/步。
+    //
+    // 所以唯一可靠的办法：**不改轨迹形状，把大步切成小步**——位置线性插值、
+    // 枪轴球面插值（slerp），机器人沿真实回摆弧走，而不是一步甩过去。
+    // 工艺（倾角/喷角/开关枪/速度）一格不改，插点 spray 只在两端都开枪时才开。
+    //
+    // 每个插补点过一遍枪体闸门（阶段 2.5 同款轻量评估器）：弦比弧贴轴，
+    // 弦太长可能啃到特征本体。不过线就加倍细分——分得足够密时弦→弧、间隙→端点间隙，
+    // 弧本身是端点之间的既有路径；6 次加倍仍不过就放弃插点，保留 STEP_JUMP 如实上报。
+    // 插成功才撤掉这一段的 STEP_JUMP / TILT_JUMP（跳点已经不存在了）。
+    std::vector<PR> emit;
+    std::vector<int> emitSrc;
+    std::vector<char> emitSpray;
+    emit.reserve((size_t)n + 64);
+    emitSrc.reserve((size_t)n + 64);
+    emitSpray.reserve((size_t)n + 64);
+    int insertedPts = 0, densifiedSegs = 0, densifyGiveUp = 0;
+    {
+        const double SwD = p.standoff > 1e-6 ? p.standoff : 100.0;
+        auto toolClrOf = [&](const V3& pos, const V3& gunDir) {
+            const V3 g = unit(gunDir);
+            PR pr;
+            evTool.eval(pos + g * SwD, g * -1.0, nullptr, nullptr, 0.0, 0.0, false, pr);
+            return pr.clearance;   // requireReach=0 口径 = 枪体最小表面距离
+        };
+        for (int i = 0; i < n; ++i) {
+            if (i > 0 && hasResult[i] && hasResult[i - 1]) {
+                const PR& A = results[i - 1];
+                const PR& B = results[i];
+                const double step = norm(B.pos - A.pos);
+                if (step > thrStep) {
+                    const V3 a = unit(A.gun), b = unit(B.gun);
+                    const double omega =
+                        std::acos(std::max(-1.0, std::min(1.0, dot(a, b))));
+                    auto slerp = [&](double s) -> V3 {
+                        if (omega < 1e-9) return unit(a + (b - a) * s);
+                        const double w1 = std::sin((1.0 - s) * omega) / std::sin(omega);
+                        const double w2 = std::sin(s * omega) / std::sin(omega);
+                        return unit(a * w1 + b * w2);
+                    };
+                    const double ca = toolClrOf(A.pos, A.gun);
+                    const double cb = toolClrOf(B.pos, B.gun);
+                    // 任一端没量出枪体间隙（不该发生：阶段 3 全程建了碰撞体）就不设闸
+                    const bool verify = std::isfinite(ca) && std::isfinite(cb);
+                    const double floorClr = std::min(ca, cb) - 2.0;
+                    int k = (int)std::ceil(step / thrStep) - 1;
+                    if (k < 1) k = 1;
+                    std::vector<PR> ins;
+                    bool ok = false;
+                    while (true) {
+                        ins.clear();
+                        ok = true;
+                        for (int j = 1; j <= k && ok; ++j) {
+                            const double s = (double)j / (k + 1);
+                            PR q;
+                            q.pos = A.pos + (B.pos - A.pos) * s;
+                            q.gun = slerp(s);
+                            q.sprayAngle = A.sprayAngle + (B.sprayAngle - A.sprayAngle) * s;
+                            q.tiltDeg = q.sprayAngle;
+                            q.azDeg = B.azDeg;
+                            if (verify) {
+                                const double cc = toolClrOf(q.pos, q.gun);
+                                if (!(cc >= floorClr)) { ok = false; break; }
+                                q.clearance = cc;
+                                q.clrTool = cc;
+                            } else {
+                                q.clearance = std::min(A.clearance, B.clearance);
+                                q.clrTool = std::min(A.clrTool, B.clrTool);
+                            }
+                            // 其余报告字段取两端较保守值：插补点是几何中间态，
+                            // 不是独立评估过的位姿，别伪装成比端点更安全。
+                            q.clrLink = std::min(A.clrLink, B.clrLink);
+                            q.selfGap = std::min(A.selfGap, B.selfGap);
+                            q.margin = std::min(A.margin, B.margin);
+                            q.ikOk = A.ikOk && B.ikOk;
+                            q.standoffErr = 0.0;   // pos/gun 是端点凸组合，偏差有界不另测
+                            q.viol = 0;
+                            ins.push_back(q);
+                        }
+                        if (ok || k >= 96) break;
+                        k *= 2;
+                    }
+                    if (ok) {
+                        const char spr = (t.spray[i - 1] && t.spray[i]) ? 1 : 0;
+                        for (const PR& q : ins) {
+                            emit.push_back(q);
+                            emitSrc.push_back(i);
+                            emitSpray.push_back(spr);
+                        }
+                        // 跳点已经切小，相应的 P2 告警随之撤掉
+                        results[i].viol &= ~(unsigned)(RS_VIOL_STEP_JUMP | RS_VIOL_TILT_JUMP);
+                        ++densifiedSegs;
+                        insertedPts += (int)ins.size();
+                    } else {
+                        ++densifyGiveUp;
+                    }
+                }
+            }
+            emit.push_back(results[i]);
+            emitSrc.push_back(i);
+            emitSpray.push_back(t.spray[i] ? 1 : 0);
+        }
+    }
+    const int nOut = (int)emit.size();
+    if (g_prof.on && (densifiedSegs || densifyGiveUp)) {
+        std::fprintf(stderr,
+                     "  [dens] 超步长(>%.1fmm)切段=%d 插点=%d 放弃=%d 段 · 输出 %d 点（原 %d）\n",
+                     thrStep, densifiedSegs, insertedPts, densifyGiveUp, nOut, n);
+    }
+
     // ---- 输出
     g_prof.mark("过渡+自检");
-    RobotSafetyPoint* out = new RobotSafetyPoint[n];
-    std::memset(out, 0, sizeof(RobotSafetyPoint) * (size_t)n);
+    RobotSafetyPoint* out = new RobotSafetyPoint[nOut];
+    std::memset(out, 0, sizeof(RobotSafetyPoint) * (size_t)nOut);
     std::vector<double> angles;
     angles.reserve(n);
     double minClr = std::numeric_limits<double>::infinity();
     int tilted = 0;
     double minClrTool = std::numeric_limits<double>::infinity();
     double minClrLink = std::numeric_limits<double>::infinity();
+    int reachableOut = 0;   // 按输出的点（含插补点）重算，见循环内
     // 未测到（IK 失败 / 本点没查连杆）统一写 nan：写 0 会被读成"贴脸 0mm"，
     // 那比"没测"更误导。
     auto measured = [](double v) {
@@ -2639,17 +3436,18 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     vc.total = 0;
     std::memset(vc.byRule, 0, sizeof(vc.byRule));
 
-    for (int i = 0; i < n; ++i) {
-        const PR& pr = results[i];
-        RobotSafetyPoint& q = out[i];
+    for (int r = 0; r < nOut; ++r) {
+        const PR& pr = emit[r];
+        const int src = emitSrc[r];
+        RobotSafetyPoint& q = out[r];
         q.x = pr.pos.x;
         q.y = pr.pos.y;
         q.z = pr.pos.z;
         q.i = pr.gun.x;
         q.j = pr.gun.y;
         q.k = pr.gun.z;
-        q.speed = t.speed[i];
-        q.spray = t.spray[i];
+        q.speed = t.speed[src];
+        q.spray = emitSpray[r];
         q.tiltDeg = pr.sprayAngle;
         q.clearanceMm = pr.clearance;
         q.selfGapMm = pr.selfGap;
@@ -2657,18 +3455,22 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         q.standoffErrMm = pr.standoffErr;
         q.liftedMm = pr.lifted;
         q.cond = pr.cond;
+        // theta 只在真解过 IK 时才有意义；其余情况写 0（不是 0°，是"没解"）。
         for (int k = 0; k < 6; ++k) q.theta[k] = pr.ikOk ? pr.theta[k] : 0.0;
         q.ikOk = pr.ikOk ? 1 : 0;
         q.reverted = pr.reverted ? 1 : 0;
         q.violation = pr.viol;
         q.clearanceToolMm = measured(pr.clrTool);
         q.clearanceLinkMm = measured(pr.clrLink);
-        q.worstKind = pr.ikOk ? pr.partKind : -1;
-        q.worstJ0 = pr.ikOk ? pr.partJ0 : -1;
-        q.worstJ1 = pr.ikOk ? pr.partJ1 : -1;
-        q.linkKind = pr.ikOk ? pr.linkKind : -1;
-        q.linkJ0 = pr.ikOk ? pr.linkJ0 : -1;
-        q.linkJ1 = pr.ikOk ? pr.linkJ1 : -1;
+        // 最近部位按"有没有这个部位"决定，不再挂在 ikOk 上：
+        // 不要求可达时没解 IK，但枪体的最近部位（握把/细管/喷嘴）是真量出来的，
+        // 报告里"枪体撞在喷嘴"这句话必须留着。
+        q.worstKind = pr.partKind;
+        q.worstJ0 = pr.partJ0;
+        q.worstJ1 = pr.partJ1;
+        q.linkKind = pr.linkKind;
+        q.linkJ0 = pr.linkJ0;
+        q.linkJ1 = pr.linkJ1;
         if (pr.viol) {
             for (int b = 0; b < RS_VIOL_COUNT; ++b)
                 if (pr.viol & (1u << b)) ++vc.byRule[b];
@@ -2682,14 +3484,21 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
         if (ct < minClrTool) minClrTool = ct;
         if (cl < minClrLink) minClrLink = cl;
         if (pr.sprayAngle > 0.5) ++tilted;
+        // 可达率按**输出的点**（含插补点）重算：插补点 ikOk = 两端与，
+        // 分子分母才是同一个口径。
+        if (!p.requireReach || pr.ikOk) ++reachableOut;
     }
 
     double sum = 0.0;
     for (double a : angles) sum += a;
 
+    // 不要求可达时根本没有解过 IK（ikOk 恒 0）。按用户口径「默认全部通过」记成全部点
+    // （循环里已逐点计入 reachableOut），但这只是记账口径：CSV 里 ikOk 仍是 0、
+    // theta 仍是 0，界面/报告上必须显著标成「未检查」，不能把 100% 当成真测出来的可达率。
+    // minClearanceLinkMm 同理：没建连杆碰撞体，它会是 nan，不是 0。
     R.points = out;
-    R.count = n;
-    R.reachable = reachable;
+    R.count = nOut;
+    R.reachable = reachableOut;
     R.tiltedPoints = tilted;
     R.poseReverted = reverted;
     R.violations = vc.total;
@@ -2697,7 +3506,7 @@ RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
     R.minClearanceMm = minClr;
     R.minClearanceToolMm = minClrTool;
     R.minClearanceLinkMm = minClrLink;
-    R.tiltMeanDeg = n ? sum / n : 0.0;
+    R.tiltMeanDeg = nOut ? sum / nOut : 0.0;
     R.tiltP95Deg = percentile(angles, 0.95);
     R.tiltMaxDeg = angles.empty() ? 0.0 : *std::max_element(angles.begin(), angles.end());
     R.standoffMaxErrMm = standoffMaxErr;

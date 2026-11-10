@@ -31,4 +31,23 @@
     <Warning Text="找不到核心算法库：$(SprayTrajCoreDll)，请先构建 cpp/SprayTrajCore（cmake --build build --config Release）" />
   </Target>
 
+  <!--
+    标定配置跟着 exe 走：界面里「手眼矩阵」默认填的是相对路径 config\handeye_cam2base.txt，
+    按程序目录解析。不复制的话，从 bin 里双击启动就会报"文件不存在"，
+    而人明明看得见仓库根目录下有这么个文件 —— 这种"路径感"问题最费时间。
+    整个 config 目录一起同步，以后加新配置文件不用再改工程。
+  -->
+  <PropertyGroup>
+    <CalibConfigDir>$(MSBuildThisFileDirectory)..\..\config\</CalibConfigDir>
+  </PropertyGroup>
+
+  <Target Name="SyncCalibConfig" AfterTargets="Build" Condition="Exists('$(CalibConfigDir)')">
+    <ItemGroup>
+      <CalibFiles Include="$(CalibConfigDir)**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CalibFiles)" DestinationFolder="$(OutDir)config\%(RecursiveDir)"
+          SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="已同步标定配置 @(CalibFiles->Count()) 个 -> $(OutDir)config" />
+  </Target>
+
 </Project>

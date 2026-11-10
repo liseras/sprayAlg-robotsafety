@@ -19,7 +19,26 @@ import struct
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.spatial import cKDTree
+try:                                   # scipy 只用于"抽样估点距"，不是判定链路的一部分
+    from scipy.spatial import cKDTree
+except ImportError:                    # 现场机/托管 python 常常没装 scipy
+    cKDTree = None
+
+
+def _nn_dists(pts: np.ndarray, query: np.ndarray) -> np.ndarray:
+    """每个 query 点到 pts 的最近距离。有 scipy 走 KD 树，没有就分块暴力。"""
+    if cKDTree is not None:
+        tree = cKDTree(pts)
+        d, _ = tree.query(query, k=1)
+        return d
+    out = np.empty(len(query), dtype=np.float64)
+    q = np.asarray(query, dtype=np.float32)
+    p = np.asarray(pts, dtype=np.float32)
+    for i in range(0, len(q), 64):
+        blk = q[i:i + 64]
+        d2 = ((blk[:, None, :] - p[None, :, :]) ** 2).sum(axis=2)
+        out[i:i + 64] = np.sqrt(d2.min(axis=1))
+    return out
 
 from . import geom
 
@@ -137,15 +156,24 @@ class CloudCollider:
         # 对判定毫无影响，但内存带宽减半（这是全量计算的主要成本）。
         self.pts = np.ascontiguousarray(pts, dtype=np.float32)
         self.name = name
-        self.tree = cKDTree(self.pts.astype(np.float64))
+        self.tree = cKDTree(self.pts.astype(np.float64)) if cKDTree is not None else None
         self.min = self.pts.min(axis=0).astype(np.float64)
         self.max = self.pts.max(axis=0).astype(np.float64)
         self.centroid = self.pts.mean(axis=0).astype(np.float64)
         self.raw_count = len(self.pts)
         if len(self.pts) > 400:
             idx = np.random.default_rng(0).choice(len(self.pts), 400, replace=False)
-            d, _ = self.tree.query(self.pts[idx].astype(np.float64), k=2)
-            self.spacing = float(np.median(d[:, 1]))
+            if cKDTree is not None:
+                d, _ = cKDTree(self.pts.astype(np.float64)).query(
+                    self.pts[idx].astype(np.float64), k=2)
+                self.spacing = float(np.median(d[:, 1]))
+            else:
+                out = []
+                for j in idx:
+                    dd = np.linalg.norm(self.pts - self.pts[j], axis=1)
+                    dd[j] = np.inf
+                    out.append(dd.min())
+                self.spacing = float(np.median(out))
         else:
             self.spacing = 0.0
 
@@ -220,9 +248,16 @@ def _estimate_spacing(pts: np.ndarray, sample: int = 400) -> float:
         return 0.0
     rng = np.random.default_rng(0)
     idx = rng.choice(len(pts), min(sample, len(pts)), replace=False)
-    tree = cKDTree(pts)
-    d, _ = tree.query(pts[idx], k=2)
-    return float(np.median(d[:, 1]))
+    if cKDTree is not None:
+        tree = cKDTree(pts)
+        d, _ = tree.query(pts[idx], k=2)
+        return float(np.median(d[:, 1]))
+    out = []
+    for j in idx:
+        dd = np.linalg.norm(pts - pts[j], axis=1)
+        dd[j] = np.inf
+        out.append(dd.min())
+    return float(np.median(out))
 
 
 def _decimate(pts: np.ndarray, max_points: int, spacing: float) -> np.ndarray:

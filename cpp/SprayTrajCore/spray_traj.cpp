@@ -1326,6 +1326,162 @@ static FaceOrient classify_face_orientation(const std::vector<Vec3>& P, const Kd
     return fo;
 }
 
+// 拆层后单片定向：拆层切出来的是"沿法向有间隙的两片"，而**间隙不等于壁的两侧**
+// ——台阶/两级平台/凸台同样有间隙。所以两片的符号必须各自重判一次，
+// 不能再用"另一片取反"这种构造：一旦把同向的两片当成壁，大片会被翻成 -Z，
+// 再被可喷窗口（>130° 不喷）静默丢掉一整片（实测煤气灶背板丢了 46472 点/16%）。
+// 口径与主定向一致：先归 +Z 半球（近竖直背离质心），射线能判出可喷侧时以射线为准。
+//
+// ---------- 步骤 1：初始定向（与主定向同口径） ----------
+// ---------- 步骤 2：射线复核，只有 src==1（一侧贴材料/一侧朝腔）才采信 ----------
+// ---------- 步骤 3：重算 angZ / tilt / side / isInner ----------
+static void orient_piece_after_split(const std::vector<Vec3>& P, const KdTree& tree,
+                                     PlaneSeg& s, const Vec3& partC)
+{
+    // ---------- 步骤 1：初始定向（与主定向同口径） ----------
+    Vec3 n = s.pl.n;
+    if(std::fabs(n.z) > 0.05){ if(n.z < 0) n = n*(-1.0); }
+    else if(dot(n, s.pl.c - partC) < 0) n = n*(-1.0);   // 近竖直：背离质心
+    s.pl.n = n;
+    s.pl.d = -dot(n, s.pl.c);
+
+    // ---------- 步骤 2：射线复核可喷侧 ----------
+    // src==1：一侧近挡（材料）/一侧远挡（腔体），符号可信，以它为准；
+    // src==2/4：两侧都自由或两侧都贴材料，几何二义，保留步骤 1 的结果。
+    const FaceOrient fo = classify_face_orientation(P, tree, s, partC, 0);
+    if(fo.src == 1 && dot(fo.n, s.pl.n) < 0.0){
+        s.pl.n = fo.n;
+        s.pl.d = -dot(s.pl.n, s.pl.c);
+    }
+    s.fo = fo;
+    s.fo.n  = s.pl.n;
+    s.fo.src = 4;                       // 来源标记仍记"薄壁拆层"，界面按它显示内外壁
+
+    // ---------- 步骤 3：重算角度与分类 ----------
+    const double D2R = 3.141592653589793/180.0;
+    s.fo.angZ = std::acos(std::max(-1.0, std::min(1.0, s.pl.n.z)))/D2R;
+    s.fo.tilt = 90.0 - s.fo.angZ;
+    s.fo.side = (s.fo.angZ < 87.0) ? 1 : (s.fo.angZ > 93.0 ? -1 : 0);
+    // 可喷侧朝腔（指向整件质心）= 内壁；这一片已经单独定过向，
+    // 不能再沿用源块的 isInner（那是两层混在一起时的结论）。
+    s.fo.isInner = (dot(s.pl.n, partC - s.pl.c) > 0.0) ? 1 : 0;
+}
+
+// ==================== 枪位物理验收：最后一道方向过滤（不可绕过） ====================
+// 为什么角度窗口挡不住"撞机"：
+//   窗口只说"法向与 +Z 的夹角 ≤ 130°"，它不知道枪位（X + standoff·n）外有没有东西。
+//   拆层/双面拆出来的假面，angZ 可能只有 91°（窗口完全合法），但那侧 40mm 就是隔壁
+//   那片料——枪伸不进去，走过去就是贴件/撞机。反过来，166° 也不一定真朝下。
+// 所以这里**不看 angZ、不看 sideSrc、不看 isInner**，只信点云回答一个问题：
+//   "从这一面的点，沿法向抬到 standoff，这一路是不是空的？"
+// 三种结论：
+//   OK     —— +n 侧站得住枪，按当前 n 布行；
+//   FLIP   —— +n 侧站不住、-n 侧站得住，说明符号反了，翻过来（这才是真正的方向过滤）；
+//   REJECT —— 两侧都站不住枪 → 拒喷。宁可漏喷，绝不撞机。
+// 阈值取 0.85·standoff 而不是 standoff：拟合残差、采样点偏离平面、去噪删掉棱边点
+// 都会让实测自由距离比真值小几毫米，留 15% 余量避免误杀正常面。
+// 已经超出可喷窗口（angZ > 130°）的面**不给翻转洗白的机会**，直接 REJECT：
+// 它本来就不该喷，翻一下变成 0° 再喷，正是"朝下被喷"的事故来源。
+enum GunSideVerdict { GUN_SIDE_OK = 0, GUN_SIDE_FLIP = 1, GUN_SIDE_REJECT = 2 };
+
+// ---------- 步骤 1：面内均匀取样，实测 ±n 两侧自由距离 ----------
+// 重新实测而不复用 fo.freePlus/freeMinus：那组值是按 classify 当时的 n 算的，
+// 后面"内壁喷距法向翻转朝腔"（pl.n = fo.n）之后，两侧标签已经对不上当前 n。
+static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
+                             const PlaneSeg& s, double standoff,
+                             double& freePlus, double& freeMinus)
+{
+    const double maxFree = std::max(400.0, standoff*4.0);
+    const double hitR = 1.5, collR = 5.0;
+    const size_t N = s.inl.size();
+    freePlus = freeMinus = -1.0;
+    if(!N) return;
+
+    const int want = (int)std::min<size_t>(6, N);
+    std::vector<double> dp, dm;
+    dp.reserve((size_t)want); dm.reserve((size_t)want);
+    const Vec3 n = s.pl.n;
+    for(int i=0;i<want;++i){
+        size_t k = (size_t)((double)i/(double)want*(double)N);
+        if(k >= N) k = N-1;
+        const Vec3 p = P[s.inl[k]];
+        dp.push_back(ray_free_dist(P, tree, p + n*0.4,  n,         maxFree, hitR, collR));
+        dm.push_back(ray_free_dist(P, tree, p - n*0.4,  n*(-1.0),  maxFree, hitR, collR));
+    }
+    auto med = [](std::vector<double>& v){
+        if(v.empty()) return -1.0;
+        std::nth_element(v.begin(), v.begin()+v.size()/2, v.end());
+        return v[v.size()/2];
+    };
+    freePlus  = med(dp);
+    freeMinus = med(dm);
+}
+
+// ---------- 步骤 2：判定，需要时把符号翻过来 ----------
+// allowFlip=false 用于曲面块：曲面行用的是逐点法向 surf.N，翻面级平均法向没有意义，
+// 只能"站得住就喷、站不住就拒"，不能靠翻符号洗白。
+static GunSideVerdict verify_gun_side(const std::vector<Vec3>& P, const KdTree& tree,
+                                      PlaneSeg& s, const Vec3& partC, double standoff,
+                                      const char* tag, bool allowFlip)
+{
+    double fp = -1.0, fm = -1.0;
+    measure_gun_free(P, tree, s, standoff, fp, fm);
+    // -1 = 量程内无命中 = 完全自由，按大值参与比较
+    const double effPlus  = (fp < 0.0) ? 1e9 : fp;
+    const double effMinus = (fm < 0.0) ? 1e9 : fm;
+    const double need = standoff*0.85;
+
+    s.fo.freePlus  = fp;      // 顺手修正上报口径（与当前 pl.n 一致）
+    s.fo.freeMinus = fm;
+
+    const double D2R = 3.141592653589793/180.0;
+    auto reAngle = [&](){
+        s.fo.n    = s.pl.n;
+        s.fo.angZ = std::acos(std::max(-1.0, std::min(1.0, s.pl.n.z)))/D2R;
+        s.fo.tilt = 90.0 - s.fo.angZ;
+        s.fo.side = (s.fo.angZ < 87.0) ? 1 : (s.fo.angZ > 93.0 ? -1 : 0);
+        s.fo.isInner = (dot(s.pl.n, partC - s.pl.c) > 0.0) ? 1 : 0;
+    };
+    auto flip = [&](){
+        s.pl.n = s.pl.n*(-1.0);
+        s.pl.d = -dot(s.pl.n, s.pl.c);
+        reAngle();
+        std::swap(s.fo.freePlus, s.fo.freeMinus);
+    };
+
+    // ---------- 情形 A：+n 侧站得住枪 ----------
+    if(effPlus >= need) return GUN_SIDE_OK;
+
+    // ---------- 情形 B：+n 站不住 → 先确认它是不是"本就不该喷" ----------
+    // angZ 已超窗口（朝下）→ 不给翻转洗白，直接拒。
+    if(s.fo.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){
+        if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+            fprintf(stderr, "[gun-gate] %s angZ=%.1f° 超窗口且 +n 侧仅 %.1fmm，拒喷（不翻转洗白）\n",
+                    tag, s.fo.angZ, fp);
+        return GUN_SIDE_REJECT;
+    }
+
+    // ---------- 情形 C：-n 侧站得住 → 符号反了，翻过来 ----------
+    if(allowFlip && effMinus >= need){
+        flip();
+        if(s.fo.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){   // 翻完更朝下 → 也不许
+            flip();                                  // 还原，按拒喷处理
+            return GUN_SIDE_REJECT;
+        }
+        s.fo.src = 7;                                // 7 = 枪位验收翻转（几何自证，非标签）
+        if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+            fprintf(stderr, "[gun-gate] %s 翻转: +n 侧仅 %.1fmm、-n 侧 %.1fmm → angZ 现 %.1f°\n",
+                    tag, fp, fm, s.fo.angZ);
+        return GUN_SIDE_FLIP;
+    }
+
+    // ---------- 情形 D：两侧都伸不进枪 ----------
+    if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+        fprintf(stderr, "[gun-gate] %s 拒喷: 两侧自由 +n=%.1fmm / -n=%.1fmm 均 < %.0fmm（枪伸不进去）\n",
+                tag, fp, fm, need);
+    return GUN_SIDE_REJECT;
+}
+
 // 多平面分割：法向区域生长（技术方案 2.4 节设计）。
 // 思路：
 //   1) 主平面 RANSAC 确定高度方向；全点到主平面高度极差 < curvatureTol
@@ -3571,6 +3727,68 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     return p;
 }
 
+// ==================== 可喷侧参考方向 up：入口旋转 / 出口逆旋转 ====================
+// 为什么需要这一层：整套算法内部把 +Z 当成"工件正面朝向"，有三处硬编码依赖它：
+//   1) 初始定向 "|n.z| > 0.05 → 归 +Z 半球"；
+//   2) angZ/tilt 按与 +Z 的夹角算，可喷窗口 130° 也是相对 +Z；
+//   3) 安全高度 zSafe = 工件最高 z + 1.3×standoff，空移沿 +Z 抬枪。
+//
+// 而输入点云**来自相机系**，那里的事实是固定的、不需要人工选：
+//   · 相机系 +Z 是光轴、指向景物（远离相机）；像素/(u,v,depth) 反投影就得到这个约定；
+//   · 相机只能看到朝向它的那一面，所以可见面外法向必然 n·(+Z) < 0，即 n_z < 0；
+//   · 相机与枪同装在一个腕上（eye-in-hand），枪只能从相机这一侧伸过来。
+//   ⇒ "可喷侧 = 朝相机侧 = 更低 Z"是「看得见才喷得到」的必然结果，不是工位参数。
+// 旧代码把这个事实当成"工件朝上、相机在上方"（+Z 半球），于是可喷面被翻到背面，
+// 枪位整体跑到工件后面（实测背板_X+800：轨迹 z 中位数比点云高 78mm，k 朝 −Z）。
+//
+// 逐处改那三处要动二十几处、每处都得重测；改成**入口做一次刚体旋转**：把 up 方向
+// 转到 +Z，内部一行不动，出口再把轨迹点/枪轴/平面法向与顶点逆变换回原坐标系。
+// 旋转 det=+1，不是镜像：叉积、行方向、枪口朝向都保持右手系，安全高度也自动落到
+// 正确一侧（转完以后"最高 z"就是沿 up 最远的点）。
+//
+// 默认 up = (0,0,-1)：相机系恒定不变的那个方向。
+// 仅当点云已被搬到别的坐标系（例如手眼变换后的机器人基座系，+Z 竖直向上）时，
+// 才用环境变量 SPRAYTRAJ_UP="x,y,z" 覆盖 —— 那是换了个坐标系，不是换了个工位习惯。
+//   相机在上方（工件朝上）       → 不设 / 0,0,1
+//   相机朝工件、朝相机的方向 Z 低 → 0,0,-1
+//   侧装（相机在 -Y 侧）         → 0,-1,0
+// 轴角旋转（Rodrigues）：v 绕单位轴 axis 转 ang 弧度。右手系，det=+1，不镜像。
+static Vec3 rot_axis(const Vec3& v, const Vec3& axis, double ang){
+    const double c = std::cos(ang), s = std::sin(ang);
+    return v*c + cross(axis, v)*s + axis*(dot(axis, v)*(1.0-c));
+}
+
+struct UpFrame {
+    bool   active = false;
+    Vec3   axis{1,0,0};
+    double ang = 0.0;
+    Vec3   up{0,0,1};
+    Vec3 fwd(const Vec3& v) const { return active ? rot_axis(v, axis,  ang) : v; }
+    Vec3 inv(const Vec3& v) const { return active ? rot_axis(v, axis, -ang) : v; }
+};
+
+static UpFrame read_up_frame(){
+    UpFrame f;
+    // 相机系事实：可喷侧永远是朝相机侧，也就是 −Z。不需要调用方传、也不该让人去选。
+    f.up = Vec3{0,0,-1};
+    if(const char* e = std::getenv("SPRAYTRAJ_UP")){
+        double a=0,b=0,c=0;
+        if(std::sscanf(e, "%lf,%lf,%lf", &a,&b,&c) == 3){
+            Vec3 v{a,b,c};
+            if(len(v) > 1e-9) f.up = norm(v);
+        }
+    }
+    const Vec3 z{0,0,1};
+    const double c0 = std::max(-1.0, std::min(1.0, dot(f.up, z)));
+    if(c0 > 0.999999) return f;                       // up 已经是 +Z：点云已在"正面朝 +Z"的坐标系
+    f.active = true;
+    f.ang = std::acos(c0);
+    const Vec3 ax = cross(f.up, z);                   // 把 up 转到 +Z 的转轴
+    if(len(ax) < 1e-9){ f.axis = Vec3{1,0,0}; f.ang = 3.141592653589793; }  // up = -Z
+    else f.axis = norm(ax);
+    return f;
+}
+
 SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     const double* xyz, int n, const SprayTrajParams* params)
 {
@@ -3582,8 +3800,14 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     std::string err;
     if(!xyz || n<10){ err="点云点数不足(<10)"; res.error=_strdup(err.c_str()); return res; }
 
+    // 可喷侧参考方向：非 +Z 时先把点云整体旋转到"up = +Z"，出口再转回（见 UpFrame 注释）
+    const UpFrame uf = read_up_frame();
+    if(uf.active)
+        fprintf(stderr, "[坐标系] 点云按相机系处理：可喷侧 up=(%.2f,%.2f,%.2f) → 入口旋转 %.1f° 到 +Z，出口转回（轨迹仍在原坐标系）\n",
+                uf.up.x, uf.up.y, uf.up.z, uf.ang*180.0/3.141592653589793);
+
     std::vector<Vec3> P(n);
-    for(int i=0;i<n;++i) P[i]={xyz[i*3],xyz[i*3+1],xyz[i*3+2]};
+    for(int i=0;i<n;++i) P[i]=uf.fwd({xyz[i*3],xyz[i*3+1],xyz[i*3+2]});
     res.input_points=n;
     fprintf(stderr, "[参数] 工艺行距=%.2fmm（只用于布行） 重建几何尺度=%.1fmm（固定，与工艺行距解耦）\n",
             params->scanRowSpacing, kReconGap);
@@ -3792,7 +4016,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         std::vector<PlaneSeg> outerSegs, innerSegs;
         outerSegs.reserve(segs.size());
         innerSegs.reserve(segs.size());
-        int nSplit = 0, nSplitPeak = 0;
+        int nSplit = 0, nSplitPeak = 0, nSameDir = 0;
 
         // 直方图双峰检测：返回分界位置（沿法向，相对块质心）。
         auto twoPeaks = [](const std::vector<double>& h, double& mid)->bool{
@@ -3933,49 +4157,56 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 return t*(1.0/(double)v.size());
             };
             const Vec3 cLo = cen(lo), cHi = cen(hi);
-            const bool hiOuter = len(cHi-partC) >= len(cLo-partC);   // 离质心远的一片在外
-            const Vec3 nOut = hiOuter ? n : n*(-1.0);
-            const double D2R = 3.141592653589793/180.0;
 
-            PlaneSeg so;
+            // 两片先把几何立起来；法向符号一律交给 orient_piece_after_split 重判，
+            // 这里给的 n 只是"源块法向"这个起点。
+            PlaneSeg so;                                     // 高侧（沿源块法向更远）
             so.curved = false;
-            so.pl.n = nOut;
-            so.pl.c = hiOuter ? cHi : cLo;
-            so.pl.d = -dot(nOut, so.pl.c);
-            so.inl  = hiOuter ? std::move(hi) : std::move(lo);
-            so.fo   = s.fo;
-            so.fo.n = nOut;
-            so.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,nOut.z)))/D2R;
-            so.fo.tilt = 90.0 - so.fo.angZ;
-            so.fo.side = (so.fo.angZ < 87.0) ? 1 : (so.fo.angZ > 93.0 ? -1 : 0);
-            so.fo.isInner = 0;
-            so.fo.src = 4;                                   // 4 = 薄壁拆层
-            so.layerCnt = 2;                                 // 来源块是双层（数据里内外壁都有）
-            so.layerThick = s.layerThick;
+            so.pl.n = n; so.pl.c = cHi; so.pl.d = -dot(n, cHi);
+            so.inl  = std::move(hi);
+            so.layerCnt = 2; so.layerThick = s.layerThick;
 
-            PlaneSeg sn;
+            PlaneSeg sn;                                     // 低侧
             sn.curved = false;
-            sn.pl.n = nOut*(-1.0);                           // 内壁：可喷侧朝腔内
-            sn.pl.c = hiOuter ? cLo : cHi;
-            sn.pl.d = -dot(sn.pl.n, sn.pl.c);
-            sn.inl  = hiOuter ? std::move(lo) : std::move(hi);
-            sn.fo   = so.fo;
-            sn.fo.n = sn.pl.n;
-            sn.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,sn.pl.n.z)))/D2R;
-            sn.fo.tilt = 90.0 - sn.fo.angZ;
-            sn.fo.side = (sn.fo.angZ < 87.0) ? 1 : (sn.fo.angZ > 93.0 ? -1 : 0);
-            sn.fo.isInner = 1;
-            sn.fo.src = 4;
-            sn.layerCnt = 2;
-            sn.layerThick = s.layerThick;
-            std::swap(sn.fo.freePlus, sn.fo.freeMinus);       // 自由距离随法向一起翻
+            sn.pl.n = n; sn.pl.c = cLo; sn.pl.d = -dot(n, cLo);
+            sn.inl  = std::move(lo);
+            sn.layerCnt = 2; sn.layerThick = s.layerThick;
+
+            // ---- 拆层也要过方向过滤：两片各自定可喷侧，不许"一片取反" ----
+            orient_piece_after_split(Pf, cn.tree, so, partC);
+            orient_piece_after_split(Pf, cn.tree, sn, partC);
+
+            // ---- 两片到底是不是"壁的两侧" ----
+            // 只有可喷侧确实相反才算内外壁；同向 = 台阶/两级平台/凸台，
+            // 两片各按自己的法向布行（都朝 +Z 就都喷），谁也不许被翻过来。
+            const bool facing = dot(so.pl.n, sn.pl.n) < -0.5;
+            if(!facing){
+                // src=6 与"薄壁拆层(4)"区分开：清单里要能一眼看出这两片不是壁的两侧，
+                // 而是被间隙误分成两片的一张脸，两片都该喷。
+                so.fo.isInner = 0; sn.fo.isInner = 0;
+                so.fo.src = 6;     sn.fo.src = 6;
+            }
 
             if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                fprintf(stderr, "[split] seg%zu 双层: 间隙=%.2fmm 外壁点=%d 内壁点=%d 外法向=(%.2f,%.2f,%.2f)\n",
-                        si2, maxGap, (int)so.inl.size(), (int)sn.inl.size(), nOut.x,nOut.y,nOut.z);
+                fprintf(stderr, "[split] seg%zu 双层: 间隙=%.2fmm 高侧点=%d 低侧点=%d "
+                                "高侧n=(%.2f,%.2f,%.2f) 低侧n=(%.2f,%.2f,%.2f) → %s\n",
+                        si2, maxGap, (int)so.inl.size(), (int)sn.inl.size(),
+                        so.pl.n.x,so.pl.n.y,so.pl.n.z, sn.pl.n.x,sn.pl.n.y,sn.pl.n.z,
+                        facing ? "壁两侧(内外壁)" : "同向两面(不是壁，各自布行)");
             ++nSplit;
-            outerSegs.push_back(std::move(so));
-            innerSegs.push_back(std::move(sn));
+            if(!facing) ++nSameDir;
+            // 顺序：先喷完所有外壁，再进腔喷内壁。
+            // 若按"外/内/外/内"交替，枪会在工件内外来回穿，每次都要走一遍抬枪绕行。
+            if(!facing){
+                outerSegs.push_back(std::move(so));
+                outerSegs.push_back(std::move(sn));
+            } else if(so.fo.isInner > 0){
+                innerSegs.push_back(std::move(so));
+                outerSegs.push_back(std::move(sn));
+            } else {
+                outerSegs.push_back(std::move(so));
+                innerSegs.push_back(std::move(sn));
+            }
         }
         // 顺序：先喷完所有外壁，再进腔喷内壁。
         // 若按"外/内/外/内"交替，枪会在工件内外来回穿，每次都要走一遍抬枪绕行。
@@ -3983,8 +4214,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         segs.reserve(outerSegs.size()+innerSegs.size());
         for(auto& s : outerSegs) segs.push_back(std::move(s));
         for(auto& s : innerSegs) segs.push_back(std::move(s));
-        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（含内壁 %d 面，其中双峰判据 %d 块）\n",
-                           nSplit, segs.size(), nSplit, nSplitPeak);
+        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（内壁 %d 面，其中双峰判据 %d 块；"
+                                   "同向两面 %d 块按普通面各自布行）\n",
+                           nSplit, segs.size(), nSplit-nSameDir, nSplitPeak, nSameDir);
     }
 
     // ---- 薄壳双面：一层点代表一张板，板有两面 ----
@@ -4423,6 +4655,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     std::vector<SprayTrajPoint> allPts;
     int totalRows = 0;
     int nDownSkip = 0;      // 朝下超出角度窗口、不喷的面数
+    int nGunReject = 0;     // 枪位验收未通过（两侧都伸不进枪）、不布行的面数
+    int nGunFlip = 0;       // 枪位验收翻符号纠正的面数
     int nPlanarSkip = 0;    // 平面性不足（误合并/强曲面），不按平面布行的面数
     ProfStage psTraj("4.轨迹生成", &tTraj);
 
@@ -4647,15 +4881,54 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         const auto& inl = seg.inl;
         if(inl.size() < 20) continue;
 
+        // ================= 方向过滤硬闸（最后一道，任何上游标签都绕不过） =================
+        // 位置很关键：必须在**所有**定向/劈面/拆层/内壁修正之后，在布行之前。
+        // 上游（区域生长 → 初始定向 → 射线定向 → 拆层 → 内壁翻朝腔）每一步都可能把
+        // 符号弄错，而它们的错误只有两种下场：漏喷（可接受）或从背面伸枪（撞机，不可接受）。
+        // 这里不再相信任何标签，只问"枪能不能站到这一侧"：
+        //   站得住 → 按当前法向布行；
+        //   站不住但反侧站得住（且没超窗口）→ 翻过来；
+        //   两侧都站不住 → 拒喷。
+        {
+            char tag[48];
+            std::snprintf(tag, sizeof(tag), "面%zu", si);
+            const bool allowFlip = !(seg.curved && isCurved);   // 曲面块只判不翻
+            const GunSideVerdict gv = verify_gun_side(Pf, cn.tree, seg, partC,
+                                                      params->standoff, tag, allowFlip);
+            if(gv == GUN_SIDE_REJECT){
+                ++nGunReject;
+                fprintf(stderr, "[skip] 面%zu 枪位验收未通过：两侧都伸不进枪（自由 +n=%.1fmm / -n=%.1fmm），"
+                                "不布行（内点数 %zu）\n", si, seg.fo.freePlus, seg.fo.freeMinus, inl.size());
+                continue;
+            }
+            if(gv == GUN_SIDE_FLIP){
+                ++nGunFlip;
+                fprintf(stderr, "[fix] 面%zu 枪位验收翻转法向：angZ 现 %.1f°（原向一侧枪伸不进去）\n",
+                        si, seg.fo.angZ);
+            }
+        }
+
         // ---- 可喷角度窗口：法向朝下的面不生成轨迹 ----
         // 与面级清单用同一条判据（SPRAYTRAJ_NORMAL_WIN_DEG = 130°）。以前窗口只在
         // driver 打印清单时执行，轨迹照喷，于是开口盒的"外底面"（法向 180°、朝下、
         // 贴地面）也有轨迹——清单里已经滤掉，这里必须同口径滤掉。
         // 注意用 fo.angZ（真实可喷侧法向），不是 pl.n：内底朝上（0°）在这条之外，照喷。
-        if(seg.fo.angZ > SPRAYTRAJ_NORMAL_WIN_DEG){
+        // SPRAYTRAJ_NORMAL_WIN 是**外壁**的朝上窗口，默认 130° = 外壁也喷（用户 2026-10-30
+        // 确认：整个工件都要涂层，侧面漏不得；加倾斜角后侧壁枪轴与竖直是 63° 左右，不是 90°，
+        // 因为安全层会绕表面点把枪轴倾斜上去，喷距不变）。
+        // 想只喷接近朝上的面再调小（如 60°）；**内壁不受这个窗口管**——箱体内壁法向本来就是
+        // 水平，必须水平喷，一刀切到 60° 会把开口盒从 118 行砍到 22 行。
+        double normalWin = SPRAYTRAJ_NORMAL_WIN_DEG;
+        if(const char* e = std::getenv("SPRAYTRAJ_NORMAL_WIN")){
+            double v = atof(e);
+            if(v > 1.0 && v <= 180.0) normalWin = v;
+        }
+        const bool isInnerWall = (seg.fo.isInner == 1);
+        const double effWin = isInnerWall ? SPRAYTRAJ_NORMAL_WIN_DEG : normalWin;
+        if(seg.fo.angZ > effWin){
             ++nDownSkip;
-            fprintf(stderr, "[skip] 面%zu 可喷侧朝下 %.1f° > %.0f°，不喷（内点数 %zu）\n",
-                    si, seg.fo.angZ, SPRAYTRAJ_NORMAL_WIN_DEG, inl.size());
+            fprintf(stderr, "[skip] 面%zu %s朝向 %.1f° > %.0f°，不喷（内点数 %zu）\n",
+                    si, isInnerWall ? "内壁" : "外壁", seg.fo.angZ, effWin, inl.size());
             continue;
         }
 
@@ -4872,6 +5145,15 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 Vec3 q = Pf[i] + pl.n*params->standoff;
                 // 只判 "d < gunClear"，用半径上界查询；远点 O(log n) 剪枝。
                 double d = partTree.nearestWithinExcept(q, gunClear, faceSkipMask[si]);
+                // 绝对兜底：**不排除任何面**，测枪位到整件的最近距离。
+                // 为什么必须补这一条：上面那次查询会剪掉本面（faceSkipMask[si]），
+                // 法向一旦反了，枪位就正好藏在本面材料里，而本面点又被剪掉 → 查不到 → 放行。
+                // 正常面枪位离本面就是 standoff(100mm)，这条恒过、不误杀；法向反了会立刻掉到个位数。
+                {
+                    KnnBuf kb;
+                    partTree.knn(q, 1, kb);
+                    if(kb.n > 0) d = std::min(d, std::sqrt(kb.d2[0]));
+                }
                 d = std::min(d, planeClearAt(q, (int)si));   // 面几何（棱边点可能被去噪删掉）
                 d = std::min(d, edgeClearAt(q, (int)si));    // 棱边/边界线
                 if(d < gunClear){ ++drop; continue; }
@@ -5913,10 +6195,53 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             minClearAll = std::min(minClearAll, bestClear);
             maxDetourRatio = std::max(maxDetourRatio, bestLen / L0);
 
-            // 整段插补：位置按弧长等距，姿态按弧长比例 slerp，单步转角超限则加密点。
+            // 整段插补：位置按折线等距，姿态按弧长比例插值，单步转角超限则加密点。
+            // 姿态插值策略（用户 2026-10-28 口径 + 2026-10-30 复查）：
+            //   两端夹角 ≤90°（常规行间/面间）→ 直接球面插值，最短路径；
+            //   >90°（侧壁↔侧壁这种反向）→ **经 -Z 极点转身**：先把枪抬到竖直朝下，
+            //   再从竖直落到目标。纯 slerp 在这种情况下走的是水平面里的半圈（实测
+            //   box 方位扫 179°、cao 180°、g_rim 179°），真机上就是枪身横着扫一大圈。
+            //   两端本来就接近极点（仰角>80°）时不绕，直接插值，避免过极点抖动。
             std::vector<Vec3> rs; std::vector<double> ts;
             const double L = resample(best, mvStep, rs, ts);
-            const double thTot = std::acos(std::max(-1.0, std::min(1.0, dot(ijkA, ijkB)))) * 57.29577951308232;
+            const Vec3 kPole{0.0, 0.0, -1.0};
+            auto deg = [](double rad){ return rad * 57.29577951308232; };
+            const double thAB = deg(std::acos(std::max(-1.0, std::min(1.0, dot(ijkA, ijkB)))));
+            const double elA = deg(std::asin(std::max(-1.0, std::min(1.0, -ijkA.z))));
+            const double elB = deg(std::asin(std::max(-1.0, std::min(1.0, -ijkB.z))));
+            const bool usePole = (thAB > 90.0) && (elA <= 80.0) && (elB <= 80.0);
+            const double thPole = deg(std::acos(std::max(-1.0, std::min(1.0, dot(ijkA, kPole)))))
+                                + deg(std::acos(std::max(-1.0, std::min(1.0, dot(kPole, ijkB)))));
+            const double thTot = usePole ? thPole : thAB;
+
+            // 转身分配（用户 2026-10-30 口径）：平移段**保持起点姿态**，只在「接近目标的
+            // 最后一段」把姿态转完，避免枪横着平移。
+            // 转身段 = 路径最后一腿；太短（<15% 总长）就并入上一腿；再不够就按 5°/点
+            // 所需长度补齐（否则短距离内塞 90° 会顶到 J5 限位）。
+            size_t kTurn = best.size() >= 2 ? best.size() - 2 : 0;
+            auto lenFromK = [&](size_t k0)->double{
+                double s = 0.0;
+                for(size_t q = k0 + 1; q < best.size(); ++q) s += len(best[q] - best[q-1]);
+                return s;
+            };
+            double turnLen = lenFromK(kTurn);
+            while(kTurn > 0 && turnLen < 0.15 * L){ --kTurn; turnLen = lenFromK(kTurn); }
+            const double turnMin = (thTot / kStepDeg) * mvStep;
+            if(turnLen < turnMin) turnLen = turnMin;
+            turnLen = std::min(turnLen, std::max(1e-6, L));
+
+            auto poseAt = [&](double tt)->Vec3{
+                const double distFromEnd = (1.0 - tt) * L;
+                double s = (distFromEnd >= turnLen) ? 0.0
+                                                   : (turnLen - distFromEnd) / turnLen;
+                s = std::max(0.0, std::min(1.0, s));
+                if(!usePole) return slerpU(ijkA, ijkB, s);
+                const double a = deg(std::acos(std::max(-1.0, std::min(1.0, dot(ijkA, kPole)))));
+                const double thT = std::max(1e-9, thPole);
+                const double sf = s * thT;
+                if(sf <= a) return slerpU(ijkA, kPole, a > 1e-6 ? sf/a : 0.0);
+                return slerpU(kPole, ijkB, (thT - a) > 1e-6 ? (sf - a)/(thT - a) : 1.0);
+            };
             const int need = (int)std::ceil(thTot / kStepDeg) + 1;
             if(need > (int)rs.size() && L > 1e-6)
                 resample(best, std::max(0.3, L / (double)(need - 1)), rs, ts);
@@ -5927,7 +6252,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             }
             Vec3 prevG = ijkA;
             for(size_t k = 1; k + 1 < rs.size(); ++k){
-                const Vec3 g = slerpU(ijkA, ijkB, ts[k]);
+                const Vec3 g = poseAt(ts[k]);
                 const double dg = std::acos(std::max(-1.0, std::min(1.0, dot(prevG, g)))) * 57.29577951308232;
                 maxStepDeg = std::max(maxStepDeg, dg);
                 prevG = g;
@@ -6052,6 +6377,41 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     res.count=cnt;
     std::memcpy(res.points, allPts.data(), sizeof(SprayTrajPoint)*cnt);
 
+    // ---- 出口：把内部（up=+Z）坐标系逆变换回世界系 ----
+    // 轨迹点/枪轴、面法向/质心/局部基/重建面顶点、总法向与质心，全部要转。
+    // angZ/tilt 保留内部值（相对可喷侧 up 的夹角，0 = 正对可喷方向），不重算：
+    // 世界系的 n 与 +Z 夹角对这类工位恒接近 180°，拿来显示和判窗口都是错的。
+    if(uf.active){
+        for(int i=0;i<cnt;++i){
+            SprayTrajPoint& q = res.points[i];
+            const Vec3 p = uf.inv({q.x,q.y,q.z});
+            const Vec3 d = uf.inv({q.i,q.j,q.k});
+            q.x=p.x; q.y=p.y; q.z=p.z;
+            q.i=d.x; q.j=d.y; q.k=d.z;
+        }
+        for(int pi=0; pi<res.plane_count && pi<SPRAYTRAJ_PLANE_SLOTS; ++pi){
+            SprayTrajPlane& q = res.planes[pi];
+            const Vec3 nn = uf.inv({q.nx,q.ny,q.nz});
+            const Vec3 n0 = uf.inv({q.n0x,q.n0y,q.n0z});
+            const Vec3 cc = uf.inv({q.cx,q.cy,q.cz});
+            q.nx=nn.x; q.ny=nn.y; q.nz=nn.z;
+            q.n0x=n0.x; q.n0y=n0.y; q.n0z=n0.z;
+            q.cx=cc.x; q.cy=cc.y; q.cz=cc.z;
+            const Vec3 uu = uf.inv({q.ux,q.uy,q.uz});
+            const Vec3 vv = uf.inv({q.vx,q.vy,q.vz});
+            q.ux=uu.x; q.uy=uu.y; q.uz=uu.z;
+            q.vx=vv.x; q.vy=vv.y; q.vz=vv.z;
+            for(int k=0;k<q.polyVertCount*3;k+=3){
+                const Vec3 v = uf.inv({q.polyVerts[k],q.polyVerts[k+1],q.polyVerts[k+2]});
+                q.polyVerts[k]=v.x; q.polyVerts[k+1]=v.y; q.polyVerts[k+2]=v.z;
+            }
+        }
+        const Vec3 rn = uf.inv({res.normal_x,res.normal_y,res.normal_z});
+        const Vec3 rc = uf.inv({res.plane_cx,res.plane_cy,res.plane_cz});
+        res.normal_x=rn.x; res.normal_y=rn.y; res.normal_z=rn.z;
+        res.plane_cx=rc.x; res.plane_cy=rc.y; res.plane_cz=rc.z;
+    }
+
     // 自检：点距（仅统计"喷涂段内"的相邻点）。
     // 空移点（面间抬枪/跨段跳转）必须排除：它们的间距由避障路径决定（本例 5.8mm、
     // 100mm 不等），混进来会把 seg_len_max 抬高，看起来像"点距失控"。
@@ -6077,4 +6437,49 @@ SPRAYTRAJ_API void spray_traj_free(SprayTrajResult* res){
     res->points=nullptr; res->error=nullptr; res->count=0;
 }
 
+// ---- C# 友好入口（2026-11-05 接入 SprayVisionSimple 时新增）----
+// 为什么不直接用 spray_traj_generate 的"返回结构体"：SprayTrajResult 约 145KB，
+// 托管侧 P/Invoke 返回大结构体会在调用线程栈上分配，70 万点/多线程场景有栈溢出风险；
+// 改为调用方（C#）用 Marshal.AllocHGlobal 提供缓冲区，内部浅拷贝所有权。
+SPRAYTRAJ_API int spray_traj_generate_ex(const double* xyz, int n,
+                                         const SprayTrajParams* params, SprayTrajResult* out){
+    if(!out) return -1;
+    std::memset(out, 0, sizeof(*out));
+    SprayTrajResult r = spray_traj_generate(xyz, n, params);
+    *out = r;                       // points/error 指针所有权随之转移，调用方负责 spray_traj_free
+    return r.error ? 1 : 0;
+}
+
+SPRAYTRAJ_API void spray_traj_abi_sizes(int* paramsSize, int* planeSize, int* resultSize){
+    if(paramsSize) *paramsSize = (int)sizeof(SprayTrajParams);
+    if(planeSize)  *planeSize  = (int)sizeof(SprayTrajPlane);
+    if(resultSize) *resultSize = (int)sizeof(SprayTrajResult);
+}
+
+SPRAYTRAJ_API void spray_traj_result_info(const SprayTrajResult* res, SprayTrajInfo* out){
+    if(!out) return;
+    std::memset(out, 0, sizeof(*out));
+    if(!res) return;
+    out->count = res->count;
+    out->rows = res->rows;
+    out->input_points = res->input_points;
+    out->removed_points = res->removed_points;
+    out->inlier_points = res->inlier_points;
+    out->plane_count = res->plane_count;
+    out->plane_rms = res->plane_rms;
+    out->normal_x = res->normal_x; out->normal_y = res->normal_y; out->normal_z = res->normal_z;
+    out->plane_cx = res->plane_cx; out->plane_cy = res->plane_cy; out->plane_cz = res->plane_cz;
+    out->seg_len_mean = res->seg_len_mean;
+    out->seg_len_max = res->seg_len_max;
+}
+
+SPRAYTRAJ_API int spray_traj_get_plane(const SprayTrajResult* res, int idx, SprayTrajPlane* out){
+    if(!res || !out || idx < 0 || idx >= res->plane_count || idx >= SPRAYTRAJ_PLANE_SLOTS) return -1;
+    *out = res->planes[idx];
+    return 0;
+}
+
+SPRAYTRAJ_API const char* spray_traj_result_error(const SprayTrajResult* res){
+    return res ? res->error : nullptr;
+}
 } // extern "C"

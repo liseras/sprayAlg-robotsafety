@@ -1,5 +1,9 @@
 # 编译产物
 cpp/SprayTrajCore/build/
+# build_rls 是 build_release.bat 的产物目录（本机沙箱拉黑 reg.exe，
+# vcvarsall 起不来，故改用手写 MSVC 环境，输出目录另起一个）
+cpp/SprayTrajCore/build_rls/
+cpp/SprayTrajCore/build_obj/
 wpf/SprayTrajViewer/bin/
 wpf/SprayTrajViewer/obj/
 *.exe
@@ -9,6 +13,10 @@ wpf/SprayTrajViewer/obj/
 *.pdb
 *.ilk
 .vs/
+
+# 手滑把 "-row 80" 当参数打时，driver 会照字面生成这些文件
+/-row
+/-row.plane*.ply
 
 # 回归中间产物（保留 10 个基础样本，其余由脚本生成，不入库）
 cpp/_regress/*.csv
@@ -51,3 +59,38 @@ cpp/_regress/ubox4.ply
 # Python 缓存
 __pycache__/
 *.pyc
+
+# ---------------------------------------------------------------
+# 运行产物 / 临时调试物（2026-11-10 整理）
+# 判据：能由脚本随时重跑出来的一律不入库；只留人写的结论性文档。
+# ---------------------------------------------------------------
+
+# outputs/ 下用于调试的图表（_ 前缀，临时看图用）
+outputs/_*.png
+outputs/_*.csv
+
+# 仿真/回归/审计跑出来的整目录（几十 MB 级，可重跑）
+outputs/align_front/
+outputs/audit_*/
+outputs/cli_test/
+outputs/cloud_shift_denso/
+outputs/denso_link/
+outputs/denso_sim_pkg/
+outputs/diag_move/
+outputs/regression/
+
+# 崩溃日志、驱动日志
+outputs/crash_*.log
+myeasylog.txt
+
+# 手动备份目录（改大文件前留的副本，随时可从 git 取回）
+cpp/SprayTrajCore/.bak_*/
+cpp/SprayTrajCore/temp/
+
+# 仓库根的 A/B 对比中间产物（点云+CSV，255MB 级，跑一遍就重生成）
+/temp/
+
+# outputs/ 下的点云与轨迹样本（可用 tools/gen_tube_pointcloud.py 等重生成，
+# 入库只会让 diff 变成几十万行噪声；结论图表和诊断文档仍然入库）
+outputs/*.ply
+outputs/*.csv

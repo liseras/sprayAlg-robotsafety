@@ -363,6 +363,31 @@ class Seg:
         return self.group == "tool"
 
 
+def tool_segments(flange, tcp, sizing: ArmSizing) -> list[Seg]:
+    """只造工具段（握把 + 细管 + 喷嘴）。
+
+    为什么单独抽出来：**枪体的位置由「目标 TCP + 枪轴」解析确定，与机器人型号/基座/IK 全都无关**
+    —— 法兰就在 TCP 沿枪轴退 tool_len 的地方。所以"枪会不会戳进工件"这一条在
+    「要求可达」和「不要求可达」两种口径下是同一个判据、同一份几何。
+    `arm_segments` 也从这里取工具段，避免两处各写一份（改一处漏一处的老坑）。
+
+    参数收「法兰点 + TCP 点」而不是「TCP + 轴向 + 长度」：FK 那条路必须原样用 r.flange，
+    按轴向反推法兰会引入 1ulp 差异，等距时最近的段名会在「工具细管/工具握把」之间串。
+    """
+    flange = np.asarray(flange, dtype=float)
+    tcp = np.asarray(tcp, dtype=float)
+    d = tcp - flange
+    L = geom.norm(d)
+    if L <= 0.5:
+        return []
+    u = d / L
+    neck = flange + u * (L * GRIP_FRACTION)
+    tip = tcp + u * (L * NOZZLE_FRACTION)
+    return [Seg(flange.copy(), neck, sizing.grip_r, "工具握把", "tool"),
+            Seg(neck, tcp.copy(), sizing.tool_pipe_r, "工具细管", "tool"),
+            Seg(tcp.copy(), tip, sizing.nozzle_r, "喷嘴", "tool")]
+
+
 def arm_segments(r: FkResult, sizing: ArmSizing, include_base: bool = False, include_tool: bool = True) -> list[Seg]:
     """由 FK 结果生成碰撞段（胶囊）。与 ArmCollider.Build 逐段对应。"""
     segs: list[Seg] = []
@@ -378,17 +403,7 @@ def arm_segments(r: FkResult, sizing: ArmSizing, include_base: bool = False, inc
             rr = sizing.wrist_link_r if i >= 4 else sizing.link_r
             segs.append(Seg(o[i].copy(), o[i + 1].copy(), rr, f"连杆 J{i}-J{i+1}", "link"))
     if include_tool:
-        flange = r.flange[:3, 3]
-        tcp = r.tcp[:3, 3]
-        d = tcp - flange
-        L = geom.norm(d)
-        if L > 0.5:
-            u = d / L
-            neck = flange + u * (L * GRIP_FRACTION)
-            nozzle_tip = tcp + u * (L * NOZZLE_FRACTION)
-            segs.append(Seg(flange.copy(), neck, sizing.grip_r, "工具握把", "tool"))
-            segs.append(Seg(neck, tcp.copy(), sizing.tool_pipe_r, "工具细管", "tool"))
-            segs.append(Seg(tcp.copy(), nozzle_tip, sizing.nozzle_r, "喷嘴", "tool"))
+        segs.extend(tool_segments(r.flange[:3, 3], r.tcp[:3, 3], sizing))
     return segs
 
 

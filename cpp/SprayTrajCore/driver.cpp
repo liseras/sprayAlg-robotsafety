@@ -25,40 +25,92 @@ static bool read_ply(const std::string& path, std::vector<double>& xyz){
     fclose(fp);
     buf.resize(got);
 
-    // 解析头部：点数 + 是否 ascii
-    int n=0; bool ascii=true; size_t dataStart=0;
+    // 解析头部：点数 + 编码 + vertex 属性表
+    // binary 必须按属性偏移取 x/y/z —— 不能像 ascii 那样"每行前 3 个数"，
+    // 现场点云常见 x y z intensity / x y z nx ny nz rgb 两种排布，混着来。
+    int n=0; bool ascii=true, binLE=false; size_t dataStart=0;
+    struct Prop { std::string name; int bytes; };
+    std::vector<Prop> props;
+    bool inVertex = false;
     {
         size_t pos = 0;
         while(pos < buf.size()){
             size_t nl = buf.find('\n', pos);
             if(nl == std::string::npos) nl = buf.size();
             std::string line = buf.substr(pos, nl-pos);
-            if(line.rfind("format",0)==0) ascii = line.find("ascii")!=std::string::npos;
-            if(line.rfind("element vertex",0)==0) sscanf(line.c_str(),"element vertex %d",&n);
-            if(line.rfind("end_header",0)==0){ dataStart = (nl<buf.size())? nl+1 : buf.size(); break; }
+            if(!line.empty() && line[line.size()-1]=='\r') line.erase(line.size()-1);
+            if(line.rfind("format",0)==0){
+                ascii = line.find("ascii")!=std::string::npos;
+                binLE = line.find("binary_little_endian")!=std::string::npos;
+            } else if(line.rfind("element ",0)==0){
+                inVertex = (line.rfind("element vertex",0)==0);
+                if(inVertex) sscanf(line.c_str(),"element vertex %d",&n);
+            } else if(line.rfind("property",0)==0 && inVertex){
+                char type[64]={0}, name[64]={0};
+                if(sscanf(line.c_str(),"property %63s %63s",type,name)==2){
+                    std::string ts(type);
+                    int b=4;
+                    if(ts=="char"||ts=="uchar"||ts=="int8"||ts=="uint8") b=1;
+                    else if(ts=="short"||ts=="ushort"||ts=="int16"||ts=="uint16") b=2;
+                    else if(ts=="double"||ts=="float64") b=8;
+                    Prop pr; pr.name = name; pr.bytes = b; props.push_back(pr);
+                }
+            } else if(line.rfind("end_header",0)==0){
+                dataStart = (nl<buf.size())? nl+1 : buf.size(); break;
+            }
             pos = nl + 1;
         }
     }
-    if(n<=0 || !ascii) return false;
+    if(n<=0) return false;
 
-    // 数据区：每行取前 3 个数（面板件是 x y z intensity 四列）
-    xyz.reserve((size_t)n*3);
-    const char* q = buf.data() + dataStart;
-    const char* end = buf.data() + buf.size();
-    while(q < end && (int)(xyz.size()/3) < n){
-        while(q < end && (*q==' '||*q=='\t'||*q=='\r'||*q=='\n')) ++q;
-        if(q >= end) break;
-        double v[3]; int c=0;
-        while(c < 3){
-            char* e2 = nullptr;
-            double d = std::strtod(q, &e2);
-            if(e2 == q) break;
-            v[c++] = d; q = e2;
-            while(q < end && (*q==' '||*q=='\t')) ++q;
+    if(ascii){
+        // 数据区：每行取前 3 个数（面板件是 x y z intensity 四列）
+        xyz.reserve((size_t)n*3);
+        const char* q = buf.data() + dataStart;
+        const char* end = buf.data() + buf.size();
+        while(q < end && (int)(xyz.size()/3) < n){
+            while(q < end && (*q==' '||*q=='\t'||*q=='\r'||*q=='\n')) ++q;
+            if(q >= end) break;
+            double v[3]; int c=0;
+            while(c < 3){
+                char* e2 = nullptr;
+                double d = std::strtod(q, &e2);
+                if(e2 == q) break;
+                v[c++] = d; q = e2;
+                while(q < end && (*q==' '||*q=='\t')) ++q;
+            }
+            if(c >= 3){ xyz.push_back(v[0]); xyz.push_back(v[1]); xyz.push_back(v[2]); }
+            while(q < end && *q != '\n') ++q;   // 跳到行尾（跳过强度等多余列）
+            if(q < end) ++q;
         }
-        if(c >= 3){ xyz.push_back(v[0]); xyz.push_back(v[1]); xyz.push_back(v[2]); }
-        while(q < end && *q != '\n') ++q;   // 跳到行尾（跳过强度等多余列）
-        if(q < end) ++q;
+    } else if(binLE){
+        // 按属性表算步长与 x/y/z 的字节偏移，逐条记录 memcpy。
+        // 只认 4/8 字节的坐标（float/double）；其余宽度按 0 跳过 —— 坐标是整数的点云不存在。
+        int stride=0, off[3]={-1,-1,-1}, w[3]={4,4,4};
+        for(size_t i=0;i<props.size();++i){
+            const std::string& nm = props[i].name;
+            if(nm=="x"){ off[0]=stride; w[0]=props[i].bytes; }
+            else if(nm=="y"){ off[1]=stride; w[1]=props[i].bytes; }
+            else if(nm=="z"){ off[2]=stride; w[2]=props[i].bytes; }
+            stride += props[i].bytes;
+        }
+        if(off[0]<0||off[1]<0||off[2]<0||stride<=0) return false;
+        const unsigned char* base = (const unsigned char*)buf.data() + dataStart;
+        size_t avail = buf.size() - dataStart;
+        xyz.reserve((size_t)n*3);
+        for(int i=0;i<n;++i){
+            size_t p0 = (size_t)i*(size_t)stride;
+            if(p0 + (size_t)stride > avail) break;
+            double v[3]={0,0,0};
+            for(int k=0;k<3;++k){
+                const unsigned char* src = base + p0 + (size_t)off[k];
+                if(w[k]==4){ float f; memcpy(&f, src, 4); v[k]=f; }
+                else if(w[k]==8){ double d; memcpy(&d, src, 8); v[k]=d; }
+            }
+            xyz.push_back(v[0]); xyz.push_back(v[1]); xyz.push_back(v[2]);
+        }
+    } else {
+        return false;
     }
     return !xyz.empty();
 }
@@ -72,7 +124,7 @@ int main(int argc, char** argv){
     const char* outcsv = argc>2? argv[2] : "traj_out.csv";
     const char* outply = argc>3? argv[3] : "traj_out.ply";
     std::vector<double> xyz;
-    if(!read_ply(in, xyz)){ printf("读取失败(仅支持ascii PLY): %s\n", in); return 1; }
+    if(!read_ply(in, xyz)){ printf("读取失败(支持 ascii / binary_little_endian PLY): %s\n", in); return 1; }
     int n = (int)(xyz.size()/3);
     SprayTrajParams p = spray_traj_default_params();
     // 可选参数：-flat <平面拟合阈值mm>  -curve <曲面升级阈值mm>
@@ -96,6 +148,14 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"-ee"))    p.edgeExtend     = atof(argv[i+1]);
         if(!strcmp(argv[i],"-ea"))    p.edgeExtendAcross = atof(argv[i+1]);
         if(!strcmp(argv[i],"-st"))    p.shellThick     = atof(argv[i+1]);
+        // -flip 1：把上游所有定向结果强制取反。用于压力测试"方向过滤"这道硬闸——
+        // 人为制造一片朝向全错的输入，硬闸必须把能救的翻回来、救不回来的拒喷，
+        // 绝不能出现"从背面伸枪"的轨迹。
+        if(!strcmp(argv[i],"-flip"))  p.normalFlip     = atoi(argv[i+1]);
+        // -up x,y,z：可喷侧参考方向。默认 0,0,-1 —— 相机系里相机只能看到朝向自己那一面，
+        // 所以可喷侧恒为朝相机侧（更低 Z），这是事实不是参数，一般不用传。
+        // 只有点云已被搬到别的坐标系（如手眼变换后的基座系，+Z 竖直向上）时，才用 0,0,1 覆盖。
+        if(!strcmp(argv[i],"-up"))    _putenv_s("SPRAYTRAJ_UP", argv[i+1]);
     }
     printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f\n",
         p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
@@ -127,7 +187,8 @@ int main(int argc, char** argv){
         ++nWin;
         const char* cls = q.side>0 ? "正向" : (q.side<0 ? "反向" : "竖直");
         const char* src = q.sideSrc==1 ? "射线" : (q.sideSrc==3 ? "强制"
-                        : (q.sideSrc==4 ? "薄壁" : (q.sideSrc==5 ? "双面" : "兜底")));
+                        : (q.sideSrc==4 ? "薄壁" : (q.sideSrc==5 ? "双面"
+                        : (q.sideSrc==6 ? "同向" : (q.sideSrc==7 ? "枪位" : "兜底")))));
         const char* inn = q.isInner>0 ? "内 " : (q.isInner<0 ? "未分" : "外 ");
         double flip = q.nx*q.n0x + q.ny*q.n0y + q.nz*q.n0z;
         // 层/壁厚：单层壳 = 这一面在点云里只有一层点、没有壁厚。这种面谈不上
@@ -158,7 +219,7 @@ int main(int argc, char** argv){
         char buf[512]; snprintf(buf,sizeof(buf),"%s.faces.csv",outcsv);
         FILE* ff=fopen(buf,"w");
         if(ff){
-            fprintf(ff,"face,count,nx,ny,nz,n0x,n0y,n0z,angZ,tiltDeg,side,isInner(1内/0外/-1未分),sideSrc(1射线/2兜底/3强制/4薄壁),freePlus,freeMinus,cx,cy,cz,layerCnt(1单层/2双层/0未判定),layerThick,inWin(1=夹角<=%.0f)\n", SPRAYTRAJ_NORMAL_WIN_DEG);
+            fprintf(ff,"face,count,nx,ny,nz,n0x,n0y,n0z,angZ,tiltDeg,side,isInner(1内/0外/-1未分),sideSrc(1射线/2兜底/3强制/4薄壁/5双面/6拆层同向/7枪位验收翻转),freePlus,freeMinus,cx,cy,cz,layerCnt(1单层/2双层/0未判定),layerThick,inWin(1=夹角<=%.0f)\n", SPRAYTRAJ_NORMAL_WIN_DEG);
             for(int i=0;i<r.plane_count && i<SPRAYTRAJ_PLANE_SLOTS;++i){
                 const SprayTrajPlane& q=r.planes[i];
                 fprintf(ff,"%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%.3f,%d,%.2f,%d\n",

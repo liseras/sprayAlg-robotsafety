@@ -66,6 +66,9 @@ class Params:
     fix_transit: bool = True           # 过渡点（spray=0）碰撞时允许沿 +Z 抬升
     transit_lift_max: float = 400.0    # 过渡点最大抬升量（mm）
     az_fallback: bool = True           # 允许把「上翻方向」左右各偏 30/60° 作为兜底
+    # 是否要求"这台机器人可达"。False = 只查几何（喷距/倾角/枪体），不解 IK、
+    # 不建连杆碰撞体、不查自碰撞与关节限位。见 C++ 侧 RobotSafetyParams.requireReach。
+    require_reach: bool = True
 
 
 @dataclass
@@ -175,6 +178,10 @@ class Evaluator:
     def to_base_R(self, Rc: np.ndarray) -> np.ndarray:
         return self.R.T @ Rc
 
+    def to_base_v(self, v: np.ndarray) -> np.ndarray:
+        """方向向量：点云系 → 基座系（只转不平移）。to_cloud_R 的反向。"""
+        return self.R.T @ v
+
     def to_cloud_p(self, p: np.ndarray) -> np.ndarray:
         return self.R @ p + self.t
 
@@ -197,6 +204,43 @@ class Evaluator:
         """
         z_tool = -geom.unit(d)
         p_c = face + d * self.p.standoff
+
+        # ---- 不要求可达：不解 IK，只查枪体与点云的间隙。
+        # 枪体位置由「TCP + 枪轴」解析确定，与机器人无关；所以这不是"少查了一项"，
+        # 而是把与型号无关的那部分单独算准。与 C++ eval() 的 requireReach==0 分支逐行对应。
+        if not self.p.require_reach:
+            # 碰撞段一律建在**基座系**：后面的 to_cloud_p 只负责 基座系→点云系。
+            # 直接喂点云系的 TCP/枪轴、再被 to_cloud_p 变换一次，等于整根枪被平移了
+            # 一个基座偏移，会算出"枪体撞了 1512 点、最深 −21.2mm"这种假结论。
+            tcp_b = self.to_base_p(p_c)
+            segs = robot.tool_segments(tcp_b - self.to_base_v(z_tool) * self.tool.length,
+                                       tcp_b, self.sizing)
+            worst = math.inf
+            worst_part = ""
+            for s in segs:
+                hit = self.cloud.segment(self.to_cloud_p(s.a), self.to_cloud_p(s.b),
+                                        s.r, self.p.search, s.part)
+                if hit.surface_dist < worst:
+                    worst = hit.surface_dist
+                    worst_part = s.part
+            return PointResult(
+                idx=-1,
+                tilt_deg=tilt_deg,
+                clearance=worst,
+                min_part=worst_part,
+                ik_ok=False,          # 如实：没解过 IK
+                over_limit=False,
+                margin_min=math.inf,  # 没量到（不是 0°）
+                cond=0.0,
+                theta=np.zeros(6),
+                pos=p_c,
+                gun=-d,
+                spray_angle_to_normal=0.0,
+                standoff_err=abs(geom.norm(p_c - face) - self.p.standoff),
+                self_collision=math.inf,
+                az_deg=az_deg,
+            )
+
         Rc = geom.pose_from_z(z_tool, 0.0)[:3, :3]
         if ref_x is not None:
             # 用上一点的工具 x 轴做参考（投影到新切平面）——保证姿态「最小旋转」。
@@ -426,10 +470,15 @@ def _hard_ok(pr: PointResult, params: Params) -> bool:
     """硬约束：IK 成功、不自碰撞、间隙不低于绝对安全距离、关节不超限。
 
     margin_min < joint_margin_min 只是 P1 软告警，不在这里判死；over_limit 才是硬约束。
+    require_reach=False 时只剩「间隙不低于绝对安全距离」，而那时的 clearance 就是枪体间隙
+    （没建连杆碰撞体），所以"枪不许戳进工件"这一条在两种口径下都成立。
     """
+    if not (pr.clearance >= params.hard_clearance):
+        return False
+    if not params.require_reach:
+        return True
     return (pr.ik_ok
             and pr.self_collision >= 0.0
-            and pr.clearance >= params.hard_clearance
             and not pr.over_limit)
 
 
@@ -456,9 +505,10 @@ def precheck(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, params: Par
     out: list[dict] = []
 
     # ① 喷距 + 工具长 vs 臂展
+    #    只在「要求可达」时才有意义：不要求可达时臂展根本不参与判定。
     reach_need = params.standoff + params.tool_len
     limit = robot.VS087_REACH * 0.90
-    if reach_need > limit:
+    if params.require_reach and reach_need > limit:
         out.append({
             "index": -1, "rule": "PARAM_REACH_MARGIN",
             "value": reach_need, "limit": limit, "severity": "P1",
@@ -648,6 +698,9 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
         standoff_max_err = max(standoff_max_err, pr.standoff_err)
 
         # ---- 违规归集
+        # require_reach=False：SELF_COLLISION / JOINT_LIMIT 这两位不置。它们都是「这台机器人 +
+        # 这条站位」的结论，点云本身没有对错。几何层（穿透 / 间隙 / 工艺喷角）照旧。
+        _kin = params.require_reach
         if pr.clearance < 0:
             pr.violations.append("COLLISION")
             violations.append({"index": i, "rule": "COLLISION", "value": pr.clearance, "limit": 0.0,
@@ -656,11 +709,11 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
             pr.violations.append("CLEARANCE")
             violations.append({"index": i, "rule": "CLEARANCE", "value": pr.clearance, "limit": params.safety,
                                "severity": "P1", "note": f"{pr.min_part} 表面距离 {pr.clearance:.1f}mm < {params.safety:.0f}mm"})
-        if pr.self_collision < 0:
+        if _kin and pr.self_collision < 0:
             pr.violations.append("SELF_COLLISION")
             violations.append({"index": i, "rule": "SELF_COLLISION", "value": pr.self_collision, "limit": 0.0,
                                "severity": "P0", "note": "连杆自碰撞"})
-        if pr.over_limit or pr.margin_min < params.joint_margin_min:
+        if _kin and (pr.over_limit or pr.margin_min < params.joint_margin_min):
             pr.violations.append("JOINT_LIMIT")
             violations.append({"index": i, "rule": "JOINT_LIMIT", "value": pr.margin_min,
                                "limit": params.joint_margin_min, "severity": "P1",
@@ -716,10 +769,13 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
     violations = l0 + violations
 
     angles = [p.spray_angle_to_normal for p in results]
-    n_ok = sum(1 for p in results if p.ik_ok)
+    # 不要求可达时根本没解过 IK（ik_ok 恒 False）。按「默认全部通过」记成 n，
+    # 但这只是记账口径 —— 报告/界面必须显著标成「未检查」，别把 100% 当成真测出来的。
+    n_ok = n_pts if not params.require_reach else sum(1 for p in results if p.ik_ok)
     stats = {
         "points": n_pts,
         "spray_points": int(np.count_nonzero(traj.spray)),
+        "reach_checked": bool(params.require_reach),
         "reachable_points": n_ok,
         "reach_fraction": (n_ok / n_pts) if n_pts else 0.0,
         "tilted_points": int(sum(1 for a in angles if a > 0.5)),
@@ -744,7 +800,9 @@ def plan(traj: traj_mod.Traj, collider: cloud_mod.CloudCollider, base: np.ndarra
         "centroid": collider.centroid.tolist(),
     }
     if verbose:
-        print(f"[plan] {n_pts} 点 · 可达 {n_ok} ({stats['reach_fraction'] * 100:.1f}%) · "
+        reach_txt = (f"可达 {n_ok} ({stats['reach_fraction'] * 100:.1f}%)" if params.require_reach
+                     else "可达 未检查（仅几何口径）")
+        print(f"[plan] {n_pts} 点 · {reach_txt} · "
               f"倾斜 {stats['tilted_points']} 点 (均值 {stats['tilt_mean_deg']:.1f}°, 最大 {stats['tilt_max_deg']:.1f}°) · "
               f"违规 {len(violations)} · 最小间隙 {stats['min_clearance_mm']:.1f}mm")
         if standoff_max_err > 1e-3:

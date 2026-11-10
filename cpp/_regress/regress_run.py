@@ -110,10 +110,16 @@ def run_case(name, ply, args, clear):
     csv = os.path.join(OUT, name + ".csv")
     oply = os.path.join(OUT, name + ".ply")
     t0 = time.time()
-    cp = subprocess.run([EXE, ply_path, csv, oply] + args.split(),
-                        capture_output=True, text=True, encoding="utf-8", errors="ignore", cwd=HERE)
+    # 沙箱环境禁止匿名管道（subprocess 的 capture_output 会 CreatePipe → WinError 5），
+    # 所以把子进程输出重定向到文件再读；指标与管道版完全一致。
+    logfile = os.path.join(OUT, name + ".log")
+    os.makedirs(OUT, exist_ok=True)
+    with open(logfile, "w", encoding="utf-8", errors="ignore") as lf:
+        cp = subprocess.run([EXE, ply_path, csv, oply] + args.split(),
+                            stdout=lf, stderr=subprocess.STDOUT, cwd=HERE)
     dt = time.time() - t0
-    log = cp.stdout + cp.stderr
+    with open(logfile, encoding="utf-8", errors="ignore") as lf:
+        log = lf.read()
 
     if cp.returncode != 0:
         return {"fail": "退出码 %d" % cp.returncode, "log": log[-1500:], "sec": dt}

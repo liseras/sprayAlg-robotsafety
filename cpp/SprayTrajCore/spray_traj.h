@@ -65,7 +65,11 @@ typedef struct SprayTrajPoint {
     double x, y, z;    // 位置 mm（基座系，已按离面距离抬升）
     double i, j, k;    // 喷枪轴线单位向量（指向表面）
     double speed;      // mm/s
-    int    spray;      // 1=喷涂（全程恒为1）
+    int    spray;      // 1=喷涂段；0=空移段（换面/抬枪/行间跳转，枪关）
+                       //   空移段**同样按点距铺满点**（每 pointSpacing 一个），
+                       //   不是"只有拐点、两点间靠控制器插补"—— 上位机/DensoArmKine
+                       //   必须逐点走到，不能因为 spray=0 就跳过。导出到 plan.json 时
+                       //   这一位就是 GunOpen（0 → false）。
 } SprayTrajPoint;
 
 // 可喷面角度窗口：面法向与 +Z 的夹角（0~180°）≤ 此值才列入可喷清单。
@@ -146,6 +150,36 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
 // 释放结果（内部分配的点数组与错误串）
 SPRAYTRAJ_API void spray_traj_free(SprayTrajResult* res);
+
+// C# 友好入口：结果写入调用方提供的缓冲区（SprayTrajResult 约 145KB，
+// 直接用"返回结构体"的 ABI 会在托管侧栈上分配过大，故提供 out 参数版本）。
+// 返回 0 = 成功；1 = 失败（out->error 非空）；-1 = 参数空。
+SPRAYTRAJ_API int spray_traj_generate_ex(
+    const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out);
+
+// ABI 尺寸对账：调用方 (C# Marshal.SizeOf) 必须与本函数返回值一致，否则禁止调用，
+// 避免结构体布局不一致时原生按自身 sizeof 写越界（曾导致 0xC0000005 闪退）。
+SPRAYTRAJ_API void spray_traj_abi_sizes(int* paramsSize, int* planeSize, int* resultSize);
+
+// 结果标量（C# 用固定偏移读取会依赖结果结构体整体布局，故单独给一个扁平信息结构）。
+typedef struct SprayTrajInfo {
+    int    count;          // 轨迹点数
+    int    rows;           // 行数
+    int    input_points;
+    int    removed_points;
+    int    inlier_points;
+    int    plane_count;
+    double plane_rms;
+    double normal_x, normal_y, normal_z;
+    double plane_cx, plane_cy, plane_cz;
+    double seg_len_mean, seg_len_max;
+} SprayTrajInfo;
+
+SPRAYTRAJ_API void spray_traj_result_info(const SprayTrajResult* res, SprayTrajInfo* out);
+// 取第 idx 个重建面（0 <= idx < plane_count）；成功返回 0，越界返回 -1。
+SPRAYTRAJ_API int  spray_traj_get_plane(const SprayTrajResult* res, int idx, SprayTrajPlane* out);
+// 失败原因（成功时为 NULL）。
+SPRAYTRAJ_API const char* spray_traj_result_error(const SprayTrajResult* res);
 
 #ifdef __cplusplus
 }

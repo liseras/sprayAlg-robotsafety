@@ -1,4 +1,4 @@
-﻿<Window x:Class="SprayTrajViewer.MainWindow"
+<Window x:Class="SprayTrajViewer.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:hx="http://helix-toolkit.org/wpf"
@@ -44,6 +44,56 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBox x:Name="TxtPath" Text="C:\Users\DYF\Desktop\点云\喷涂点云\面板.ply" Padding="6" VerticalContentAlignment="Center"/>
                                     <Button Grid.Column="1" Content="浏览" Margin="8,0,0,0" Padding="12,4" Click="BtnBrowse_Click"/>
+                                </Grid>
+
+                                <!-- 手眼标定：把相机系点云搬到基座系，再挪到可达位。
+                                     放在「工艺参数」之前 —— 它决定后面所有参数（行距/倾角/喷距）
+                                     所依赖的坐标系，先定坐标再谈工艺，顺序反了会白调一遍参数。 -->
+                                <CheckBox x:Name="ChkHandEye" Content="加载后按手眼矩阵变换到基座系"
+                                          Margin="0,14,0,0" VerticalContentAlignment="Center"
+                                          Checked="ChkHandEye_Changed" Unchecked="ChkHandEye_Changed"
+                                          ToolTip="勾上：读进来的点云按「相机系→基座系」的标定矩阵旋转+平移，再整体挪到机器人可达位。&#x0a;变换完成后点云已经在基座系里，所以「基座位姿」会自动切到「点云已在基座系（恒等）」、「重力向上」自动回到 +Z —— 这两项必须一起改，否则安全层会把已经标定好的点云再猜一次基座，可达率与碰撞结论全错。&#x0a;不勾：点云保持采集时的坐标系，按旧流程手动指定基座位姿与重力向上。"/>
+
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox x:Name="TxtHandEye" Text="config\handeye_cam2base.txt" Padding="6"
+                                             VerticalContentAlignment="Center"
+                                             ToolTip="手眼标定矩阵文件（4×4 或 3×4 文本，约定 p_base = R·p_cam + t）。&#x0a;# 开头的注释行会被忽略，所以文件里可以随手写说明。"/>
+                                    <Button Grid.Column="1" Content="…" Margin="8,0,0,0" Padding="10,4"
+                                            ToolTip="选择手眼标定矩阵文件" Click="BtnHandEyeBrowse_Click"/>
+                                </Grid>
+
+                                <!-- 跳过可达位平移：手眼矩阵本身已经把点云搬到基座系了，
+                                     这一步是否还该再挪，取决于标定是不是真的。
+                                     默认不勾 = 保留旧行为（正面贴 faceX、Y 居中、最低点落 floorZ），
+                                     否则历史产物的坐标会集体变一次，没法跟以前的结论对照。 -->
+                                <CheckBox x:Name="ChkSkipPlacement" Content="跳过可达位平移（直接用手眼算出的基座坐标）"
+                                          Margin="0,8,0,0" VerticalContentAlignment="Center"
+                                          Checked="ChkSkipPlacement_Changed" Unchecked="ChkSkipPlacement_Changed"
+                                          ToolTip="勾上：手眼矩阵换算完就是终点，不再做「正面贴 faceX / Y 居中 / 最低点落 floorZ」那一次整体平移。&#x0a;适合标定可信、想知道工件真实位置在哪的场合（导出 _base.ply 与安全层都用纯手眼结果）。&#x0a;不勾：保留旧口径，把工件挪到机器人舒适区——位置是规划出来的，不是测出来的，换工件高度时必须一起改「最低点高度」。&#x0a;勾上后下面两个输入框变灰，因为它们不再参与计算。"/>
+
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel>
+                                        <TextBlock Text="正面到基座 (mm)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="工件朝向机器人的那一面，落在基座系 +X 上的位置。VS-087 舒适区约 450mm"/>
+                                        <TextBox x:Name="TxtFaceX" Text="450" Padding="4" Margin="0,2,4,0"
+                                                 LostFocus="TxtPlacement_LostFocus"
+                                                 ToolTip="改完按 Tab 或点别处即生效：工件在基座系里整体平移（只挪位置，不改姿态）"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="最低点高度 (mm)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="变换后工件最低点的 Z（相对基座原点，向上为正）。填 auto = 自动让工件中心落在舒适高度 0.35×reach（VS-087 约 317mm），换工件高度时不用手算"/>
+                                        <TextBox x:Name="TxtFloorZ" Text="-200" Padding="4" Margin="0,2,0,0"
+                                                 LostFocus="TxtPlacement_LostFocus"
+                                                 ToolTip="改完按 Tab 或点别处即生效：工件在基座系里整体平移（只挪位置，不改姿态）。&#x0a;填 auto：按工件自身高度自动算，使中心落在 0.35×reach。&#x0a;注意它是「绝对高度」，不随工件高度自适应：-200 是给 860 高背板配的，套到 476 高的件上中心只剩 +38，看起来就像掉到地上。"/>
+                                    </StackPanel>
                                 </Grid>
 
                                 <TextBlock Text="工艺参数" FontWeight="SemiBold" Margin="0,18,0,4" Foreground="#2563EB"/>
@@ -144,10 +194,14 @@
                                 <CheckBox x:Name="ChkShowRisk" Content="标记风险点（红=碰撞/不可达，橙=间隙/关节，黄=喷角等）"
                                           Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
                                           Checked="ChkShowRisk_Changed" Unchecked="ChkShowRisk_Changed"/>
-                                <CheckBox x:Name="ChkShowFixed" Content="显示修正后轨迹（青，倾斜后）"
-                                          Margin="0,4,0,0" VerticalContentAlignment="Center"
-                                          ToolTip="大多数时候与红色原轨迹重合；想看「哪些点被倾斜了」再打开"
+                                <CheckBox x:Name="ChkShowFixed" Content="显示修正后轨迹（喷涂绿 / 空移紫）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="安全层修正后的位姿：喷涂段绿色、空移段紫色（和原轨迹的红/蓝分开）。&#x0a;大多数时候与红/蓝原轨迹重合，只有被倾斜/被抬枪的点才会从原轨迹里冒出来。&#x0a;想看「哪些点被改动了」就打开它。"
                                           Checked="ChkShowFixed_Changed" Unchecked="ChkShowFixed_Changed"/>
+                                <CheckBox x:Name="ChkShowMove" Content="显示空移段（蓝，枪关）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="spray=0 的过渡段：抬枪、跨面、下枪。用亮蓝色和红色喷涂段分开画（修正层里对应紫色）。&#x0a;关掉后只留喷涂段，方便检查行距/覆盖。"
+                                          Checked="ChkShowMove_Changed" Unchecked="ChkShowMove_Changed"/>
 
                                 <TextBlock x:Name="TxtResult" Text="" Margin="0,14,0,0" TextWrapping="Wrap"
                                            FontSize="12" Foreground="#1F2937"/>
@@ -163,12 +217,45 @@
                                            FontSize="11" Foreground="#9CA3AF" Margin="0,2,0,0" TextWrapping="Wrap"/>
 
                                 <DockPanel Margin="0,14,0,0">
+                                    <TextBlock Text="重力向上" Width="150" VerticalAlignment="Center"
+                                               ToolTip="点云坐标系里哪个方向是上。倾角的朝上/侧壁/悬垂全按它判。默认 +Z 只在点云已是基座系时才对；相机系点云里 +Z 是光轴，必须改。"/>
+                                    <ComboBox x:Name="CmbUpDir" Padding="4" SelectedIndex="0"
+                                              SelectionChanged="CmbUpDir_Changed">
+                                        <ComboBoxItem Content="+Z（点云已正装）"/>
+                                        <ComboBoxItem Content="−Y（立着挂·相机正放）"/>
+                                        <ComboBoxItem Content="+Y（立着挂·上下颠倒）"/>
+                                        <ComboBoxItem Content="−Z（倒置）"/>
+                                        <ComboBoxItem Content="自定义三分量"/>
+                                    </ComboBox>
+                                </DockPanel>
+
+                                <DockPanel Margin="0,8,0,0">
+                                    <TextBlock Text="可喷侧方向" Width="150" VerticalAlignment="Center"
+                                               ToolTip="相机系里可喷侧恒定是「朝相机侧」，也就是更低 Z —— 这是相机只能看到朝向自己那一面决定的，不是可选项，所以这里只显示、不可改。算法内部把 +Z 当工件正面，入口会自动把 −Z 旋到 +Z 再算，出口把轨迹转回原坐标系。"/>
+                                    <TextBlock Text="−Z（朝相机侧，恒定）" VerticalAlignment="Center" Foreground="#666"/>
+                                </DockPanel>
+
+                                <StackPanel x:Name="PanelUpCustom" Visibility="Collapsed" Margin="0,4,0,0">
+                                    <Grid Margin="0,2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="TxtUpX" Text="0" Padding="4" Margin="0,0,4,0" ToolTip="重力向上 X（点云系，不必归一化）"/>
+                                        <TextBox x:Name="TxtUpY" Grid.Column="1" Text="0" Padding="4" Margin="0,0,4,0" ToolTip="重力向上 Y"/>
+                                        <TextBox x:Name="TxtUpZ" Grid.Column="2" Text="1" Padding="4" ToolTip="重力向上 Z"/>
+                                    </Grid>
+                                </StackPanel>
+
+                                <DockPanel Margin="0,14,0,0">
                                     <TextBlock Text="基座位姿" Width="150" VerticalAlignment="Center"
                                                ToolTip="点云坐标系 → 机器人基座坐标系。标定值请手输，自动假设仅用于可行性预判"/>
                                     <ComboBox x:Name="CmbBaseMode" Padding="4" SelectedIndex="0"
                                               SelectionChanged="CmbBaseMode_Changed">
                                         <ComboBoxItem Content="自动假设（按工件质心）"/>
                                         <ComboBoxItem Content="手动输入（标定值）"/>
+                                        <ComboBoxItem Content="点云已在基座系（恒等）"/>
                                     </ComboBox>
                                 </DockPanel>
 
@@ -205,11 +292,12 @@
                                         <RowDefinition/>
                                         <RowDefinition/>
                                         <RowDefinition/>
+                                        <RowDefinition/>
                                     </Grid.RowDefinitions>
 
                                     <StackPanel Grid.Row="0" Grid.Column="0">
                                         <TextBlock Text="工具长 法兰→喷嘴 (mm)" FontSize="11" Foreground="#6B7280"/>
-                                        <TextBox x:Name="TxtToolLen" Text="150" Padding="4" Margin="0,2,0,0"/>
+                                        <TextBox x:Name="TxtToolLen" Text="450" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
                                     <StackPanel Grid.Row="0" Grid.Column="2">
                                         <TextBlock Text="间隙告警阈值 (mm)" FontSize="11" Foreground="#6B7280"
@@ -243,11 +331,12 @@
                                         <TextBox x:Name="TxtVoxel" Text="0" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
                                     <StackPanel Grid.Row="3" Grid.Column="2" Margin="0,8,0,0">
-                                        <TextBlock Text="进刀侧方位" FontSize="11" Foreground="#6B7280"
-                                                   ToolTip="按机器人站位：每行在「向上」与「站位侧」之间按 P0 实测择优，只在旧口径真撞的行上改动"/>
-                                        <ComboBox x:Name="CmbAzMode" Margin="0,2,0,0" SelectedIndex="0">
-                                            <ComboBoxItem Content="按机器人站位择优"/>
-                                            <ComboBoxItem Content="只用「向上」(旧口径)"/>
+                                        <TextBlock Text="倾角方向（平放面）" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="安全层在基座系里算倾角：基座 +Z 是竖直。平放面（法向就是竖直）没有「往上扳」可言，只能选择往基座 +X 还是 −X 侧扳。只在基座位姿已知（手眼/恒等/手动）时生效。"/>
+                                        <ComboBox x:Name="CmbTiltSide" Margin="0,2,0,0" SelectedIndex="0">
+                                            <ComboBoxItem Content="不指定（旧口径，平放面不倾）"/>
+                                            <ComboBoxItem Content="往基座 +X 倾"/>
+                                            <ComboBoxItem Content="往基座 −X 倾"/>
                                         </ComboBox>
                                     </StackPanel>
 
@@ -261,10 +350,53 @@
                                         <TextBlock Text="仅硬约束回退；间隙略小不回退" FontSize="11" Foreground="#111827"
                                                    Margin="0,4,0,0" TextWrapping="Wrap"/>
                                     </StackPanel>
+
+                                    <StackPanel Grid.Row="5" Grid.Column="0" Margin="0,8,0,0">
+                                        <TextBlock Text="进刀侧方位" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="按机器人站位：每行在「向上」与「站位侧」之间按 P0 实测择优，只在旧口径真撞的行上改动"/>
+                                        <ComboBox x:Name="CmbAzMode" Margin="0,2,0,0" SelectedIndex="0">
+                                            <ComboBoxItem Content="按机器人站位择优"/>
+                                            <ComboBoxItem Content="只用「向上」(旧口径)"/>
+                                        </ComboBox>
+                                    </StackPanel>
                                 </Grid>
 
+                                <CheckBox x:Name="ChkRequireReach" Content="要求可达（按机器人运动学判定）"
+                                          Margin="0,14,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="勾上（默认）= 完整口径：可达 + 关节限位 + 连杆碰撞 + 自碰撞都查。&#x0a;取消勾选 = 只查几何：喷距、倾角/工艺喷角、枪体（握把+细管+喷嘴）会不会撞点云；不解 IK、不算可达率，速度快一个量级。&#x0a;点云不是给当前这台机器人 / 这条站位用时（臂展、站位都对不上），取消勾选，别让可达率把「轨迹铺得对不对」盖过去。"/>
+
                                 <CheckBox x:Name="ChkAutoSafety" Content="生成轨迹后自动评估"
-                                          Margin="0,14,0,0" VerticalContentAlignment="Center" IsChecked="True"/>
+                                          Margin="0,10,0,0" VerticalContentAlignment="Center" IsChecked="True"/>
+
+                                <CheckBox x:Name="ChkFastPose" Content="单次逆解（快 20 倍以上）"
+                                          Margin="0,8,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="勾上（默认）= 每点只解 1~2 次逆解：倾角按法向需求 + 面内轻量择优（每组 ≤7 倾角 × 24 点采样）定，不逐点搜救。&#x0a;可达 / 关节限位 / 连杆碰撞 / 自碰撞 / 喷角 / 间隙**一条不少**，省掉的只是「为了挑更好解的倾角而反复试解」。&#x0a;实测开口盒子 19082 点：30.8s → 1.59s（19×），可达率同为 99.3%。&#x0a;7 个工件对拍：6 个结论与完整搜索一致，槽型盘因 1 个点的自碰撞从 PASS 变 REJECT（面级姿态选 35° 而非 45°，抽样看不见那 1 个点）。&#x0a;所以要出正式结论、或要送机器人执行时，取消勾选跑完整搜索。"/>
+
+                                <CheckBox x:Name="ChkTiltPerPoint" Content="倾角逐点连续（按法向线性）"
+                                          Margin="0,8,0,0" VerticalContentAlignment="Center"
+                                          ToolTip="勾上 = 倾角只由该点法向决定：δ=法向与「正位置」(+Z，即采集/相机拍过去的方向)的夹角，tilt = 60°×δ/90（侧壁给满 60°，δ&lt;45° 的面不足 30°）。&#x0a;法向连续 ⟹ 倾角连续，一圈桶壁不再被切成 0°/25° 两块。&#x0a;个别点光靠线性值过不了（自碰撞/连杆撞件）时，只把那个点单独往上抬，不连累整面。&#x0a;注意：倾角就是喷角，超过「最大喷角」会报 SPRAY_ANGLE 告警 —— 系数调到 60 后，δ&gt;45° 的面都会落在 30° 喷角之外，要么把喷角上限一起放宽，要么这一项就只是提示。&#x0a;不勾（默认）= 面级常量：一个面组锁一个 (倾角,方位)，面内绝对不跳，换面才变。"/>
+
+                                <CheckBox x:Name="ChkAutoExport" Content="自动导出（点云同名 + 模拟平台 JSON）"
+                                          Margin="0,8,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="生成轨迹后自动写「点云目录\traj_out\点云名_traj.csv」与「点云名.plan.json」；安全评估后再写「点云名_safe.csv」并把 plan.json 换成修正后的轨迹。&#x0a;plan.json 是 DensoArmKine 的 spray_plan 格式，导入时选「轨迹口径=TCP、坐标系=基座系、姿态翻转=不翻」。"/>
+
+                                <!-- 输出目录写在界面上，不只写在日志里：
+                                     点云是按「文件所在目录」决定输出位置的，桌面\点云\喷涂点云 和
+                                     喷涂点云_DENSO可达 各有一份同名 ply，生成完在两处各有一个 traj_out，
+                                     只看文件名永远说不清刚才那一份落在哪。 -->
+                                <DockPanel Margin="0,4,0,0" LastChildFill="True">
+                                    <Button x:Name="BtnOpenOutDir" DockPanel.Dock="Right" Content="打开"
+                                            Padding="8,1" Margin="6,0,0,0" FontSize="11"
+                                            ToolTip="在资源管理器里打开这次的导出目录（= 点云所在目录下的 traj_out），没有就建一个"
+                                            Click="BtnOpenOutDir_Click"/>
+                                    <Button x:Name="BtnSetOutDir" DockPanel.Dock="Right" Content="更改…"
+                                            Padding="8,1" Margin="6,0,0,0" FontSize="11"
+                                            ToolTip="把自动导出目录改到别处（例如安全软件拦桌面时改到 E:\ 下）。选择会记住，换点云也不变；点「恢复默认」可以回到跟随点云目录。"
+                                            Click="BtnSetOutDir_Click"/>
+                                    <TextBlock x:Name="TxtOutDir" Text="导出目录：加载点云后显示"
+                                               FontSize="11" Foreground="#6B7280" VerticalAlignment="Center"
+                                               TextTrimming="CharacterEllipsis"/>
+                                </DockPanel>
 
                                 <Button x:Name="BtnSafety" Content="机器人安全评估" FontSize="15" FontWeight="Bold"
                                         Background="#EA580C" Foreground="White" Padding="0,10" Margin="0,10,0,0"
@@ -358,9 +490,43 @@
                 </DataGrid>
             </StackPanel>
 
-            <Border Background="#66000000" Padding="10" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="12" CornerRadius="6">
-                <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
-            </Border>
+            <!-- 提示条 + 图例：用 StackPanel 竖排，提示条行数变化时图例自动往下让位，不会压在一起 -->
+            <StackPanel VerticalAlignment="Top" HorizontalAlignment="Left" Margin="12">
+                <Border Background="#66000000" Padding="10" CornerRadius="6" HorizontalAlignment="Left">
+                    <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
+                </Border>
+
+                <!-- 当前显示坐标系：常驻标签，不随提示条一起被覆盖。
+                     三个坐标系很容易混（点云采集系 / 基座系 / 算法内部口径），
+                     没有这个标签时，看到"轨迹飘在工件外面"根本分不清是算法错还是坐标系没切 —— 
+                     2026-11-10 就是这样被误判过一次。 -->
+                <Border x:Name="BdFrameTag" Background="#CC1F2937" Padding="8,3" CornerRadius="5"
+                        HorizontalAlignment="Left" Margin="0,6,0,0">
+                    <TextBlock x:Name="TxtFrameTag" FontSize="12" Foreground="#E5E7EB"
+                               Text="视图坐标系：点云采集系（相机系）"/>
+                </Border>
+
+                <!-- 轨迹图例：原轨迹 红=喷涂、蓝=空移；修正后轨迹 绿=喷涂、紫=空移。
+                     原轨迹配色和 DensoArmKine 模拟平台一致（那边喷涂 #E03B2E / 空走 #3D7EB8），
+                     两个软件里看到的颜色含义相同，不用来回换算。
+                     修正层的绿/紫特意选了不相邻的色相：早先修正喷涂用青 #22D3EE，和空移蓝几乎分不开。 -->
+                <Border Background="#99000000" Padding="10,6" CornerRadius="6" Margin="0,6,0,0" HorizontalAlignment="Left">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#FF3020" VerticalAlignment="Center"/>
+                            <TextBlock Text="喷涂（枪开）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,14,0" VerticalAlignment="Center"/>
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#40B0F0" VerticalAlignment="Center"/>
+                            <TextBlock Text="空移（枪关，抬枪/跨面/下枪）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#4ADE80" VerticalAlignment="Center"/>
+                            <TextBlock Text="修正后喷涂" Foreground="#9CA3AF" FontSize="11" Margin="6,0,14,0" VerticalAlignment="Center"/>
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#C084FC" VerticalAlignment="Center"/>
+                            <TextBlock Text="修正后空移" Foreground="#9CA3AF" FontSize="11" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
 
             <!-- 安全评估结论：贴在视图右上角，结论一眼可见 -->
             <Border x:Name="CardSafety" Visibility="Collapsed"

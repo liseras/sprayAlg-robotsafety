@@ -112,9 +112,20 @@ namespace SprayTrajViewer
         public int    includeBase;      // 1=查底座段
         public int    fixTransit;       // 1=允许过渡点抬升
         public int    azFallback;       // 1=允许换倾斜方位兜底
-        public int    maxCloudPoints;   // 保留（<=0 = 用全量点云）
+        // 0 = 不要求可达：只查几何（喷距/倾角/枪体碰撞），不解 IK、不查连杆与自碰撞；
+        // 1 = 完整口径（默认）。**这个槽位原来是没用上的 maxCloudPoints**，改名复用，
+        // 所以 sizeof 仍是 152、ABI 没动。语义见 robot_safety.h。
+        public int    requireReach;
         public int    threads;          // 并行线程数（1=单线程，结果可复现）
         public int    azMode;           // 进刀侧策略：0=按机器人站位逐行择优（默认）；1=只用「向上」
+        // **位掩码**（与 robot_safety.h 的 RS_POSE_* 一致；旧调用方传 0/1，行为不变）：
+        //   bit0 = 单次逆解：姿态解析定（面内轻量择优 ≤500 次采样），每点 1~2 次 IK，不逐点搜救；
+        //   bit1 = 倾角逐点连续：tilt = tiltNonUpDeg × δ/90（δ=法向与 +Z 夹角），不做面级常量。
+        // 占的是结构体尾部原来的 4 字节对齐填充，sizeof 仍是 152、ABI 没动。
+        public int    fastPose;
+        // 平放面倾角方向（基座系）：0=不指定（旧口径）；+1=往基座 +X 倾；−1=往基座 −X 倾。
+        // 安全层在基座系里算，基座 +Z 竖直向上；只有基座位姿已知时才生效。
+        public double tiltSideX;
     }
 
     // 违规位（与 RS_VIOL_* 一致）
@@ -127,9 +138,10 @@ namespace SprayTrajViewer
         public const uint JointLimit = 1u << 4;
         public const uint SprayAngle = 1u << 5;
         public const uint NearSingular = 1u << 6;
-        public const uint TiltJump = 1u << 7;
+        public const uint TiltJump = 1u << 7;   // 相邻枪轴 3D 夹角跳变（不只比倾角）
         public const uint LinkHit = 1u << 8;    // 连杆/关节/底座撞点云
         public const uint ToolHit = 1u << 9;    // 枪体/细管/喷嘴撞点云
+        public const uint StepJump = 1u << 10;  // 相邻 TCP 步长跳变（跨行/跨换段也查）
         // Collision 是旧版汇总位，本层已由 LinkHit/ToolHit 细分，不再置位（保留位序不破坏兼容）
     }
 
@@ -235,6 +247,22 @@ namespace SprayTrajViewer
             [In] double[] cloudXyz, int cloudCount,
             [In] double[]? basePose16,
             ref RobotSafetyParams p);
+
+        /// <summary>
+        /// 同上，但显式给「重力向上」在**点云系**里的方向（不必归一化，函数内归一）。
+        /// null 或零向量 ⇒ 退回点云 +Z，即 robot_safety_check 的行为。
+        ///
+        /// 为什么要这个：倾角口径里"朝上"是相对重力定义的，点云系 +Z 只在
+        /// 「点云已经是机器人基座系（桌面正装采集）」时才等于重力向上。
+        /// 相机系点云里 +Z 是光轴，用旧入口会把"朝上"判成"朝向相机"。
+        /// </summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern RobotSafetyResult robot_safety_check_up(
+            [In] SprayTrajPoint[] pts, int n,
+            [In] double[] cloudXyz, int cloudCount,
+            [In] double[]? basePose16,
+            ref RobotSafetyParams p,
+            [In] double[]? upCloud);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void robot_safety_free(ref RobotSafetyResult res);

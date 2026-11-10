@@ -146,7 +146,10 @@ def write_report_md(path: str, res: Result, traj: traj_mod.Traj, src_traj: str, 
     A("")
     A("| 指标 | 值 | 说明 |")
     A("|---|---|---|")
-    A(f"| 可达率 | {s['reach_fraction'] * 100:.1f}% | IK 收敛且残差达标的点数占比 |")
+    A(f"| 可达率 | {s['reach_fraction'] * 100:.1f}% | IK 收敛且残差达标的点数占比 |"
+      if s.get("reach_checked", True)
+      else "| 可达率 | 未检查 | 本次为**仅几何口径**（require_reach=False）：不解 IK、不查连杆/自碰撞/关节限位，"
+           "所以这里没有可达率可报；枪体碰撞与喷距/喷角照旧是实测值 |")
     A(f"| 倾斜点数 | {s['tilted_points']} / {s['points']} | 喷角 > 0.5° 的点 |")
     A(f"| 喷角均值 / p95 / 最大 | {s['tilt_mean_deg']:.1f}° / {s['tilt_p95_deg']:.1f}° / {s['tilt_max_deg']:.1f}° | 喷角 = 倾角 = 枪轴与法向夹角 |")
     A(f"| **喷距保持最大偏差** | {s['standoff_max_err_mm']:.6f} mm | 倾斜后 \\|TCP-face\\| 与 standoff 之差的上限 |")
@@ -169,7 +172,8 @@ def write_report_md(path: str, res: Result, traj: traj_mod.Traj, src_traj: str, 
             "IK_FAIL": ("P0", "逆解不收敛（不可达）"),
             "SPRAY_ANGLE": ("P1", "喷角超工艺上限（膜厚会变薄/不均）"),
             "NEAR_SINGULAR": ("P2", "接近奇异位形（关节速度会放大）"),
-            "TILT_JUMP": ("P2", "倾角相对上一点跳变过大（平滑回退的代价，手腕会甩一下）"),
+            "TILT_JUMP": ("P2", "相邻枪轴夹角跳变过大（方位翻转时倾角可以不变，所以比的是 3D 夹角）"),
+            "STEP_JUMP": ("P2", "相邻 TCP 步长跳出（跨行/跨换段也查，机器人在这一步要直接移动这么远）"),
         }
         for k, cnt in sorted(by.items(), key=lambda kv: -kv[1]):
             sev, desc = rules.get(k, ("?", ""))

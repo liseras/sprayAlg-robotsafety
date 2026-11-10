@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
@@ -28,6 +28,20 @@ public partial class App : Application
         DispatcherUnhandledException += (_, a) =>
         {
             Log("FATAL/Dispatcher", a.Exception);
+            // .NET 9 已移除 BinaryFormatter：剪贴板/序列化路径抛这个异常不该让整个程序退出。
+            // 2026-10-28 就是这么退的：Ctrl+C 复制 3D 视图 -> Clipboard -> PlatformNotSupportedException。
+            // 视口复制已经改成自实现（见 MainWindow.SafeCopyViewportCommand），这里只是最后一道兜底。
+            if (a.Exception is PlatformNotSupportedException pns &&
+                pns.Message.Contains("BinaryFormatter", StringComparison.Ordinal))
+            {
+                a.Handled = true;
+                MessageBox.Show(
+                    "这次操作依赖已被 .NET 9 移除的 BinaryFormatter（剪贴板写入失败），程序已继续运行。\n" +
+                    "如果是在复制 3D 视图，请改用界面上的导出功能保存图片。",
+                    "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
             // 记录后仍交给系统处理，不掩盖真实崩溃
             a.Handled = false;
         };
@@ -56,6 +70,10 @@ public partial class App : Application
         if (ex != null)
         {
             sb.Append(' ').Append(ex.GetType().FullName).Append(": ").Append(ex.Message);
+            // XAML 加载失败一律包成 TargetInvocationException，-message 只有"目标调用抛异常"，
+            // 真因（哪个对象、哪一行）全在 InnerException 里，不打出来等于没报错。
+            for (var inner = ex.InnerException; inner != null; inner = inner.InnerException)
+                sb.Append(" <- ").Append(inner.GetType().Name).Append(": ").Append(inner.Message);
             if (!string.IsNullOrEmpty(ex.StackTrace)) sb.Append(" @ ").Append(ex.StackTrace);
         }
         string line = sb.ToString();

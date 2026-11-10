@@ -9,11 +9,21 @@
 //   -hardclr <mm>    绝对安全距离/回退硬下限（默认 2；0=只要不穿透）
 //   -search <mm>     判定带（默认 120；超过只报下界）
 //   -tool <mm>       法兰→喷嘴（默认 150）
-//   -tilt <deg>      非朝上面基准倾角（默认 20）
+//   -tilt <deg>      δ=90°（竖直侧壁）时的倾角，其余按 δ/90 线性缩（默认 60）
 //   -tiltmax <deg>   倾角上限（默认 60）
 //   -rate <deg>      每点倾角最大变化（默认 3）
 //   -sprayang <deg>  工艺喷角上限（默认 30）
 //   -base <x> <y> <z> <rx> <ry> <rz>   基座位姿（mm / 度，ZYX 欧拉）；不给则自动假设
+//   -reach <0|1>     是否需要"这台机器人可达"。1（默认）= 完整口径：可达 + 关节限位 +
+//                    连杆碰撞 + 自碰撞；0 = 只查几何：喷距 + 倾角/喷角 + **枪体**碰撞。
+//                    关掉后不解 IK（快一个量级），theta/ikOk 全 0，可达率按全部通过计。
+//                    用于"点云本来就不是给这台机器人/这条站位用的"场合。
+//   -fast <0|1>      姿态求解策略。0（默认）= 完整搜索：面级择优 + 倾角梯级 + 方位兜底 +
+//                    S=32/96/400 三档抽样复核 + 逐点救援（每点平均 9.5 次 IK）。
+//                    1 = 单次逆解：倾角取面内几何需求的最大值 + 「≤7 倾角 × 8 点」的
+//                    轻量择优，每点 1~2 次 IK，不逐点搜救。碰撞/可达/关节/喷角判据一条不少。
+//                    开口盒子 19082 点实测：30.8s → 1.59s（19×），可达率同为 99.3%；
+//                    代价是深腔件 P0 报得更多（不再逐点找可避让的位姿），平面件逐值一致。
 //   -quiet           只打印结论
 //
 // 退出码：0 = 无 P0（可执行）；1 = 有 P0（撞了 / 不可达）；2 = 参数或读文件错误
@@ -360,7 +370,14 @@ int main(int argc, char** argv) {
         printf("用法: spray_safety <traj.csv> <cloud.ply> <out.csv> [选项]\n");
         printf("      -standoff -safety -hardclr -search -tool -tilt -tiltmax -rate -sprayang\n");
         printf("      -hardclr <mm>  绝对安全距离/回退硬下限（默认 2；0=只要不穿透）\n");
-        printf("      -threads <n>  -stride <n>  -voxel <mm>  -azmode <0|1>  -base <x y z rx ry rz>  -quiet\n");
+        printf("      -threads <n>  -stride <n>  -voxel <mm>  -azmode <0|1>  -base <x y z rx ry rz>\n");
+        printf("      -up <+X|-X|+Y|-Y|+Z|-Z | x y z>  点云系重力向上方向（默认 +Z=旧口径）。\n");
+        printf("          点云是相机系时必须改：相机 +Z 是光轴不是重力，倾角『朝上』会判错方向。\n");
+        printf("      -reach <0|1>   1=要求可达（完整口径，默认）；0=只查几何（不解 IK / 不查连杆自碰撞）\n");
+        printf("      -fast <0|1>    1=单次逆解（姿态解析、每点 1 次 IK、不搜救不回退）\n");
+        printf("      -tiltmode <0|1> 1=倾角逐点连续（tilt=系数×δ/90，δ=法向与重力向上夹角，系数见 -tilt）；\n");
+        printf("                      0=面级常量（默认：一个面组锁一个倾角）\n");
+        printf("      -quiet\n");
         printf("      -azmode 0 = 按机器人站位逐行择优进刀侧（默认）；1 = 只用「向上」（旧口径）\n");
         return 2;
     }
@@ -371,7 +388,10 @@ int main(int argc, char** argv) {
     RobotSafetyParams p = robot_safety_default_params();
     double basePose[16];
     bool hasBase = false;
+    double up[3] = {0, 0, 1};   // 点云系重力向上；默认旧口径 +Z
+    bool hasUp = false;
     bool quiet = false;
+    bool reach = true;   // 是否要求"这台机器人够得着/不撞自己"（对应 p.requireReach）
 
     for (int i = 4; i < argc; ++i) {
         if (!strcmp(argv[i], "-standoff") && i + 1 < argc) p.standoff = atof(argv[++i]);
@@ -387,7 +407,28 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "-stride") && i + 1 < argc) p.linkStride = std::max(1, atoi(argv[++i]));
         else if (!strcmp(argv[i], "-voxel") && i + 1 < argc) p.voxelMm = atof(argv[++i]);
         else if (!strcmp(argv[i], "-azmode") && i + 1 < argc) p.azMode = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "-reach") || !strcmp(argv[i], "-kin")) && i + 1 < argc) {
+            // 0 = 不要求可达：只查几何（喷距/倾角/枪体），不解 IK、不查连杆与自碰撞。
+            // 点云不是给当前机器人型号用时（臂展/站位都不对）就关掉它，别让可达率
+            // 把"轨迹铺得对不对"盖过去。
+            reach = atoi(argv[++i]) != 0;
+        }
         else if (!strcmp(argv[i], "-quiet")) quiet = true;
+        else if ((!strcmp(argv[i], "-fast") || !strcmp(argv[i], "-onepass")) && i + 1 < argc) {
+            // 1 = 单次逆解：姿态纯解析（倾角按法向线性、方位向上），每点只解 1 次 IK，
+            // 解不出就照实报不可达，不搜救、不回退、不做面级抽样择优。
+            // 碰撞/可达/关节/喷角四类判据一条不少，只是不再为"挑一个更好解的倾角"反复试解。
+            // 注意 fastPose 是位掩码，这里只动 bit0，不影响 -tiltmode 设的 bit1。
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_FAST;
+            else                     p.fastPose &= ~RS_POSE_FAST;
+        }
+        else if ((!strcmp(argv[i], "-tiltmode") || !strcmp(argv[i], "-tiltperp")) && i + 1 < argc) {
+            // 1 = 倾角逐点连续：tilt = tiltNonUpDeg × δ/90，δ = 法向与 +Z（正位置）夹角，
+            //     **不做面级常量**。法向连续 ⟹ 倾角连续，桶壁一圈不再被切成 0°/25° 两块。
+            // 0 = 面级常量（默认，工艺要求"面内姿态恒定"的旧口径）。
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_TILT_PERP;
+            else                     p.fastPose &= ~RS_POSE_TILT_PERP;
+        }
         else if (!strcmp(argv[i], "-base") && i + 6 < argc) {
             double x = atof(argv[i + 1]), y = atof(argv[i + 2]), z = atof(argv[i + 3]);
             double rx = atof(argv[i + 4]) * 3.14159265358979323846 / 180.0;
@@ -417,7 +458,33 @@ int main(int argc, char** argv) {
             basePose[11] = z;
             hasBase = true;
         }
+        // 重力向上方向（点云系）。不给 = 旧口径 (0,0,1)。
+        // 支持简写 -up +Y / -Y / +X ... 和显式三分量 -up 0 -1 0。
+        else if (!strcmp(argv[i], "-up") && i + 1 < argc) {
+            std::string a = argv[i + 1];
+            for (auto& ch : a) ch = (char)toupper((unsigned char)ch);
+            bool named = true;
+            if      (a == "+X") { up[0] =  1; up[1] = 0; up[2] = 0; i += 1; }
+            else if (a == "-X") { up[0] = -1; up[1] = 0; up[2] = 0; i += 1; }
+            else if (a == "+Y") { up[0] = 0; up[1] =  1; up[2] = 0; i += 1; }
+            else if (a == "-Y") { up[0] = 0; up[1] = -1; up[2] = 0; i += 1; }
+            else if (a == "+Z") { up[0] = 0; up[1] = 0; up[2] =  1; i += 1; }
+            else if (a == "-Z") { up[0] = 0; up[1] = 0; up[2] = -1; i += 1; }
+            else named = false;
+            if (!named) {
+                if (i + 3 >= argc) {
+                    printf("-up 需要 3 个分量：-up x y z（或简写 -up +Y）\n");
+                    return 2;
+                }
+                up[0] = atof(argv[i + 1]);
+                up[1] = atof(argv[i + 2]);
+                up[2] = atof(argv[i + 3]);
+                i += 3;
+            }
+            hasUp = true;
+        }
     }
+    p.requireReach = reach ? 1 : 0;
 
     TrajCsv traj;
     if (!readTraj(trajPath, traj)) {
@@ -434,10 +501,16 @@ int main(int argc, char** argv) {
         printf("参数: standoff=%.1f safety=%.1f hardClearance=%.1f search=%.1f tool=%.1f tilt=%.1f/%.1f rate=%.1f sprayAngle<=%.1f\n",
                p.standoff, p.safety, p.hardClearance, p.search, p.toolLen, p.tiltNonUpDeg, p.tiltMaxDeg,
                p.tiltRateDeg, p.maxSprayAngleDeg);
+        printf("口径: reach=%d（1=几何+运动学；0=仅几何，不解 IK）· 姿态=%s · 倾角=%s\n",
+               p.requireReach,
+               (p.fastPose & RS_POSE_FAST) ? "单次逆解" : "搜索",
+               (p.fastPose & RS_POSE_TILT_PERP) ? "逐点连续（tilt=系数×δ/90，系数见 -tilt）" : "面级常量");
     }
 
-    RobotSafetyResult r = robot_safety_check(traj.pts.data(), (int)traj.pts.size(), cloud.xyz.data(), cloud.n,
-                                             hasBase ? basePose : NULL, &p);
+    RobotSafetyResult r = robot_safety_check_up(traj.pts.data(), (int)traj.pts.size(),
+                                                cloud.xyz.data(), cloud.n,
+                                                hasBase ? basePose : NULL, &p,
+                                                hasUp ? up : NULL);
     if (r.error) {
         printf("失败: %s\n", r.error);
         robot_safety_free(&r);
@@ -504,22 +577,76 @@ int main(int argc, char** argv) {
     }
 
     // ---- 结论
-    int p0 = 0;
+    // 等级以 robot_safety.h 的 RS_VIOL_* 注释为唯一权威：
+    //   P0 = IK_FAIL / COLLISION / SELF_COLLISION / LINK_HIT / TOOL_HIT
+    //   P1 = CLEARANCE / JOINT_LIMIT / SPRAY_ANGLE
+    //   P2 = NEAR_SINGULAR / TILT_JUMP
+    // verdict 只由 P0/P1 决定 —— P2 是"注意"级，不升级结论。
+    //
+    // 这里原先用 r.violations > 0 判 WARNINGS，把 P2 也算进去了，于是出现
+    // "界面 PASS、命令行 PASS_WITH_WARNINGS"的分歧（垃圾桶件 P2=33）。同时 P0
+    // 是按类型累加、界面是按点去重（开口盒子 1112 vs 805）。现在统一成界面的口径：
+    // 每个点取命中里的最高等级、只计一次；累加值另起一行给出，便于排查。
+    static const int kLevel[RS_VIOL_COUNT] = {
+        0,  // 0 IK_FAIL         P0
+        0,  // 1 COLLISION       P0（细分后不再置位，保留以防将来启用）
+        1,  // 2 CLEARANCE       P1
+        0,  // 3 SELF_COLLISION  P0
+        1,  // 4 JOINT_LIMIT     P1
+        1,  // 5 SPRAY_ANGLE     P1
+        2,  // 6 NEAR_SINGULAR   P2
+        2,  // 7 TILT_JUMP       P2
+        0,  // 8 LINK_HIT        P0
+        0,  // 9 TOOL_HIT        P0
+        2   // 10 STEP_JUMP      P2（相邻 TCP 步长，跨行/跨换段也查）
+    };
+    int acc[3] = {0, 0, 0};      // 按类型累加（同一点可进多个桶）
     for (int b = 0; b < RS_VIOL_COUNT; ++b) {
         const char* nm = robot_safety_rule_name(1u << b);
-        // P0：不可达 / 自碰撞 / 连杆撞 / 枪体撞。COLLISION(1) 已被 LINK_HIT/TOOL_HIT 细分，
-        // 本层不再置位，所以这里不把它算进 P0（否则 byRule[1] 恒为 0，算了也没意义）。
-        bool isP0 = (b == 0 || b == 3 || b == 8 || b == 9);
-        if (isP0) p0 += r.byRule[b];
+        int lv = kLevel[b];
+        acc[lv] += r.byRule[b];
         if (r.byRule[b] > 0 && !quiet) {
-            printf("  %-15s %7d  [%s]\n", nm ? nm : "?", r.byRule[b], isP0 ? "P0" : "P1/P2");
+            printf("  %-15s %7d  [P%d]\n", nm ? nm : "?", r.byRule[b], lv);
         }
     }
-    const char* verdict = (p0 > 0) ? "REJECT" : (r.violations > 0 ? "PASS_WITH_WARNINGS" : "PASS");
-    printf("结论: %s  (P0=%d)\n", verdict, p0);
-    printf("  %d 点 · 可达 %d (%.1f%%) · 倾斜 %d 点 (均值 %.1f° p95 %.1f° 最大 %.1f°)\n", r.count, r.reachable,
-           r.count ? 100.0 * r.reachable / r.count : 0.0, r.tiltedPoints, r.tiltMeanDeg, r.tiltP95Deg,
-           r.tiltMaxDeg);
+    int pts[3] = {0, 0, 0};      // 按点去重：该点取命中的最高等级
+    // 同时按「喷涂点 / 空移点」拆开数。空移段现在按点距铺满（每 4mm 一个 spray=0 点），
+    // 于是它也被逐点判 IK/碰撞 —— 以前空移段只有几个拐点，这一层几乎等于没查。
+    // 两类的含义完全不同，混在一个 P0 里会被误读成"喷涂变差了"：
+    //   喷涂点 P0 = 这个位姿喷不了（要改工艺/姿态）；
+    //   空移点 P0 = 这条路走不通（要改空移路径/站位，不动喷涂）。
+    int ptsS[3] = {0, 0, 0}, ptsM[3] = {0, 0, 0};
+    for (int i = 0; i < r.count; ++i) {
+        unsigned int v = r.points[i].violation;
+        if (!v) continue;
+        int lv = 2;
+        for (int b = 0; b < RS_VIOL_COUNT; ++b) {
+            if ((v & (1u << b)) && kLevel[b] < lv) lv = kLevel[b];
+        }
+        ++pts[lv];
+        if (r.points[i].spray) ++ptsS[lv]; else ++ptsM[lv];
+    }
+    const char* verdict = (pts[0] > 0) ? "REJECT" : (pts[1] > 0 ? "PASS_WITH_WARNINGS" : "PASS");
+    printf("结论: %s  (P0=%d)\n", verdict, pts[0]);
+    printf("  按点去重 P0=%d P1=%d P2=%d · 按类型累加 P0=%d P1=%d P2=%d\n",
+           pts[0], pts[1], pts[2], acc[0], acc[1], acc[2]);
+    printf("  其中喷涂点 P0=%d P1=%d P2=%d · 空移点 P0=%d P1=%d P2=%d\n",
+           ptsS[0], ptsS[1], ptsS[2], ptsM[0], ptsM[1], ptsM[2]);
+    if (ptsS[0] == 0 && ptsM[0] > 0)
+        printf("  注意: P0 全部来自空移段（喷涂位姿本身没问题），改空移路径/站位即可，"
+               "不必重铺喷涂轨迹\n");
+    printf("  口径: %s\n", reach
+               ? "几何 + 运动学（可达/关节/连杆/自碰撞都查）"
+               : "仅几何（不查运动学：不解 IK、不查连杆/关节/自碰撞；可达按全部通过计）");
+    if (reach) {
+        printf("  %d 点 · 可达 %d (%.1f%%) · 倾斜 %d 点 (均值 %.1f° p95 %.1f° 最大 %.1f°)\n", r.count,
+               r.reachable, r.count ? 100.0 * r.reachable / r.count : 0.0, r.tiltedPoints, r.tiltMeanDeg,
+               r.tiltP95Deg, r.tiltMaxDeg);
+    } else {
+        // 这里绝不能打"可达 100%"：没解过 IK，那个 100% 只是记账口径
+        printf("  %d 点 · 可达 未检查 · 倾斜 %d 点 (均值 %.1f° p95 %.1f° 最大 %.1f°)\n", r.count,
+               r.tiltedPoints, r.tiltMeanDeg, r.tiltP95Deg, r.tiltMaxDeg);
+    }
     if (std::isfinite(r.minClearanceMm))
         printf("  最小表面距离 %.2fmm · 平滑回退 %d 点 · 喷距偏差 %.6fmm\n", r.minClearanceMm, r.poseReverted,
                r.standoffMaxErrMm);
@@ -537,7 +664,7 @@ int main(int argc, char** argv) {
         printf("  枪体最小表面距离 %s · 连杆最小表面距离 %s\n", ct, cl);
     }
     // 最危险连杆段（现场最关心：哪一段连杆几乎蹭到工件）
-    {
+    if (reach) {
         double worst = 1e300;
         int wk = -1, wj0 = -1, wj1 = -1, wi = -1;
         for (int i = 0; i < r.count; ++i) {
@@ -557,12 +684,12 @@ int main(int argc, char** argv) {
         else
             printf("  进刀侧：单行轨迹，按站位侧择优\n");
     }
-    if (r.baseAuto) printf("  ⚠ 基座位姿为自动假设（未给 -base），可达率与连杆碰撞结论依赖它\n");
+    if (reach && r.baseAuto) printf("  ⚠ 基座位姿为自动假设（未给 -base），可达率与连杆碰撞结论依赖它\n");
     if (r.l0Issues) printf("  ⚠ L0 输入层自检有 %d 项问题（详见 -standoff / 臂展），结论需谨慎\n", r.l0Issues);
     if (r.standoffMedianMm > 0) printf("  反推喷距中位数 %.2fmm（沿枪轴投影）\n", r.standoffMedianMm);
     printf("写出: %s\n", outPath);
 
-    int rc = (p0 > 0) ? 1 : 0;
+    int rc = (pts[0] > 0) ? 1 : 0;
     robot_safety_free(&r);
     return rc;
 }

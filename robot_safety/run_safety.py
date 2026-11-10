@@ -71,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--base-json", help="4x4 矩阵 JSON（T_base_in_cloud）")
     ap.add_argument("--no-tilt", action="store_true", help="完全不加倾斜角（出「现状」基线）")
     ap.add_argument("--no-fix-transit", action="store_true", help="过渡点碰撞不做抬升修正")
+    ap.add_argument("--no-reach", action="store_true",
+                    help="不要求可达：只查几何（喷距/倾角/枪体碰撞），不解 IK、不查连杆与自碰撞。"
+                         "点云不是给当前机器人型号/站位用时加它")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
@@ -104,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         link_stride=max(1, args.link_stride),
         fix_transit=not args.no_fix_transit,
         az_fallback=not args.no_tilt,
+        require_reach=not args.no_reach,
     )
 
     try:
@@ -166,7 +170,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"结论 {verdict['verdict']}   P0={sum(1 for v in res.violations if v['severity'] == 'P0')}  "
           f"P1={sum(1 for v in res.violations if v['severity'] == 'P1')}  "
           f"P2={sum(1 for v in res.violations if v['severity'] == 'P2')}")
-    print(f"可达 {res.stats['reach_fraction'] * 100:.1f}% · 喷角 均值 {res.stats['tilt_mean_deg']:.1f}° "
+    # 可达率只在「要求可达」时才是真测出来的；关掉运动学后绝不能打 100%，
+    # 那只是记账口径（planner 把 reachable 填成 n），会让人以为测过了。
+    reach_txt = (f"可达 {res.stats['reach_fraction'] * 100:.1f}%"
+                 if res.stats.get("reach_checked", True) else "可达 未检查（仅几何口径）")
+    print(f"{reach_txt} · 喷角 均值 {res.stats['tilt_mean_deg']:.1f}° "
           f"p95 {res.stats['tilt_p95_deg']:.1f}° 最大 {res.stats['tilt_max_deg']:.1f}° · "
           f"喷距偏差 {res.stats['standoff_max_err_mm']:.6f}mm")
     if res.stats.get("pose_reverted"):
