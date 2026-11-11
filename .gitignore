@@ -107,3 +107,4 @@ baseline_tmp/obj/
 # 一次性探针工具：只留工程与源码
 tools/DensoIkProbe/bin/
 tools/DensoIkProbe/obj/
+tools/DensoIkProbe/out/
