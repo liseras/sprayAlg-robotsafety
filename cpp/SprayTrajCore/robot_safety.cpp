@@ -654,7 +654,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
 
 struct Sizing {
     double jointR, joint1R, linkR, wristLinkR, baseColumnR, baseNeckR;
-    double gripR, toolPipeR, nozzleR;
+    double gripR, toolPipeR;
 };
 
 Sizing sizingFrom(double reach) {
@@ -667,12 +667,10 @@ Sizing sizingFrom(double reach) {
     s.baseNeckR = s.jointR * 1.15;
     s.gripR = s.jointR * 0.62;
     s.toolPipeR = s.gripR * 0.45;
-    s.nozzleR = s.gripR * 0.30;
     return s;
 }
 
 constexpr double kGripFraction = 0.72;    // 握把占「法兰→TCP」全长比例
-constexpr double kNozzleFraction = 0.18;  // 喷嘴伸出 TCP 的比例
 
 enum SegGroup { SG_TOOL = 0, SG_LINK = 1, SG_JOINT = 2, SG_BASE = 3 };
 
@@ -685,7 +683,18 @@ struct Seg {
     int kind;      // RS_SEG_*，用于把「最近部位」报成人能看懂的名字
 };
 
-// 只造工具段（握把 + 细管 + 喷嘴）。
+// 只造工具段（握把 + 细管）。
+//
+// **枪长 toolLen 已经把喷嘴包含在内**：toolLen 的定义是「法兰面 → 喷嘴出口」，喷嘴出口
+// 就是 TCP。所以枪体几何只有「法兰 → TCP」这 450mm 一段实体，**TCP 之外没有任何东西**。
+//
+// 这里踩过一次严重的坑：曾在 TCP 之外再加一段 "喷嘴" 胶囊（tip = tcp + u*(L*0.18)），
+// 等于沿枪轴朝工件又伸了 0.18×450 = 81mm，半径 8.56mm。喷距 standoff=100 是从 TCP 量的，
+// 于是 100mm 里有 81mm 被这段凭空的胶囊吃掉，剩下 19mm 再减半径——
+// 槽型盘悬挂 1467 点报出「枪体撞 398 点、最小表面距离 −5.33mm」，而 3D 视图里枪离工件
+// 明明有 100mm。改成不虚构后，同一份数据最差间隙 +69.39mm、0 穿透，完全印证那 398 个
+// P0 全是假阳性。不要再把"喷嘴"当成枪长之外的一段加回来。
+//
 // 为什么单独抽出来：**枪体的位置由「目标 TCP + 枪轴」解析确定，与机器人型号/基座/IK 全都无关**
 // —— 法兰就在 TCP 沿枪轴退 toolLen 的地方。所以"枪会不会戳进工件"这一条在
 // 「要求可达」和「不要求可达」两种模式下是同一个判据、同一份几何，不依赖 IK 解。
@@ -698,11 +707,9 @@ void buildToolSegs(const V3& flange, const V3& tcp, const Sizing& sz, std::vecto
     double L = norm(d);
     if (L <= 0.5) return;
     V3 u = d * (1.0 / L);
-    V3 neck = flange + u * (L * kGripFraction);
-    V3 tip = tcp + u * (L * kNozzleFraction);
+    V3 neck = flange + u * (L * kGripFraction);   // 握把末端：枪身由粗变细的地方
     out.push_back({flange, neck, sz.gripR, SG_TOOL, -1, -1, "工具握把", RS_SEG_GRIP});
     out.push_back({neck, tcp, sz.toolPipeR, SG_TOOL, -1, -1, "工具细管", RS_SEG_PIPE});
-    out.push_back({tcp, tip, sz.nozzleR, SG_TOOL, -1, -1, "喷嘴", RS_SEG_NOZZLE});
 }
 
 void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vector<Seg>& out) {
@@ -730,7 +737,6 @@ std::string segName(int kind, int j0, int j1) {
     switch (kind) {
         case RS_SEG_GRIP:      return "工具握把";
         case RS_SEG_PIPE:      return "工具细管";
-        case RS_SEG_NOZZLE:    return "喷嘴";
         case RS_SEG_BASE_COL:  return "底座立柱";
         case RS_SEG_BASE_NECK: return "底座颈";
         case RS_SEG_JOINT:
@@ -1067,6 +1073,10 @@ struct Params {
     // true = 倾角逐点连续：倾角只由该点法向决定（tilt = tiltNonUpDeg × δ/90），
     // 不做面级常量。见 robot_safety.h 里 RS_POSE_TILT_PERP 的说明。
     bool tiltPerPoint = false;
+    // true = 逐点解析救 J5：倾角与方位都由「前臂方向 ⊕ 法向」解析反推，
+    // 目标是让 |θ5| 留够 jointMarginMin 余量。见 robot_safety.h 里 RS_POSE_TILT_J5 的说明。
+    // 与 tiltPerPoint 同时置位时优先本模式。
+    bool tiltJ5 = false;
     // 点云系里的「重力向上」单位向量。**默认 (0,0,1) = 旧口径，逐字节不变**。
     //
     // 为什么需要显式给：倾角口径里"正位置/朝上"是相对**重力**定义的，而点云是相机系，
@@ -1172,6 +1182,8 @@ public:
     V3 toCloudR(const V3& v) const { return m3mul(baseR_, v); }
     // 基座原点（点云系）。方位决策要用它判"机器人从哪一侧够过来"。
     V3 baseOrigin() const { return baseT_; }
+    // 基座→点云系的旋转矩阵。逐点救 J5 要把基座系里的前臂方向转到点云系。
+    const M3& baseR() const { return baseR_; }
 
     // 给定枪身朝外方向 d（倾斜后的法向 n'），求 IK + 碰撞 + 自碰撞。
     // **工具 +Z 是 −d**：d 是从工件指向枪的外法向，工具 +Z 是喷射方向（法兰→喷嘴）= −d。
@@ -1361,6 +1373,115 @@ inline void tiltAxisAndDir(const V3& nIn, const V3& ref, V3& axis, V3& uUp) {
     axis = unit(cross(n, uUp));
 }
 
+// 永不退化的切平面基。与 tiltAxisAndDir 的唯一区别：ref 与法向几乎平行时**不返回零向量**，
+// 而是换一个世界轴兜底，保证「倾斜」在这个面上仍然有定义。
+//
+// 为什么必须有这个：tiltAxisAndDir 退化时返回零向量，调用方一律把 tilt 归 0、az 只有 0
+// —— 于是朝上的大平面（法向 ∥ 重力）上"倾角"这个自由度被彻底关掉。实测 big（煤气灶背板
+// 平放，枪轴与 −Z 夹角中位仅 3.9°）退化率 **100%**，tilt 唯一值只有 0°、
+// 9761 个喷涂点里非零倾角的点 0 个；而它恰恰是 J5 贴限位最严重的一件（−5.23°）。
+// 也就是说：唯一能救它的杠杆，被退化判据关掉了。
+inline void tangentBasisRobust(const V3& nIn, const V3& ref, V3& axis, V3& uUp) {
+    V3 n = unit(nIn);
+    V3 u = ref - n * dot(ref, n);
+    if (norm(u) < std::sin(5.0 * kDeg)) {
+        // ref 与 n 近平行 → 取三个世界轴里「投影最长」的那个当参考，必定可用
+        const V3 cands[3] = {V3(1, 0, 0), V3(0, 1, 0), V3(0, 0, 1)};
+        double bestL = -1.0;
+        V3 bestU(0, 0, 0);
+        for (int k = 0; k < 3; ++k) {
+            V3 w = cands[k] - n * dot(cands[k], n);
+            double L = norm(w);
+            if (L > bestL) { bestL = L; bestU = w; }
+        }
+        if (bestL < 1e-9) {           // 理论上不可能（n 是单位向量）
+            axis = V3(0, 0, 0);
+            uUp = V3(0, 0, 0);
+            return;
+        }
+        u = bestU;
+    }
+    uUp = unit(u);
+    axis = unit(cross(n, uUp));
+}
+
+// ---------------------------------------------------------------- J5 的可解方向（解析）
+//
+// ⚠ 这是本文件唯一一处「用运动学结构反推姿态」的地方，别的都是几何/试解。务必读懂再改。
+//
+// 结论（推导与实测见 outputs/diag_关节限位_J5_2026-11-10.md）：
+//   |θ5| = arccos(u_z)，u = R03ᵀ·g，R03 = Rz(θ1)·Ry(θ2+θ3)
+//   R03 的第三列就是**前臂方向** a = (sin(θ2+θ3)cosθ1, sin(θ2+θ3)sinθ1, cos(θ2+θ3))
+//   于是 u_z = g·a  ⟹  **|θ5| = ∠(a, g)**
+// 也就是说：θ5 只取决于「前臂方向」与「枪轴方向」的夹角，**与绕枪轴滚转完全无关**
+// （滚转只改 θ4/θ6 的分配）。这就是为什么"多解"救不了 J5：解支只换臂构型，
+// θ5 由枪轴⊕前臂共同决定，枚举 28 个种子后最优支与当前支差中位 0.00°。
+//
+// 反过来用：**想改 θ5，唯一有效的杠杆是改枪轴方向 g**（= 改倾斜方向/倾角）。
+// 固定 TCP 与喷距时，枪轴只能在「绕面点、半径 standoff」的球面上动：
+//   g = −(cosT·n + sinT·U)
+// 最大化 |a·g| 关于 U 的一阶条件给出
+//   U* = −a_T/|a_T|，  a_T = a − n(a·n)   （前臂在切平面上的投影，**取反**）
+// 代回得到闭式：
+//   θ5(T) = arccos(−a_n·cosT + |a_T|·sinT)
+// 注意 **不取绝对值**：u_z 可为负，θ5∈[0,180]，取绝对值会把 −0.577 的 125.2° 误算成 54.8°。
+// 物理直觉：|θ5| 小 = 腕子伸直 = 工具轴与前臂同向；所以要让枪轴"顺着前臂伸出去"。
+//
+// 退化：|a_T| ≈ 0（前臂垂直于面）时倾斜对 θ5 完全无效 —— 这是结构死结，
+// 只能换站位/换喷距，不是角度能救的。此时返回 norm(axis)=0，调用方按老路径走。
+
+// 由关节角（度）取基座系前臂方向 a。θ4/θ5/θ6 不参与 —— 这正是"滚转无效"的体现。
+inline V3 forearmDirOf(const double thetaDeg[6]) {
+    const double t1 = thetaDeg[0] * kDeg;
+    const double t23 = (thetaDeg[1] + thetaDeg[2]) * kDeg;
+    const double s23 = std::sin(t23);
+    return V3(s23 * std::cos(t1), s23 * std::sin(t1), std::cos(t23));
+}
+
+// 给定法向与目标关节余量，解析求「最省倾角的救 J5 倾斜方向」。
+//   nC  : 点云系外法向（= −gun）
+//   nB  : 同一法向在**基座系**下的表示
+//   aB  : 基座系前臂方向（forearmDirOf 的结果）
+//   marginTargetDeg : 期望把 |θ5| 压到多少度以内（限位 120°，通常给 120−余量）
+//   maxTiltDeg      : 工艺/安全允许的最大倾角
+// 输出：outTiltNeed（解除 θ5 危机所需最小倾角；-1 表示无解/退化）
+// 返回 true 表示算出了有效倾角需求。**最优倾斜方向由调用方按 nC 现算**
+// （切平面内 a_T 方向），因为把基座系方向转回点云系需要旋转矩阵，绕一圈只是引入误差。
+//
+// 方向约定：dirOf 里 uUp 是"绕 n 的起始方向"、az 是相对它的右手转角。调用方把
+// uUp 直接设成 U*、az 设 0，就等价于「方位指向前臂反方向」，不必再走 stanceAzDeg 的启发式。
+inline bool j5RescueTilt(const V3& nB, const V3& aB,
+                         double marginTargetDeg, double maxTiltDeg,
+                         double& outTiltNeed) {
+    // 前臂在**基座系**切平面上的投影（推导全在基座系里成立）
+    const double an = dot(aB, nB);
+    const double at = norm(aB - nB * an);
+    // 退化判据：切向分量 < cos(85°) ⟹ 前臂几乎垂直于面，倾斜改不动 θ5（结构死结）
+    if (at < 0.0872) return false;
+
+    const double R = std::sqrt(an * an + at * at);   // = |aB|
+    if (R < 1e-9) return false;
+    double C = std::cos(marginTargetDeg * kDeg);
+    C = std::max(-1.0, std::min(1.0, C / R));
+    // θ5(T) = arccos(R·cos(T − φ))，φ = atan2(at, −an)
+    const double phiDeg = std::atan2(at, -an) * kRad;
+    const double dPhiDeg = std::acos(C) * kRad;
+    // 两个根里取最小的非负根 = 最省倾角的解
+    double best = 1e300;
+    for (int s = -1; s <= 1; s += 2) {
+        double T = phiDeg + s * dPhiDeg;
+        if (T > 180.0) T -= 360.0;
+        if (T >= -1e-9 && T < best) best = T;
+        if (T + 360.0 <= maxTiltDeg + 1e-9 && T + 360.0 < best) best = T + 360.0;
+    }
+    if (best > maxTiltDeg) {
+        // 目标余量在倾角预算内够不着：退而求其次，取预算上限（能救多少救多少）
+        best = maxTiltDeg;
+    }
+    outTiltNeed = best;
+    return true;
+}
+
 // 该法向**需要多大倾角**（0 = 正对基准方向，α=90° 侧壁时给满 tiltNonUpDeg）。
 // 抽成独立函数是因为行级方位打分也要用它 —— 两处若各写一份，
 // 打分用的倾角和真正执行的倾角会悄悄分叉，A/B 结论就不可信了。
@@ -1405,6 +1526,103 @@ inline double stanceAzDeg(const V3& nIn, const V3& face, const V3& base,
 }
 
 // ================================================================ 主规划
+
+// ---------------------------------------------------------------- 逐点解析救 J5
+//
+// 本函数是整个 RS_POSE_TILT_J5 模式的决策核心：给定一个喷涂点，直接算出
+// 「该用哪个倾斜方向、倾多大角」，使得 |θ5| 留够余量、且倾角尽量小。
+//
+// 三个输入决定一切：
+//   · 外法向 n          → 枪轴只能绕它所在的切平面偏
+//   · 前臂方向 a        → |θ5| = ∠(a, g)，a 由 θ1、θ2+θ3 给出（与腕部无关）
+//   · 关节余量目标      → 把 |θ5| 压到 (120° − jointMarginMin) 以内
+//
+// 输出 (tilt, az)：az 是相对**稳健切平面基**（tangentBasisRobust 的 uUp）的方位角，
+// 由 U* = −a_T 反算得到。因为 a 逐点连续，U* 与 tilt 也逐点连续 —— 姿态可以随点变，
+// 但不会来回甩腕。这是它相对"面级常量"的核心优势，也是用户明确要求的口径。
+//
+// 注意：本函数**不解 IK**。它是纯几何+运动学的解析解，所以可以放心在阶段 1 逐点调用
+// （10 万点也只是一次乘加）。能不能真解出来，仍由阶段 3 的 IK 说了算。
+struct J5Plan {
+    bool valid = false;      // false = 退化（前臂垂直于面）或已在目标内
+    double tiltDeg = 0.0;
+    double azDeg = 0.0;
+    double j5PredDeg = 180.0;   // 预测的 |θ5|（便于诊断输出）
+};
+
+// ⚠ 三个方向参数的坐标系归属必须分清（这里踩过一次）：
+//   nCloud = 点云系外法向（t.normal(i)）；aBase/nBase = 基座系。
+//   把基座系的 n 当点云系用，会让 aT 的切向分解在错误平面上做，方位角整体偏掉。
+inline J5Plan planTiltForJ5(const V3& nCloud, const V3& aBase, const V3& nBase,
+                            const M3& baseR,   // 基座系→点云系的旋转
+                            const Params& p) {
+    J5Plan out;
+    if (p.jointMarginMin <= 0.0 && p.tiltMaxDeg <= 0.0) return out;
+    // J5 限位 ±120°（上下对称，取小的那侧）
+    const double j5Lim = std::min(std::fabs(kJoints[4].hi), std::fabs(kJoints[4].lo));
+    // 目标：留出 jointMarginMin + 1° 的缓冲。多给的这 1° 是留给「IK 收敛后 θ5
+    // 与解析值有零点几度偏差」的，不然算出来刚好卡线、实解又掉出去。
+    const double tgt = j5Lim - std::max(0.0, p.jointMarginMin) - 1.0;
+    if (tgt <= 1.0) return out;
+
+    const V3 aU = unit(aBase), nU = unit(nBase);
+    const V3 nC = unit(nCloud);
+    const double an = dot(aU, nU);
+    const double at = std::sqrt(std::max(0.0, 1.0 - an * an));
+
+    // ---- 0) 先看**当前会执行的姿态**下 θ5 是多少。不紧张就别动 —— 这是本次改动的关键。
+    //
+    // 判据用 tilt=0 的枪轴（g = −n），因为「非危机点就 tilt=0」是本模式对非危机点的
+    // 唯一承诺（见阶段 2 的说明）。用别的东西当"现状"会和执行口径分叉。
+    const double c0 = dot(aU, -nU);
+    const double j5Now = std::acos(std::max(-1.0, std::min(1.0, c0))) * kRad;
+    if (j5Now <= tgt) return out;                // 已在目标内 → 不倾斜（valid=false）
+
+    // ---- 1) 解析求「把 |θ5| 压到 tgt 所需的最小倾角」（全在基座系里算）
+    double tiltNeed = 0.0;
+    if (!j5RescueTilt(nU, aU, tgt, p.tiltMaxDeg, tiltNeed)) return out;
+
+    // ---- 2) 最优倾斜方向 U* = −a_T（切平面内、指向前臂反方向）
+    // baseR 的列就是基座轴在点云系下的表示，所以点云系 a = baseR · aBase。
+    const V3 aC = unit(m3mul(baseR, aU));
+    V3 aT = aC - nC * dot(aC, nC);
+    const double atLen = norm(aT);
+    if (atLen < 0.0872) return out;          // 与 j5RescueTilt 同口径的退化判据
+    aT = aT * (-1.0 / atLen);                // U*
+
+    // ---- 3) 用稳健切平面基表达 U* 的方位角
+    V3 axis, uUp;
+    tangentBasisRobust(nC, p.upW, axis, uUp);
+    if (norm(uUp) < 1e-6) return out;
+    double az = std::atan2(dot(aT, axis), dot(aT, uUp)) * kRad;
+    while (az <= -180.0) az += 360.0;
+    while (az > 180.0) az -= 360.0;
+
+    // ---- 4) 倾角：解析值优先，但受工艺喷角上限约束
+    // 工艺上喷角 ≡ 倾角（d 是 n 绕切向轴转 tilt），不能为了救 J5 把喷角无限放大。
+    // 解析需求超过上限时取上限：能救多少救多少，救不回来的由阶段 3 / 报告如实暴露。
+    double tilt = tiltNeed;
+    if (tilt > p.maxSprayAngleDeg) tilt = p.maxSprayAngleDeg;
+    if (tilt > p.tiltMaxDeg) tilt = p.tiltMaxDeg;
+
+    // ---- 5) 预测该姿态下的 |θ5|，并做「不许更差」的单调性保护
+    // U* 与 a_T 反向，故 a·g = −a_n·cosT + |a_T|·sinT
+    double c = -an * std::cos(tilt * kDeg) + at * std::sin(tilt * kDeg);
+    c = std::max(-1.0, std::min(1.0, c));
+    out.j5PredDeg = std::acos(c) * kRad;
+
+    // ⚠ 保护：解析解只在**真的把 θ5 拉回来**时才采纳。
+    // 目标值 tgt 是"上限"，但倾角受 maxSprayAngleDeg 钳制后可能落在
+    // 「把 θ5 推得更远」的那一侧（闭式解有正负两支，取小正值不一定单调改善）。
+    // 出现这种情况说明该点靠倾斜救不了（前臂方向不对），应当保持基线姿态、
+    // 让报告如实暴露，而不是执行一个更糟的姿态。实测 big 就有点落在这一侧。
+    if (out.j5PredDeg >= j5Now - 1e-6) return out;
+
+    out.valid = true;
+    out.tiltDeg = tilt;
+    out.azDeg = az;
+    return out;
+}
 
 struct VioCount {
     int byRule[RS_VIOL_COUNT] = {0};
@@ -1724,6 +1942,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         p.azStance = (s.azMode != 1);
         p.fastPose = (s.fastPose & RS_POSE_FAST) != 0;
         p.tiltPerPoint = (s.fastPose & RS_POSE_TILT_PERP) != 0;
+        p.tiltJ5 = (s.fastPose & RS_POSE_TILT_J5) != 0;
         p.tiltSideX = s.tiltSideX;
     }
 
@@ -1885,6 +2104,12 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
 
     // ---- 阶段 1：每点的倾角需求（带 IK 种子连续性）
     std::vector<double> need(n, 0.0), azOf(n, 0.0);
+    // 逐点救 J5 用的「基线 |θ5|」记录（诊断用）。
+    // ⚠ 这里**只留诊断数组**：J5 的倾角/方位不再由阶段 1 预算并存下来，
+    //   而是由阶段 3.6 在拿到真实执行位姿之后现场算（见阶段 3.6 的说明）。
+    //   历史教训：第一版在这里预算 (tiltJ5, azJ5) 并在阶段 2 覆盖基线，
+    //   等于让 J5 取代基线 —— complex 关节步长 47→93、longstripe P0 2→22。
+    std::vector<float> j5Base(n, 0.0f);
     std::vector<char> hasCache(n, 0);
     std::vector<PR> cache(n);
     std::vector<char> hasPrevSol(n, 0);
@@ -2462,6 +2687,19 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     int azChangedRows = 0;
     for (size_t r = 0; r < azRow.size(); ++r)
         if (std::fabs(azRow[r]) > 1e-9) ++azChangedRows;
+
+    // 统一取「第 i 点的方位角」。
+    // ⚠ 这里**不区分 J5 模式**：J5 现在是叠加层（见阶段 3.6），基线阶段一律走行级 azRow。
+    //   第一版在这里按 p.tiltJ5 分流到逐点数组，等于让 J5 模式绕过基线方位决策 ——
+    //   那是"取代"而不是"叠加"，正是复杂件退化的根源。
+    auto azAt = [&](int i) -> double {
+        return (rowOf[i] >= 0) ? azRow[rowOf[i]] : 0.0;
+    };
+    // 统一取「切平面基」。基线一律用原判据（退化→倾角无意义，恒 0），
+    // 与 needTilt/tiltNeedDeg 的退化口径一致。J5 叠加层自己用 tangentBasisRobust。
+    auto basisAt = [&](const V3& nrm, V3& axis, V3& uUp) {
+        tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+    };
     if (g_prof.on) {
         int nonZeroPts = 0;
         for (int i = 0; i < n; ++i)
@@ -2622,10 +2860,10 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 const V3 nrm = t.normal(i);
                 const V3 face = t.pos[i] + t.gun[i] * Sw;
                 V3 axis, uUp;
-                tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+                basisAt(nrm, axis, uUp);
                 if (norm(uUp) < 1e-6) continue;   // 法向退化时 dirOf 恒返回 n，tilt 无效
                 ++changed;
-                const double az = (rowOf[i] >= 0) ? azRow[rowOf[i]] : 0.0;
+                const double az = azAt(i);
                 auto clrAt = [&](double tt) {
                     PR pr;
                     evTool.eval(face, dirOf(nrm, uUp, axis, tt, az),
@@ -2664,9 +2902,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 V3 prevT(0, 0, 0);
                 for (int i = rn.first; i <= rn.second; ++i) {
                     const V3 nrm = t.normal(i);
-                    const double az = (rowOf[i] >= 0) ? azRow[rowOf[i]] : 0.0;
+                    const double az = azAt(i);
                     V3 axis, uUp;
-                    tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+                    basisAt(nrm, axis, uUp);
                     if (norm(uUp) < 1e-6) { hasPrev = false; continue; }
                     const V3 dd = dirOf(nrm, uUp, axis, finalTilt[i], az);
                     const V3 T = t.pos[i] + (dd - nrm) * Sw;
@@ -2752,10 +2990,10 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             V3 nrm = t.normal(i);
             V3 face = t.pos[i] + t.gun[i] * p.standoff;
             double tilt = finalTilt[i];
-            double az = rowOf[i] >= 0 ? azRow[rowOf[i]] : 0.0;
+            double az = azAt(i);
 
             V3 axis, uUp;
-            tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
+            basisAt(nrm, axis, uUp);
             if (norm(uUp) < 1e-6) {
                 axis = V3(0, 0, 0);
                 uUp = V3(0, 0, 0);
@@ -3076,7 +3314,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             if (b - a < 1) continue;   // 单点段没有阶梯可压
 
             const double faceTilt = finalTilt[a];
-            const double faceAz = (ri >= 0) ? azRow[ri] : 0.0;
+            const double faceAz = azAt(a);
             std::vector<std::pair<double, double>> cands;
             auto addCand = [&](double t2, double z2) {
                 for (const auto& c : cands)
@@ -3098,7 +3336,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     V3 nrm = t.normal(k);
                     V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
                     V3 ax, up;
-                    tiltAxisAndDir(nrm, p.tiltRefW, ax, up);
+                    basisAt(nrm, ax, up);
                     if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
                     V3 d2 = dirOf(nrm, up, ax, cands[ci].first, cands[ci].second);
                     bool checkLinks = (k % std::max(1, p.linkStride) == 0);
@@ -3131,7 +3369,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 V3 nrm = t.normal(k);
                 V3 fpt = t.pos[k] + t.gun[k] * p.standoff;
                 V3 ax, up;
-                tiltAxisAndDir(nrm, p.tiltRefW, ax, up);
+                basisAt(nrm, ax, up);
                 if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
                 V3 d2 = dirOf(nrm, up, ax, bTilt, bAz);
                 bool checkLinks = (k % std::max(1, p.linkStride) == 0);
@@ -3182,6 +3420,245 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         }
         azStanceRows = 0;
         for (char c : applied) if (c) ++azStanceRows;
+    }
+
+    // ---- 阶段 3.6：逐点解析救 J5（RS_POSE_TILT_J5）—— **叠加层**
+    //
+    // 这一段的定位必须先说清楚，否则很容易又写回"另一套姿态方案"：
+    //
+    //   **基线（面级常量 / 逐点连续）负责"够得着、不撞、喷角合规"。J5 只在
+    //   「θ5 贴限位」这一件事上做局部修补。修补不了的保持基线姿态、如实报 P0。**
+    //
+    // 为什么必须是叠加而不是并列：第一版把 J5 做成阶段 2 的头号分支，非危机点一律
+    // tilt=0，等于用一次局部修补推翻整套基线。代价实测（9 算例 A/B）：
+    //   · complex：基线全点 6.21° 倾角被抹成 0，阶段 3 靠回退硬撑，关节步长>5° 47→93；
+    //   · longstripe：基线 40° 倾角是把枪伸进窄槽的避障刚需，抹成 0 后连杆撞件，
+    //     P0 从 2 涨到 22（LINK_HIT 20 点）；
+    //   · longwide：基线 2.81° 是抬出浅槽用的，抹 0 后 7 点新增超限。
+    // 三个算例的退化源头完全一样：**把非危机点的基线姿态丢掉**。
+    //
+    // 所以现在的顺序是：基线跑完 → 阶段 3 已拿到每点真实执行位姿（results[]）→
+    // 这里只在「θ5 超出目标」的点上，用解析解**替换该点的 (tilt, az)**，
+    // 其余点一个字节都不动。
+    //
+    // 判据用 results[i].theta —— 这是**真正会下发给机器人**的关节角，不是种子、
+    // 不是近似。第一版图省时间用 analyticSeeds 估前臂方向，实测与真值差中位 28.6°、
+    // 最大 59°，直接导致 big 上 8005/9761 点被误判成危机点、关节步长>5° 从 3 涨到 407。
+    //
+    // 三个已知边界（踩过，别再踩）：
+    //   ① 退化面（前臂近乎垂直于面，|a_T|<cos85°）倾斜对 θ5 无效，是结构死结 → 跳过；
+    //   ② 危机点方位逐点独立算会跨 ±180 翻转、实机拧腕 → 段内取同一空间方向（圆均值）；
+    //   ③ 替换后的姿态必须重新过 hardOk，过不了就退回基线（不许为了救 J5 制造撞件）。
+    int j5Rescued = 0, j5Rejected = 0, j5Segs = 0;
+    if (p.tiltJ5) {
+        std::vector<double> j5T(n, 0.0), j5A(n, 0.0);
+        std::vector<char> j5Hit(n, 0);
+        // |θ5| 的目标：限位 120° 减去要求余量，再留 1° 给 IK 收敛误差
+        const double j5Lim = std::min(std::fabs(kJoints[4].hi), std::fabs(kJoints[4].lo));
+        const double j5Tgt = j5Lim - std::max(0.0, p.jointMarginMin) - 1.0;
+
+        if (j5Tgt > 1.0) {
+            // ---- 步骤 1：逐点判定 + 解析规划（只读 results[]，不写任何东西）
+            for (int i = 0; i < n; ++i) {
+                if (!t.spray[i] || !hasResult[i] || !results[i].ikOk) continue;
+                // 基线下的真实 |θ5|
+                const double j5Now = std::fabs(results[i].theta[4]);
+                j5Base[i] = (float)j5Now;
+                if (j5Now <= j5Tgt) continue;          // 基线已经够安全 → 不动
+
+                const V3 aBase = forearmDirOf(results[i].theta);
+                const V3 nBase = ev.toBaseV(t.normal(i));
+                // 第 1 参 = 点云系法向（算方位要用点云系切平面基），第 3 参 = 基座系（解析倾角）
+                const J5Plan pl = planTiltForJ5(t.normal(i), aBase, nBase, ev.baseR(), p);
+                if (!pl.valid) { ++j5Rejected; continue; }
+                j5T[i] = pl.tiltDeg;
+                j5A[i] = pl.azDeg;
+                j5Hit[i] = 1;
+            }
+
+            // ---- 步骤 2：危机点按连续段分组，段内统一倾斜方向（枪轴必须连续）
+            //
+            // 逐点独立用 U* 会让方位在相邻点间跳几十度（实测同一面上 74.5°→69.0°→111.2°→59.1°，
+            // 还有跨 ±180 的翻转），落到实机上就是沿轨迹反复拧腕。但**倾角不能统一**：
+            // 每个点需要的倾角是它自己解出来的，强行统一会把"刚好够"的点推到撞件。
+            const int kGap = 2;                        // 允许夹 ≤2 个非危机点仍算同段
+            int i = 0;
+            while (i < n) {
+                if (!j5Hit[i]) { ++i; continue; }
+                const int a = i;
+                int b = i;
+                while (b + 1 < n) {
+                    int k = b + 1;
+                    while (k < n && !j5Hit[k]) ++k;
+                    if (k < n && k - b - 1 <= kGap && rowOf[k] == rowOf[a]) b = k;
+                    else break;
+                }
+                i = b + 1;
+
+                // 段内方位用**空间方向**求圆均值，而不是角度平均
+                // （179° 与 −179° 直接平均得 0°，方向完全反了）
+                V3 usum(0, 0, 0);
+                int cnt = 0;
+                for (int k = a; k <= b; ++k) {
+                    if (!j5Hit[k]) continue;
+                    const V3 nrm = t.normal(k);
+                    V3 axis, uUp;
+                    tangentBasisRobust(nrm, p.upW, axis, uUp);
+                    if (norm(uUp) < 1e-6) continue;
+                    const double r = j5A[k] * kDeg;
+                    usum = usum + uUp * std::cos(r) + axis * std::sin(r);
+                    ++cnt;
+                }
+                if (cnt == 0 || norm(usum) < 1e-6) continue;
+                usum = unit(usum);
+                // 各点法向不同 → 同一个空间方向的 az 也不同，逐点反算回来
+                for (int k = a; k <= b; ++k) {
+                    if (!j5Hit[k]) continue;
+                    const V3 nrm = t.normal(k);
+                    V3 axis, uUp;
+                    tangentBasisRobust(nrm, p.upW, axis, uUp);
+                    if (norm(uUp) < 1e-6) continue;
+                    V3 uu = usum - nrm * dot(usum, nrm);
+                    if (norm(uu) < 1e-6) continue;
+                    uu = unit(uu);
+                    j5A[k] = std::atan2(dot(uu, axis), dot(uu, uUp)) * kRad;
+                }
+                ++j5Segs;
+            }
+
+            // ---- 步骤 3：逐点试执行，过 hardOk 才采纳
+            //
+            // 这是「不许把 J5 危机换成撞件」的唯一保障。注意必须用**本点前一点的
+            // 已定结果**当 IK 种子（种子链），冷启会让本来连续的解跳到另一支。
+            //
+            // 采纳失败分因记录（RS_DBG_J5=1 打印），因为三类失败的处置完全不同：
+            //   IK 失败   → 解析方向本身不可达，只能退回基线；
+            //   硬约束    → 解析方向撞件/推别的关节超限，值得在附近搜一次方位（见下）；
+            //   θ5 未改善 → 该点前臂方向不对，倾斜救不了，老实退回。
+            int rejIk = 0, rejHard = 0, rejWorse = 0, rejSing = 0, azFb = 0;
+            const bool dbgJ5 = std::getenv("RS_DBG_J5") != nullptr;
+
+            // 尝试一个 (tilt, az) 并判定是否可采纳。
+            // 返回 0=可采纳 1=IK失败 2=硬约束 3=θ5未改善 4=腕部奇异。可采纳时写入 out。
+            auto tryOne = [&](int idx, double tilt, double az, PR& out) -> int {
+                const V3 nrm = t.normal(idx);
+                const V3 face = t.pos[idx] + t.gun[idx] * p.standoff;
+                V3 axis, uUp;
+                tangentBasisRobust(nrm, p.upW, axis, uUp);
+                if (norm(uUp) < 1e-6) return 1;              // 退化基
+                const double* seed = (idx > 0 && hasResult[idx - 1]) ? results[idx - 1].theta : nullptr;
+                const bool checkLinks = (idx % std::max(1, p.linkStride) == 0);
+                PR pr;
+                if (!ev.eval(face, dirOf(nrm, uUp, axis, tilt, az), nullptr, seed, tilt, az,
+                             checkLinks, pr))
+                    return 1;                                // IK 失败
+                if (!hardOk(pr, p)) return 2;                // 硬约束
+                // ---- 腕部奇异防护（必须）
+                //
+                // |θ5| → 0 表示 5 轴伸直，这是 VS-087 的腕部奇异：J4 与 J6 轴共线，
+                // 末端姿态对 θ4/θ6 的分配完全失去约束，实机在这一点附近会出现
+                // 关节速度爆冲。hardOk **不查 cond**（cond 只报 P2 告警），
+                // 所以一个 θ5=0 的奇异解能顺利通过 hardOk —— longwide 实测就踩到了：
+                // i=788 从 θ5=−119.43° 被"救"成 θ5=0.00°、cond=0.0，margin 看着从
+                // 0.57 涨到 1.29（假改善），代价是把一个贴限位的点位换成不可执行位姿。
+                //
+                // 判据取 |θ5| ≥ 6°：VS-087 腕部奇异的实际危险带在 θ5 小于 5~8°，
+                // 取 6° 既能挡住奇异，又不会误伤真正需要小 θ5 的点（那些点根本
+                // 不会是"J5 贴限位"的危机点，进不了这个分支）。
+                constexpr double kJ5SingMin = 6.0;
+                if (std::fabs(pr.theta[4]) < kJ5SingMin) return 4;   // 奇异
+                // 容差 0.5°：目标 j5Tgt 是硬线，贴着它抖动（118.0→118.3）也算"没改善"，
+                // 为 0.3° 去改姿态不划算，还会多一次姿态跳变。
+                if (std::fabs(pr.theta[4]) >= std::fabs(results[idx].theta[4]) - 0.5) return 3;
+                pr.idx = idx;
+                pr.tiltDeg = tilt;
+                pr.azDeg = az;
+                pr.sprayAngle = angleBetweenDeg(-pr.gun, nrm);
+                out = pr;
+                return 0;
+            };
+
+            for (int i = 0; i < n; ++i) {
+                if (!j5Hit[i]) continue;
+                PR got;
+                int rc = tryOne(i, j5T[i], j5A[i], got);
+                if (rc == 0) {
+                    got.reverted = std::fabs(j5T[i] - finalTilt[i]) > 1e-6 ||
+                                   std::fabs(j5A[i] - azAt(i)) > 1e-6;
+                    results[i] = got;
+                    hasResult[i] = 1;
+                    ++j5Rescued;
+                    continue;
+                }
+                // ---- 解析方向过不去（硬约束）→ 在**附近**搜方位
+                //
+                // 根因：U* = −a_T 是**纯运动学**最优，它只知道"这样能让腕子伸直"，
+                // 完全不知道几何。窄槽/深腔件上，"指向前臂反方向"往往正好是把枪管
+                // 顶进槽壁的方向 —— longstripe 实测 27 个退回点里 clr=−20.9mm 的占一半，
+                // 那是真撞，不是算错。
+                //
+                // 所以不立刻放弃：**倾角大致保持**（倾角决定 θ5），把方位扫一圈，
+                // 找第一个既过 hardOk 又把 θ5 拉回来的。方位改了 θ5 照样能变小
+                // （θ5 只关心枪轴与前臂的夹角，方位可以转），只是不如 U* 省倾角。
+                // 这就是把运动学结论当**先验**、几何当**否决权**。
+                if (rc == 2 || rc == 4) {
+                    const double azTries[9] = {0, 40, -40, 75, -75, 110, -110, 145, -145};
+                    bool hasAlt = false;
+                    double bestJ5 = 1e9;
+                    for (int t = 0; t < 9 && !hasAlt; ++t) {
+                        double az2 = j5A[i] + azTries[t];
+                        while (az2 <= -180.0) az2 += 360.0;
+                        while (az2 > 180.0) az2 -= 360.0;
+                        // 方位一转，同一方位上需要的倾角也会变，给三档
+                        const double tilts[3] = {j5T[i], j5T[i] + 6.0,
+                                                 std::max(2.0, j5T[i] - 6.0)};
+                        for (int q = 0; q < 3; ++q) {
+                            if (tilts[q] > p.tiltMaxDeg + 1e-9) continue;
+                            if (tilts[q] > p.maxSprayAngleDeg + 1e-9) continue;
+                            PR alt;
+                            if (tryOne(i, tilts[q], az2, alt) != 0) continue;
+                            const double j5v = std::fabs(alt.theta[4]);
+                            if (j5v < bestJ5) { bestJ5 = j5v; got = alt; hasAlt = true; }
+                        }
+                    }
+                    if (hasAlt) {
+                        got.reverted = true;
+                        results[i] = got;
+                        hasResult[i] = 1;
+                        ++j5Rescued;
+                        ++azFb;
+                        continue;
+                    }
+                }
+                ++j5Rejected;
+                if (rc == 1) { ++rejIk; }
+                else if (rc == 2) { ++rejHard; }
+                else if (rc == 4) { ++rejSing; }
+                else { ++rejWorse; }
+                if (dbgJ5) std::fprintf(stderr, "  [j5rej] i=%d rc=%d tilt=%.2f az=%.1f\n",
+                                        i, rc, j5T[i], j5A[i]);
+            }
+            if (g_prof.on)
+                std::fprintf(stderr,
+                             "  [j5] 退回原因：IK失败 %d · 硬约束 %d · θ5未改善 %d · 腕部奇异 %d"
+                             " · 方位搜索救回 %d\n",
+                             rejIk, rejHard, rejWorse, rejSing, azFb);
+            if (g_prof.on)
+                std::fprintf(stderr, "  [j5] 退回原因：IK失败 %d · 硬约束 %d · θ5未改善 %d\n",
+                             rejIk, rejHard, rejWorse);
+        }
+        if (g_prof.on) {
+            int over0 = 0, over1 = 0;
+            for (int i = 0; i < n; ++i) {
+                if (!t.spray[i] || !hasResult[i]) continue;
+                if (j5Base[i] > j5Tgt) ++over0;
+                if (std::fabs(results[i].theta[4]) > j5Tgt) ++over1;
+            }
+            std::fprintf(stderr,
+                         "  [j5] 目标|θ5|<=%.1f° · 危机点 %d · 采纳 %d · 退回基线 %d · 归 %d 段 · "
+                         "仍超目标 %d→%d\n",
+                         j5Tgt, over0, j5Rescued, j5Rejected, j5Segs, over0, over1);
+        }
     }
 
     // ---- 过渡点抬升（spray=0 ⇒ 位置可改，只求不撞）

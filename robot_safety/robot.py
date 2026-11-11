@@ -327,7 +327,6 @@ class ArmSizing:
     base_neck_r: float
     grip_r: float
     tool_pipe_r: float
-    nozzle_r: float
 
     @staticmethod
     def of(reach: float = VS087_REACH) -> "ArmSizing":
@@ -342,12 +341,10 @@ class ArmSizing:
             base_neck_r=joint_r * 1.15,
             grip_r=grip_r,
             tool_pipe_r=grip_r * 0.45,
-            nozzle_r=grip_r * 0.30,
         )
 
 
 GRIP_FRACTION = 0.72     # 握把占「法兰→TCP」全长比例（与 ArmCollider 一致）
-NOZZLE_FRACTION = 0.18   # 喷嘴伸出 TCP 的比例（锥按底半径圆柱保守近似）
 
 
 @dataclass
@@ -364,7 +361,12 @@ class Seg:
 
 
 def tool_segments(flange, tcp, sizing: ArmSizing) -> list[Seg]:
-    """只造工具段（握把 + 细管 + 喷嘴）。
+    """只造工具段（握把 + 细管）。
+
+    **枪长 tool_len 已经把喷嘴包含在内**：tool_len 的定义是「法兰面 → 喷嘴出口」，喷嘴
+    出口就是 TCP。所以枪体实体只有「法兰 → TCP」这一段，**TCP 之外没有任何东西**。
+    不要在 TCP 之外再加"喷嘴"段：那等于沿枪轴朝工件凭空多伸 0.18×枪长 ≈ 81mm，
+    而喷距是从 TCP 量的，会直接把它吃掉——实测报出「枪离工件 100mm 却穿透 −5.33mm」。
 
     为什么单独抽出来：**枪体的位置由「目标 TCP + 枪轴」解析确定，与机器人型号/基座/IK 全都无关**
     —— 法兰就在 TCP 沿枪轴退 tool_len 的地方。所以"枪会不会戳进工件"这一条在
@@ -381,11 +383,9 @@ def tool_segments(flange, tcp, sizing: ArmSizing) -> list[Seg]:
     if L <= 0.5:
         return []
     u = d / L
-    neck = flange + u * (L * GRIP_FRACTION)
-    tip = tcp + u * (L * NOZZLE_FRACTION)
+    neck = flange + u * (L * GRIP_FRACTION)   # 握把末端：枪身由粗变细的地方
     return [Seg(flange.copy(), neck, sizing.grip_r, "工具握把", "tool"),
-            Seg(neck, tcp.copy(), sizing.tool_pipe_r, "工具细管", "tool"),
-            Seg(tcp.copy(), tip, sizing.nozzle_r, "喷嘴", "tool")]
+            Seg(neck, tcp.copy(), sizing.tool_pipe_r, "工具细管", "tool")]
 
 
 def arm_segments(r: FkResult, sizing: ArmSizing, include_base: bool = False, include_tool: bool = True) -> list[Seg]:

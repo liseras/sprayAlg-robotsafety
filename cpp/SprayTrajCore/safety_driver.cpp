@@ -318,7 +318,6 @@ std::string segName(int kind, int j0, int j1) {
     switch (kind) {
         case RS_SEG_GRIP: return "工具握把";
         case RS_SEG_PIPE: return "工具细管";
-        case RS_SEG_NOZZLE: return "喷嘴";
         case RS_SEG_BASE_COL: return "底座立柱";
         case RS_SEG_BASE_NECK: return "底座颈";
         case RS_SEG_JOINT: snprintf(b, sizeof(b), "关节J%d", j0); return b;
@@ -377,6 +376,7 @@ int main(int argc, char** argv) {
         printf("      -fast <0|1>    1=单次逆解（姿态解析、每点 1 次 IK、不搜救不回退）\n");
         printf("      -tiltmode <0|1> 1=倾角逐点连续（tilt=系数×δ/90，δ=法向与重力向上夹角，系数见 -tilt）；\n");
         printf("                      0=面级常量（默认：一个面组锁一个倾角）\n");
+        printf("      -tiltj5 <0|1>  1=逐点解析救 J5（倾角+方位由前臂方向反推，姿态逐点可变）；优先于 -tiltmode\n");
         printf("      -quiet\n");
         printf("      -azmode 0 = 按机器人站位逐行择优进刀侧（默认）；1 = 只用「向上」（旧口径）\n");
         return 2;
@@ -428,6 +428,14 @@ int main(int argc, char** argv) {
             // 0 = 面级常量（默认，工艺要求"面内姿态恒定"的旧口径）。
             if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_TILT_PERP;
             else                     p.fastPose &= ~RS_POSE_TILT_PERP;
+        }
+        else if ((!strcmp(argv[i], "-tiltj5") || !strcmp(argv[i], "-j5")) && i + 1 < argc) {
+            // 1 = 逐点解析救 J5：倾角与方位都由「前臂方向 ⊕ 法向」反推，目标是让 |θ5|
+            //     留够 jointMarginMin 余量。**姿态逐点可变**（取消面级常量）。
+            // 推导与实测见 outputs/diag_关节限位_J5_2026-11-10.md。
+            // 与 -tiltmode 可同时置位，本开关优先。
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_TILT_J5;
+            else                     p.fastPose &= ~RS_POSE_TILT_J5;
         }
         else if (!strcmp(argv[i], "-base") && i + 6 < argc) {
             double x = atof(argv[i + 1]), y = atof(argv[i + 2]), z = atof(argv[i + 3]);
@@ -504,7 +512,10 @@ int main(int argc, char** argv) {
         printf("口径: reach=%d（1=几何+运动学；0=仅几何，不解 IK）· 姿态=%s · 倾角=%s\n",
                p.requireReach,
                (p.fastPose & RS_POSE_FAST) ? "单次逆解" : "搜索",
-               (p.fastPose & RS_POSE_TILT_PERP) ? "逐点连续（tilt=系数×δ/90，系数见 -tilt）" : "面级常量");
+               (p.fastPose & RS_POSE_TILT_J5) ? "逐点解析救J5（姿态逐点可变）"
+                                              : ((p.fastPose & RS_POSE_TILT_PERP)
+                                                     ? "逐点连续（tilt=系数×δ/90，系数见 -tilt）"
+                                                     : "面级常量"));
     }
 
     RobotSafetyResult r = robot_safety_check_up(traj.pts.data(), (int)traj.pts.size(),

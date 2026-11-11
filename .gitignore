@@ -94,3 +94,16 @@ cpp/SprayTrajCore/temp/
 # 入库只会让 diff 变成几十万行噪声；结论图表和诊断文档仍然入库）
 outputs/*.ply
 outputs/*.csv
+
+# ---------------------------------------------------------------
+# 2026-11-11 补充
+# ---------------------------------------------------------------
+
+# 旧版本源码快照（用于「改前/改后 CSV 逐位 diff」的回归基准）：只留源码与构建脚本，
+# 编译产物（.obj/.exe/.lib）不入库
+baseline_tmp/bin/
+baseline_tmp/obj/
+
+# 一次性探针工具：只留工程与源码
+tools/DensoIkProbe/bin/
+tools/DensoIkProbe/obj/
