@@ -3724,6 +3724,10 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     p.edgeExtend     = -1.0;   // 行端点外扩：-1 = 自动(1×行距)，0 = 不外扩
     p.edgeExtendAcross = -1.0; // 跨行方向外扩：-1 = 自动(0.25×行距)，0 = 首末行压边界
     p.shellThick     = 0.0;    // 薄壳双面壁厚：0 = 关闭（不推断另一面）
+    // 空移让开方向：默认 0 = 沿用旧口径（沿内部 +Z 让开，等价"工件朝上、相机俯拍"）。
+    // 侧装/立式悬挂工件必须由调用方填「基座 +X 在点云系里的方向」（手眼 R 第 1 行），
+    // 否则会从工件顶上翻过去，一次过渡走出一两米（见 spray_traj.h 的字段注释）。
+    p.liftDirX = 0.0; p.liftDirY = 0.0; p.liftDirZ = 0.0;
     return p;
 }
 
@@ -3731,7 +3735,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
 // 为什么需要这一层：整套算法内部把 +Z 当成"工件正面朝向"，有三处硬编码依赖它：
 //   1) 初始定向 "|n.z| > 0.05 → 归 +Z 半球"；
 //   2) angZ/tilt 按与 +Z 的夹角算，可喷窗口 130° 也是相对 +Z；
-//   3) 安全高度 zSafe = 工件最高 z + 1.3×standoff，空移沿 +Z 抬枪。
+//   3) 安全高度 zSafe = 工件最高 z + 1.3×standoff，空移沿 +Z 让开。
 //
 // 而输入点云**来自相机系**，那里的事实是固定的、不需要人工选：
 //   · 相机系 +Z 是光轴、指向景物（远离相机）；像素/(u,v,depth) 反投影就得到这个约定；
@@ -4664,16 +4668,174 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 面间转移是空移，但控制器会把相邻两个点用直线插值走完。原来只补一个
     // spray=0 哨兵点（位置不变），下一点直接是另一面的首点 —— 实际运动就是一
     // 根穿过工件凸台/槽壁的斜线。工业上必须"抬枪绕行"，否则撞件。
-    // 处理：沿上一面法向退出 clear → 抬到全局安全高度 zSafe → 平面内平移 → 下降接下一面首点。
+    // 处理：沿上一面法向退出 clear → 抬到安全高度 → 安全高度上平移 → 下降接下一面首点。
     //   clear 取 standoff：喷头本来就离面 100mm，再退 100mm 即彻底离开该面。
-    //   zSafe 取工件最高点 + 1.3×standoff：
-    //     枪位 = 面点 + standoff·n，而 |n_z| <= 1，所以任何喷涂点的 z 都不超过
-    //     zPartMax + standoff。取 1.3 倍即在"最高枪位"之上还留 0.3×standoff(30mm)，
-    //     比原来的 2 倍省 0.7×standoff(70mm) 的上下抬升（每次过渡省 140mm）。
-    double zPartMax = -1e18;
-    for(const auto& p : Pf){ zPartMax = std::max(zPartMax, p.z); }
+    //
+    // ---- 让开方向 liftU：这是第二十六轮的关键修正，第二十七轮（2026-11-11）改口径 ----
+    // 原来一律让到 z = 常数（内部 +Z）。这条隐含假设是"可喷侧 ≈ 竖直向上"，也就是
+    // 工件朝上摆、相机俯拍。侧装/立式悬挂工件上它直接崩掉：
+    //   背板_X+800 实测可喷侧 ≈ 基座 +X（水平），重力向上 = 基座 +Y，
+    //   而内部 +Z 经两次旋转后落到基座系的另一个**水平**轴上。
+    //   于是"让开"变成在工件前面横划 400~900mm（Z 向跨度就那么大），
+    //   竖直方向只让了几十毫米 —— 看着"空移绕了老远"的根因就是这个。
+    // 第二十六轮改成"沿重力向上让开"，背板实测反而更糟：空移从工件顶上翻过去，
+    //   一次面间过渡空移净位移 ΔY=336 / ΔZ=523、单段走 1.8 米，
+    //   而工件只有 866×539×862 —— 工件上沿外面绕了一大圈。
+    // 第二十七轮（用户 2026-11-11 拍板）：让开方向 = **基座 +X，机器人正面**。
+    //   沿 +X 退让 = 枪先撤到工件前方（这一侧没有夹具/背架，机器人一定探得到），
+    //   再从前方平移过去、降回下一面 —— 物理上最短、也最接近人的直觉。
+    // 三轴全 0 时退回 +Z，行为与最早版本**逐位一致**。所有"让到安全面"的点统一由 liftTo() 产出。
+    //
+    // ⚠ 只给"轴"不够，还要定"往哪一侧退"：
+    //   +X 这条轴有两个方向。工件厚 130mm、贴在 X∈[761,891]，正面朝机器人（X 小的一侧）。
+    //   若一律退到 s 最大侧（X≈891 外面的背面），每次过渡都得先穿过工件本体才到得了
+    //   那张安全面 —— 实测就是这个原因让侧壁面（918 个喷点）判成"无可行退出路径·整面不喷"。
+    //   退让侧应该由**枪的位置**定：枪 = 面点 + standoff·n，哪一侧有枪就从哪一侧走。
+    //   这里按「全部喷涂点 s(枪位) 的中位数」定侧，取多数面所在的那侧；
+    //   退化（两侧各半，如对喷的盒内壁）时沿用最大侧，与旧行为一致。
+    Vec3 liftU{0,0,1};
+    bool hasLiftDir = false;
+    {
+        const Vec3 d{params->liftDirX, params->liftDirY, params->liftDirZ};
+        if(len(d) > 1e-9){
+            // 与点云同做入口旋转：点云被旋到 up=+Z，方向向量也必须跟着旋。
+            liftU = norm(uf.fwd(d));
+            hasLiftDir = true;
+            const double cAng = std::acos(std::max(-1.0, std::min(1.0, liftU.z)));
+            fprintf(stderr, "[traj] 空移让开方向 = 点云(%.2f,%.2f,%.2f) → 内部(%.2f,%.2f,%.2f)"
+                            "，与可喷侧夹角 %.1f°%s\n",
+                    d.x,d.y,d.z, liftU.x,liftU.y,liftU.z,
+                    cAng*180.0/3.141592653589793,
+                    (cAng > 60.0*3.141592653589793/180.0)
+                        ? "（两者接近垂直：旧口径会横着让，本轮修正生效）" : "");
+        }
+    }
+    // 沿 liftU 的高度：s(p) = p·liftU。liftU=+Z 时 s(p) 就是 p.z，与旧代码逐位等价
+    // （p.x*0 + p.y*0 + p.z*1 的加法都是精确的，但这里仍显式走快速路径，免得
+    //  编译器把 dot 展开成 mul+add 时引入 fma 导致末位不同）。
+    //
+    // ⚠ 不要再加"按枪位自动翻侧"这类隐式纠正：
+    //   调用方给的方向就是**从工件指向枪那一侧**（用户口径：基座 +X 是正面，
+    //   工件正面朝机器人，枪就从这一侧伸过来），方向本身就是对的。
+    //   我加过一次"枪位中位数在负侧就翻过来"，结果把 +X 翻成了 −X ——
+    //   因为 liftU 在**内部系**（点云被入口旋转 180°），而 segs[].pl.n 是**点云系**，
+    //   拿 pl.n 直接点乘 liftU 等于混两个坐标系，符号整体反掉，
+    //   安全面于是落到工件背面，侧壁面被判"无可行退出路径·整面不喷"。
+    //   要判也必须先用 uf.fwd() 把法向转到内部系 —— 但既然方向由调用方给定，
+    //   这层推断本身就不该存在。
+    const bool liftIsZ = (std::fabs(liftU.x) < 1e-12 && std::fabs(liftU.y) < 1e-12
+                          && liftU.z > 0);
+    auto sOf = [&](const Vec3& p)->double{ return liftIsZ ? p.z : dot(p, liftU); };
+    double sPartMax = -1e18;
+    for(const auto& p : Pf){ sPartMax = std::max(sPartMax, sOf(p)); }
+    // 把 p 沿 liftU 挪到高度 sTarget（垂直于 liftU 的平面内的分量保持不动）。
+    //   liftU=+Z 时 = {p.x, p.y, sTarget}，正是旧写法的 {p.x, p.y, zSafe}。
+    // 这个快速路径不是优化，是**正确性**：p + u*(s - p·u) 在浮点下有约 10%
+    // 的点 z 会与 s 差 1 ulp（实测 200k 次里 19018 次），而"默认参数下与旧版本
+    // 逐位一致"是这条改动的验收标准（现场要能直接对比改前/改后的 CSV）。
+    auto liftTo = [&](const Vec3& p, double sTarget)->Vec3{
+        if(liftIsZ) return Vec3{p.x, p.y, sTarget};
+        return p + liftU*(sTarget - sOf(p));
+    };
+    // ---- 安全面：必须落在**枪所在的那一侧** ----
+    //
+    // 推导：枪位 = 面点 + standoff·n（n 指向可喷侧 = 枪那一侧），故
+    //   s(枪位) = s(面点) + standoff·(n·liftU)，落在 s 的枪侧外沿之外一点点。
+    // 所以"让开面"就是「工件沿 liftU 的极值 + 1.3×standoff」，取哪一侧的极值，
+    // 取决于枪在哪一侧。
+    //
+    // 旧口径（liftU = +Z，工件朝上、相机俯拍）里枪在上方 ⇒ 枪在 s **最大**侧，
+    // 于是 sSafe = sMax + 1.3×standoff，这就是旧的 zSafe，**逐位一致**（不许改）。
+    //
+    // 但立式悬挂工件上 liftU 变成了水平轴（基座 ±X），枪在工件**正面**，
+    // 沿这根轴的 s 可能是**最小**侧：背板实测 s ∈ [474, 1300]（点云 z，越大越靠里），
+    // 枪位 s ≈ 1333 落在 s 小的一端之外。这时还取 sMax 侧，等于把安全面放到工件
+    // **背面**，每次面间过渡都得先穿过板体才到得了 —— 实测侧壁面（918 个喷点）
+    // 就是这么被判成"无可行退出路径·整面不喷"的。
+    //
+    // 判据：拿每个面的枪位 s 取中位数，看它离 sMin 近还是离 sMax 近。
+    // 枪侧那一端就往外让 1.3×standoff。liftU 指向哪一头都不影响结论 ——
+    // 用户给的只是"轴"，物理上必须退向有枪的那一侧，否则必穿件。
     const double clear = params->standoff;
-    const double zSafe = zPartMax + 1.3*params->standoff;
+    double sSafe;
+    if(!hasLiftDir){
+        // ---- 默认口径（liftDir 三轴全 0）：逐位保持一致，不许改 ----
+        // 这条分支必须与旧版本字节级相同：现场要靠改前/改后 CSV 直接 diff 验收。
+        // 所以**不进**任何枪侧推断，哪怕推断在默认口径下也会得出同样的数 ——
+        // 只要多算一个 dot/分支，浮点结果就不再保证逐位一致。
+        sSafe = sPartMax + 1.3*params->standoff;
+    }else{
+        // ---- 指定了让开方向：安全面必须落在**枪所在的那一侧** ----
+        //
+        // ⚠ 关键：不能拿"全部枪位的中位数"投票。
+        //   背板实测（点云系=基座系，liftU=基座 +X）：
+        //     面0/1 法向≈(-0.996, 0.049, 0.069) —— 与 liftU 近乎**反平行**，
+        //       这两面 9.7 万点、是工件正反两大面，枪位 X≈711（在工件外侧小端）。
+        //     面2   法向≈(0.084, 0.997, 0.003) —— 与 liftU **垂直**，侧壁，
+        //       它的枪位 X≈845 落在工件主体内部，对"轴的两个方向"毫无信息。
+        //     面3   斜向，也无信息。
+        //   若把面2/面3 的枪位混进中位数，中位数被拉到 853（工件内部），
+        //   判据恒为"枪在最大侧"，安全面落到工件背面 —— 实测就是侧壁面被判
+        //   "无可行退出路径·整面不喷"（丢 918 个喷点）的直接原因。
+        //
+        //   正确做法：只有法向与 liftU **不垂直**的面才有资格投票，权重取
+        //   |n·liftU|（越平行越说明"枪沿这根轴站在哪一头"）。判据本身用
+        //   "投票枪位的加权中位数离哪一端更近"。
+        //
+        // ⚠ 边界必须用稳健分位，不能用 min/max：
+        //   点云 X∈[24,891]，但 X<760 只有 146 点（0.14%，飞点），主体在 [760,891]。
+        //   用 raw min 会让 sMin=24，dist(枪位,24) 永远大于 dist(枪位,sMax)。
+        std::vector<double> ss;
+        ss.reserve(Pf.size());
+        for(const auto& p : Pf) ss.push_back(sOf(p));
+        double sPartLo = sPartMax, sPartHi = sPartMax;
+        double sRawMin = sPartMax;
+        if(!ss.empty()){
+            std::sort(ss.begin(), ss.end());
+            sRawMin = ss.front();
+            const size_t lo = (size_t)(0.005 * (double)(ss.size() - 1));
+            const size_t hi = (size_t)(0.995 * (double)(ss.size() - 1));
+            sPartLo = ss[lo];
+            sPartHi = ss[hi];
+        }
+
+        // 逐面投票：只有 |n·liftU| > 0.3 的面参与（近垂直的侧壁不投票）
+        struct Vote { double s; double w; };
+        std::vector<Vote> votes;
+        votes.reserve(segs.size());
+        for(const auto& s : segs){
+            const double c = dot(s.pl.n, liftU);
+            const double wgt = std::fabs(c);
+            if(wgt <= 0.3) continue;                     // 侧壁：对轴向无信息
+            // 注意：pl.c / pl.n 出自 split_planes(Pf)，Pf 已是**内部系**点，
+            // 与 sOf/liftU 同系，**不要**再套 uf.fwd（双重旋转会让符号整体反掉）。
+            votes.push_back({dot(s.pl.c + s.pl.n * params->standoff, liftU), wgt});
+        }
+
+        double gunS = 0.0;
+        bool haveGun = false;
+        if(!votes.empty()){
+            std::sort(votes.begin(), votes.end(),
+                      [](const Vote& a, const Vote& b){ return a.s < b.s; });
+            double wSum = 0.0;
+            for(const auto& v : votes) wSum += v.w;
+            double acc = 0.0;
+            gunS = votes.back().s;
+            for(const auto& v : votes){
+                acc += v.w;
+                if(acc >= wSum * 0.5){ gunS = v.s; break; }
+            }
+            haveGun = true;
+        }
+        const bool gunOnMaxSide = !haveGun
+                               || std::fabs(gunS - sPartHi) <= std::fabs(gunS - sPartLo);
+        sSafe = gunOnMaxSide ? (sPartHi + 1.3*params->standoff)
+                             : (sPartLo - 1.3*params->standoff);
+        fprintf(stderr, "[traj] 安全面: 加权枪位 s=%.1f（%zu/%zu 面投票，侧壁不投票），"
+                        "工件沿让开轴稳健 s∈[%.1f,%.1f]（原始 [%.1f,%.1f]）→ 枪在%s侧，让到 s=%.1f\n",
+                gunS, votes.size(), segs.size(), sPartLo, sPartHi, sRawMin, sPartMax,
+                gunOnMaxSide ? "远(最大 s)" : "近(最小 s)", sSafe);
+    }
     Vec3 prevNormal{0,0,1};
     int transCount = 0;
     int nGapSafe = 0;          // 曲面行间直线会穿件→改走安全空移的次数
@@ -5024,13 +5186,13 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                     // 直抬枪会贴着壁顶擦过（bin 实测 0.06mm）。改道顺序：
                     // 原地竖直 → 缩短法向退出 → 枪体安全距离，取两腿净空最大者。
                     Vec3 L1 = ga + na*clear;
-                    const Vec3 L1top{L1.x, L1.y, zSafe};
+                    const Vec3 L1top = liftTo(L1, sSafe);
                     if(!segClearOK(ga, L1) || segCrossFace(ga, L1) ||
                        !segClearOK(L1, L1top) || segCrossFace(L1, L1top)){
                         double best = std::min(segMinClear(ga, L1), segMinClear(L1, L1top));
                         Vec3 bestW = L1;
                         auto considerExit=[&](const Vec3& W){
-                            const Vec3 Wtop{W.x, W.y, zSafe};
+                            const Vec3 Wtop = liftTo(W, sSafe);
                             double s = std::min(segMinClear(ga, W), segMinClear(W, Wtop));
                             if(s > best){ best = s; bestW = W; }
                         };
@@ -5043,12 +5205,12 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                                     L1.x,L1.y,L1.z, best);
                     }
                     move(L1, na);
-                    move({L1.x,L1.y,zSafe}, na);
-                    const Vec3 Top{gb.x,gb.y,zSafe};
+                    move(liftTo(L1, sSafe), na);
+                    const Vec3 Top = liftTo(gb, sSafe);
                     move(Top, nb);
                     if(!segClearOK(Top,gb) || segCrossFace(Top,gb)){
                         const Vec3 L2 = gb + nb*clear;
-                        move({L2.x,L2.y,zSafe}, nb);
+                        move(liftTo(L2, sSafe), nb);
                         move(L2, nb);
                     }
                     move(gb, nb);
@@ -5072,14 +5234,14 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                                           -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
                     } else {
                         Vec3 L1 = pEnd + prevNormal*clear;
-                        const Vec3 L1top{L1.x, L1.y, zSafe};
+                        const Vec3 L1top = liftTo(L1, sSafe);
                         if(!segClearOK(pEnd, L1) || segCrossFace(pEnd, L1) ||
                            !segClearOK(L1, L1top) || segCrossFace(L1, L1top)){
-                            // 与曲面行间空移同样的出口改道：原地竖直 / 缩短法向退出
+                            // 与曲面行间空移同样的出口改道：原地抬升 / 缩短法向退出
                             double best = std::min(segMinClear(pEnd, L1), segMinClear(L1, L1top));
                             Vec3 bestW = L1;
                             auto considerExit=[&](const Vec3& W){
-                                const Vec3 Wtop{W.x, W.y, zSafe};
+                                const Vec3 Wtop = liftTo(W, sSafe);
                                 double s = std::min(segMinClear(pEnd, W), segMinClear(W, Wtop));
                                 if(s > best){ best = s; bestW = W; }
                             };
@@ -5089,13 +5251,15 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                             L1 = bestW;
                         }
                         allPts.push_back({L1.x,L1.y,L1.z, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
-                        allPts.push_back({L1.x,L1.y,zSafe, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
-                        const Vec3 Top{firstPos.x,firstPos.y,zSafe};
+                        const Vec3 Lt = liftTo(L1, sSafe);
+                        allPts.push_back({Lt.x,Lt.y,Lt.z, prevNormal.x,prevNormal.y,prevNormal.z, params->speed, 0});
+                        const Vec3 Top = liftTo(firstPos, sSafe);
                         allPts.push_back({Top.x,Top.y,Top.z, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
-                        // 直降穿件时沿首点法向退 clear，再垂直降到侧上方进入
+                        // 直降穿件时沿首点法向退 clear，再降到侧上方进入
                         if(!segClearOK(Top, firstPos) || segCrossFace(Top, firstPos)){
                             const Vec3 L2 = firstPos + firstN*clear;
-                            allPts.push_back({L2.x,L2.y,zSafe, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
+                            const Vec3 L2t = liftTo(L2, sSafe);
+                            allPts.push_back({L2t.x,L2t.y,L2t.z, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
                             allPts.push_back({L2.x,L2.y,L2.z, -firstN.x,-firstN.y,-firstN.z, params->speed, 0});
                         }
                     }
@@ -5664,13 +5828,14 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             }
             return lo;                                            // 0 = 只剩直连可用
         };
-        // 抬到全局安全高度绕行：A → A 正上方 zSafe → B 正上方 → B，全部 spray=0。
+        // 抬到安全高度绕行：A → A 的抬升位 → B 的抬升位 → B，全部 spray=0。
         // 只用于**空移段**（跨段大跳跃/面间过渡）：那本来就不喷，抬起来不打断喷涂。
         // 喷涂段内部（同一面的换行连接）绝不用它——gunClear 不足要靠收缩转角解决。
-        // zSafe 在工件最高点之上，横向平移段必然安全；两段垂直起降与面间过渡同款。
+        // 安全高度在工件沿 liftU 的最远点之上，横向平移段必然安全；两段起降与面间过渡同款。
+        // 抬升位置由 liftTo 给出：liftU=+Z 时就是旧的 {x, y, zSafe}。
         auto hopZ=[&](const Vec2& a2, const Vec2& b2){
             Vec3 A = gunOf2(a2), B = gunOf2(b2);
-            Vec3 P1{A.x, A.y, zSafe}, P2{B.x, B.y, zSafe};
+            Vec3 P1 = liftTo(A, sSafe), P2 = liftTo(B, sSafe);
             auto emit3=[&](const Vec3& P, int sp){
                 const double h = dot(P - pl.c, pl.n);
                 Vec3 X = P - pl.n*h;
@@ -5761,21 +5926,21 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                             si, pEnd.x,pEnd.y,pEnd.z, pStart.x,pStart.y,pStart.z);
                 pushMove(pEnd + (pStart - pEnd)*0.5, prevNormal);
             } else {
-                const Vec3 Top{pStart.x, pStart.y, zSafe};
+                const Vec3 Top = liftTo(pStart, sSafe);
                 auto legOK=[&](const Vec3& w0, const Vec3& w1){
                     return !segCrossFace(w0, w1) && segClearOK(w0, w1);
                 };
                 // ② 沿上一面法向退出（离开该面，不擦面）
                 Vec3 L1 = pEnd + prevNormal*clear;
-                const Vec3 L1top{L1.x, L1.y, zSafe};
+                const Vec3 L1top = liftTo(L1, sSafe);
                 if(!legOK(pEnd, L1) || !legOK(L1, L1top)){
                     // 出口两条腿也必须查：腔宽与退出距离相当时，沿法向退 100mm
-                    // 恰好顶到对面内壁，再竖直抬枪就贴着壁顶擦上去（bin 实测 0.06mm）。
-                    // 先试"原地竖直抬枪"，再试缩短法向退出；取两腿最小净空最大者。
+                    // 恰好顶到对面内壁，再抬枪就贴着壁顶擦上去（bin 实测 0.06mm）。
+                    // 先试"原地抬枪"，再试缩短法向退出；取两腿最小净空最大者。
                     double exitScore = std::min(segMinClear(pEnd, L1), segMinClear(L1, L1top));
                     Vec3 exitW = L1;
                     auto considerExit=[&](const Vec3& W){
-                        const Vec3 Wtop{W.x, W.y, zSafe};
+                        const Vec3 Wtop = liftTo(W, sSafe);
                         double s = std::min(segMinClear(pEnd, W), segMinClear(W, Wtop));
                         if(s > exitScore){ exitScore = s; exitW = W; }
                     };
@@ -5793,15 +5958,15 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                     }
                 }
                 pushMove(L1, prevNormal);              // ② 退出腿：保持上一面姿态（不再提前转向）
-                // ③ 抬到全局安全高度（最高面上二者等高，不会出现"先冲高再回落"）
-                pushMove({L1.x, L1.y, zSafe}, prevNormal);
+                // ③ 让到安全面（沿 liftU；liftU=+Z 时与旧行为一致）
+                pushMove(liftTo(L1, sSafe), prevNormal);
                 // ④ 在安全高度上平移到本面首点正上方，再降落。
                 //    垂直降落会穿件的情形：首点正上方有凸台、或首点在腔内/凸台下
                 //    （complex 实测 204mm 直降穿过工件，最差 0.38mm，且这一段
                 //    spray=0→1，正是"落枪第一下就撞"）。改沿本面法向 n（指向可喷侧）
                 //    偏移后降落，再沿法向进到首点。
-                //    注意**两条腿都要查**：垂直腿 SideTop→Side 和进入腿 Side→pStart。
-                //    原来只查了垂直腿，complex 上进入腿沿法向走 100mm，中途擦过
+                //    注意**两条腿都要查**：下降腿 Top→Side 和进入腿 Side→pStart。
+                //    原来只查了下降腿，complex 上进入腿沿法向走 100mm，中途擦过
                 //    一个凸台（实测最差 0.35mm，12 个点 <20mm），因为没人查。
                 if(legOK(Top, pStart)){
                     pushMove(Top, pl.n);               // ④ 到顶空才转到本面姿态
@@ -5812,21 +5977,29 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                     const double base = std::max(clear, gunClearEff);
                     Vec3 bestW = Top; double bestScore = -1.0;
                     auto consider=[&](const Vec3& W){
-                        const Vec3 Wtop{W.x, W.y, zSafe};
+                        const Vec3 Wtop = liftTo(W, sSafe);
                         double s = std::min(segMinClear(Wtop, W), segMinClear(W, pStart));
                         if(s > bestScore){ bestScore = s; bestW = W; }
                     };
                     consider(Top);
                     for(double f : {0.25, 0.5, 1.0}) consider(pStart + pl.n*(base*f));
-                    Vec3 inPlane = cross(Vec3{0,0,1}, pl.n);
-                    if(len(inPlane) < 1e-6) inPlane = Vec3{1,0,0};
+                    // 横向方位基：要和抬升轴正交，否则"面内 8 方位"里有两个方向
+                    // 其实是沿 liftU 的 —— 抬上去再原地下降，白走一个来回。
+                    // 退化保护：liftU ∥ pl.n 时 cross 为零，此时任取面内方向都行，
+                    // 但必须**真的在面内**（与 pl.n 垂直）。原来这里回退到固定
+                    // {1,0,0}，若 pl.n 恰好也是 ±X，inPlane 与法向平行、inPlane2
+                    // 归零，8 个方位退化成同一个点，落点搜索直接失效。
+                    Vec3 inPlane = cross(liftU, pl.n);
+                    if(len(inPlane) < 1e-6) inPlane = cross(Vec3{0,0,1}, pl.n);
+                    if(len(inPlane) < 1e-6) inPlane = cross(Vec3{1,0,0}, pl.n);
+                    if(len(inPlane) < 1e-6) inPlane = Vec3{1,0,0};   // pl.n 不会是零向量，仅作兜底
                     inPlane = norm(inPlane);
                     const Vec3 inPlane2 = cross(pl.n, inPlane);
                     for(int a=0;a<8;++a){
                         const double th = a*3.141592653589793/4.0;
                         consider(pStart + (inPlane*std::cos(th) + inPlane2*std::sin(th))*base);
                     }
-                    const Vec3 Wtop{bestW.x, bestW.y, zSafe};
+                    const Vec3 Wtop = liftTo(bestW, sSafe);
                     pushMove(Wtop, pl.n);
                     if(len(bestW - pStart) > 1e-6) pushMove(bestW, pl.n);
                     if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
@@ -5862,8 +6035,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     if(nGapSafe)
         fprintf(stderr, "[traj] 曲面行间安全空移: %d 处（直线会穿件，spray=0）\n", nGapSafe);
     if(transCount)
-        fprintf(stderr, "[traj] 面间过渡: %d 处，安全高度 z=%.1f（工件最高 %.1f）",
-                transCount, zSafe, zPartMax);
+        fprintf(stderr, "[traj] 面间过渡: %d 处，安全高度 s=%.1f（工件沿抬升方向最远 %.1f）",
+                transCount, sSafe, sPartMax);
     if(nApproachFix)
         fprintf(stderr, "，其中 %d 处直降会穿件→改沿面法向进入", nApproachFix);
     if(nDropFace)
@@ -6156,25 +6329,28 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 C.push_back({A, B});                                   // 0 直连
                 {                                                     // 1 反向退出（沿工件外方向退）
                     const Vec3 E = A - nA*clear;
-                    const Vec3 Et{E.x, E.y, std::max(zSafe, E.z)};
-                    C.push_back({A, E, Et, {B.x, B.y, Et.z}, B});
+                    const Vec3 Et = liftTo(E, std::max(sSafe, sOf(E)));
+                    C.push_back({A, E, Et, liftTo(B, sOf(Et)), B});
                 }
                 for(double h : {0.0, 0.6*params->standoff, 1.5*params->standoff}){  // 2~4 抬升三档
-                    const double zH = zSafe + h;
+                    const double sH = sSafe + h;
                     const Vec3 L1 = A + nA*clear;
-                    const Vec3 L1t{L1.x, L1.y, std::max(zH, L1.z)};
-                    C.push_back({A, L1, L1t, {B.x, B.y, L1t.z}, B});
+                    const Vec3 L1t = liftTo(L1, std::max(sH, sOf(L1)));
+                    C.push_back({A, L1, L1t, liftTo(B, sOf(L1t)), B});
                 }
-                const Vec3 hz{B.x-A.x, B.y-A.y, 0.0};                 // 5~10 左右各 3 档侧绕
+                // 侧绕方向 = 横向（去掉 liftU 分量）× liftU。liftU=+Z 时与旧的
+                // cross(hd,{0,0,1}) 一致；侧装时不会退化成一个"沿让开方向的偏移"。
+                const Vec3 dv = B - A;
+                const Vec3 hz = dv - liftU*sOf(dv);
                 const double span = std::max(1.0, len(hz));
                 const Vec3 hd = (len(hz) < 1e-6) ? Vec3{1,0,0} : norm(hz);
-                const Vec3 side = norm(cross(hd, Vec3{0,0,1}));
+                Vec3 side = cross(hd, liftU);
+                side = (len(side) < 1e-6) ? Vec3{1,0,0} : norm(side);
                 for(double sgn : {-1.0, 1.0})
                     for(double off : {0.6, 1.2, 2.0}){
-                        const Vec3 M{(A.x+B.x)*0.5 + side.x*sgn*span*off,
-                                     (A.y+B.y)*0.5 + side.y*sgn*span*off,
-                                     zSafe};
-                        C.push_back({A, M, {B.x, B.y, M.z}, B});
+                        const Vec3 Mid = (A + B)*0.5 + side*(sgn*span*off);
+                        const Vec3 M = liftTo(Mid, sSafe);
+                        C.push_back({A, M, liftTo(B, sOf(M)), B});
                     }
                 const bool dbg = std::getenv("SPRAYTRAJ_MOVE_DBG") != nullptr;
                 if(dbg) fprintf(stderr, "[mvdbg] A=(%.1f,%.1f,%.1f) B=(%.1f,%.1f,%.1f) 原路径 L=%.1f 净空=%.1f 门槛=%.1f\n",

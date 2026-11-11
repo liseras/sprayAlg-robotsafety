@@ -229,6 +229,32 @@
                                     </ComboBox>
                                 </DockPanel>
 
+                                <DockPanel Margin="0,14,0,0">
+                                    <TextBlock Text="空移让开方向" Width="150" VerticalAlignment="Center"
+                                               ToolTip="空移段（枪关）抬枪绕行时，朝哪一侧离开工件：先沿它退到安全面，再在安全面上平移，最后降回下一面枪位。&#x0a;默认「基座 +X（机器人正面）」—— 这一侧没有夹具/背架，机器人一定探得到，沿它退让物理上最短。&#x0a;重力向上（+Y）只在工件朝上平放时才对；立式悬挂工件沿 +Y 让开会从顶上翻过去，一次过渡绕出一两米。"/>
+                                    <ComboBox x:Name="CmbLiftDir" Padding="4" SelectedIndex="0"
+                                              SelectionChanged="CmbLiftDir_Changed">
+                                        <ComboBoxItem Content="基座 +X（机器人正面，推荐）"/>
+                                        <ComboBoxItem Content="基座 −X（枪往回撤）"/>
+                                        <ComboBoxItem Content="重力向上（工件正装/平放）"/>
+                                        <ComboBoxItem Content="重力向下"/>
+                                        <ComboBoxItem Content="自定义三分量"/>
+                                    </ComboBox>
+                                </DockPanel>
+
+                                <StackPanel x:Name="PanelLiftCustom" Visibility="Collapsed" Margin="0,4,0,0">
+                                    <Grid Margin="0,2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                            <ColumnDefinition Width="*"/>
+                                        </Grid.ColumnDefinitions>
+                                        <TextBox x:Name="TxtLiftX" Text="1" Padding="4" Margin="0,0,4,0" ToolTip="让开方向 X（点云系，不必归一化）"/>
+                                        <TextBox x:Name="TxtLiftY" Grid.Column="1" Text="0" Padding="4" Margin="0,0,4,0" ToolTip="让开方向 Y"/>
+                                        <TextBox x:Name="TxtLiftZ" Grid.Column="2" Text="0" Padding="4" ToolTip="让开方向 Z"/>
+                                    </Grid>
+                                </StackPanel>
+
                                 <DockPanel Margin="0,8,0,0">
                                     <TextBlock Text="可喷侧方向" Width="150" VerticalAlignment="Center"
                                                ToolTip="相机系里可喷侧恒定是「朝相机侧」，也就是更低 Z —— 这是相机只能看到朝向自己那一面决定的，不是可选项，所以这里只显示、不可改。算法内部把 +Z 当工件正面，入口会自动把 −Z 旋到 +Z 再算，出口把轨迹转回原坐标系。"/>

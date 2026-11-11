@@ -18,17 +18,46 @@
     截图看着"算法没改对"，其实是 exe 旁边躺着一个几天前的 DLL。
     这里在每次构建后强制同步，并把时间戳打进日志，避免再出现"改了没生效"的假象。
   -->
+  <!--
+    源目录有**两处**，按修改时间取新的那个：
+      · build\bin\Release\ ：CMake 构建（cmake 构建 build 目录，config Release）的输出
+      · build_rls\         ：现场手搭 MSVC 环境 build_release.bat 的输出
+    2026-11-11 实测踩过：只写死前者，而实际一直在跑 build_release.bat，
+    于是构建时用 build\bin\Release 里 11-10 的旧 DLL 把 bin 目录里刚拷进去的新库盖掉。
+    源码改了、核心库也编译了、日志还打「已同步」，界面行为却完全没变。
+    取时间较新者后，两条构建路径都不会再互相覆盖。
+  -->
   <PropertyGroup>
-    <SprayTrajCoreDll>$(MSBuildThisFileDirectory)..\..\cpp\SprayTrajCore\build\bin\Release\SprayTraj.dll</SprayTrajCoreDll>
+    <SprayTrajCoreDll1>$(MSBuildThisFileDirectory)..\..\cpp\SprayTrajCore\build\bin\Release\SprayTraj.dll</SprayTrajCoreDll1>
+    <SprayTrajCoreDll2>$(MSBuildThisFileDirectory)..\..\cpp\SprayTrajCore\build_rls\SprayTraj.dll</SprayTrajCoreDll2>
   </PropertyGroup>
 
-  <Target Name="SyncSprayTrajCore" AfterTargets="Build" Condition="Exists('$(SprayTrajCoreDll)')">
-    <Copy SourceFiles="$(SprayTrajCoreDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-    <Message Importance="high" Text="已同步 SprayTraj.dll -> $(OutDir)" />
-  </Target>
-
-  <Target Name="WarnMissingSprayTrajCore" AfterTargets="Build" Condition="!Exists('$(SprayTrajCoreDll)')">
-    <Warning Text="找不到核心算法库：$(SprayTrajCoreDll)，请先构建 cpp/SprayTrajCore（cmake --build build --config Release）" />
+  <!--
+    全部写在**一个** Target 里。
+    踩过的坑：把"选源"和"拷贝"拆成两个 Target，用 DependsOnTargets 串起来，并在拷贝目标上
+    写 Condition="'$(SprayTrajCoreDll)' != ''" —— 那个 Condition 在依赖目标执行**之前**
+    就求值了，此时属性还是空，整个拷贝目标被静默跳过，日志里连提示都没有。
+    用 PropertyGroup 比较两处 DLL 的 Ticks（不能用 Sort 任务，dotnet SDK 里没有）。
+  -->
+  <Target Name="SyncSprayTrajCore" AfterTargets="Build">
+    <PropertyGroup>
+      <_Has1 Condition="Exists('$(SprayTrajCoreDll1)')">true</_Has1>
+      <_Has2 Condition="Exists('$(SprayTrajCoreDll2)')">true</_Has2>
+      <_T1 Condition="'$(_Has1)' == 'true'">$([System.IO.File]::GetLastWriteTime('$(SprayTrajCoreDll1)').Ticks)</_T1>
+      <_T2 Condition="'$(_Has2)' == 'true'">$([System.IO.File]::GetLastWriteTime('$(SprayTrajCoreDll2)').Ticks)</_T2>
+      <!-- 先默认取第一处，再按"第二处存在且更新"覆盖 -->
+      <_SrcDll Condition="'$(_Has1)' == 'true'">$(SprayTrajCoreDll1)</_SrcDll>
+      <_SrcDll Condition="'$(_Has1)' != 'true' And '$(_Has2)' == 'true'">$(SprayTrajCoreDll2)</_SrcDll>
+      <_SrcDll Condition="'$(_Has1)' == 'true' And '$(_Has2)' == 'true' And '$(_T2)' &gt; '$(_T1)'">$(SprayTrajCoreDll2)</_SrcDll>
+    </PropertyGroup>
+    <Message Importance="high" Condition="'$(_Has1)' == 'true' And '$(_Has2)' == 'true'"
+             Text="核心库两处都存在：取修改时间较新者（build\bin\Release=$(_T1)，build_rls=$(_T2)）" />
+    <Copy SourceFiles="$(_SrcDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true"
+          Condition="'$(_SrcDll)' != ''" />
+    <Message Importance="high" Condition="'$(_SrcDll)' != ''"
+             Text="已同步 SprayTraj.dll -> $(OutDir)（源：$(_SrcDll)）" />
+    <Warning Condition="'$(_SrcDll)' == ''"
+             Text="找不到核心算法库，请先构建 cpp/SprayTrajCore（build_release.bat 或 CMake）" />
   </Target>
 
   <!--

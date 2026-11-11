@@ -22,6 +22,15 @@ namespace SprayTrajViewer
         public double edgeExtend;       // 行端点外扩 mm（<0=自动 1×行距，0=不外扩）
         public double edgeExtendAcross; // 跨行方向外扩 mm（<0=自动 0.25×行距，0=首末行压边界）
         public double shellThick;       // 薄板双面壁厚 mm（0=关闭；>0 时给单层壳补出另一面）
+        // ---- 空移抬枪方向（点云系里的"重力反向"，不必归一化）----
+        //
+        // 注意与 SPRAYTRAJ_UP(-up) 的区别：那是"可喷侧方向"（相机看得见那一面，
+        // 随工件怎么摆而变），这里只决定"空移往哪边抬"。侧装/斜装工件上两者近乎
+        // 垂直，混用会让"抬枪"变成贴着工件横扫（背板_X+800 实测横划 400~900mm）。
+        //
+        // 三轴全 0（默认）= 退回旧口径（沿内部 +Z 抬，等价于"工件朝上、相机俯拍"）。
+        // 调用方应填手眼矩阵 R 的第 3 行（重力向上在点云系的方向）。
+        public double liftDirX, liftDirY, liftDirZ;
     }
 
     [StructLayout(LayoutKind.Sequential)]

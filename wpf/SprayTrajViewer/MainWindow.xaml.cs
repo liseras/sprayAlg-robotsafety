@@ -351,6 +351,30 @@ namespace SprayTrajViewer
             if (o.TryGetValue("sprayside", out v))
                 App.Log("GEN", null, $"忽略 --sprayside {v}：可喷侧恒为 −Z（朝相机侧）");
 
+            // --lift +X|-X|up|down|custom：空移让开方向（抬枪绕行朝哪一侧离开工件）。
+            // 默认 +X（基座正面）。custom 时读 --liftxyz x y z（点云系三分量）。
+            if (o.TryGetValue("lift", out v))
+            {
+                switch (v.ToUpperInvariant())
+                {
+                    case "+X": case "X": CmbLiftDir.SelectedIndex = 0; break;
+                    case "-X": CmbLiftDir.SelectedIndex = 1; break;
+                    case "UP": case "+Y": case "Y": CmbLiftDir.SelectedIndex = 2; break;
+                    case "DOWN": case "-Y": CmbLiftDir.SelectedIndex = 3; break;
+                    case "CUSTOM":
+                        CmbLiftDir.SelectedIndex = 4;
+                        if (o.TryGetValue("liftxyz", out var lxyz))
+                        {
+                            var t = lxyz.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            if (t.Length >= 3)
+                            {
+                                TxtLiftX.Text = t[0]; TxtLiftY.Text = t[1]; TxtLiftZ.Text = t[2];
+                            }
+                        }
+                        break;
+                }
+            }
+
             // 显示项（显式给值时才改，避免把用户默认勾选状态打乱）
             if (o.TryGetValue("show-cloud", out v)) ChkShowCloud.IsChecked = v != "0";
             if (o.TryGetValue("show-traj", out v)) ChkShowTraj.IsChecked = v != "0";
@@ -1236,6 +1260,32 @@ namespace SprayTrajViewer
                 shellThick     = ParseDouble(TxtShellThick.Text, 0),
             };
 
+            // ---------- 步骤 2：填"空移让开方向" ----------
+            // 这跟下面的"可喷侧 up"是两件事，必须分开喂：
+            //   可喷侧 = 相机看得见那一面（随工件摆位变，侧装时是水平的）；
+            //   让开方向 = 空移抬枪绕行时朝哪一侧离开工件（由工件相对机器人怎么放决定）。
+            // 混用的后果实测过：
+            //   · 沿内部 +Z：背板在工件前面横划 400~900mm（Z 向跨度就那么大）；
+            //   · 沿重力 +Y（第二十六轮口径）：空移从工件顶上翻过去，单段空移 1.8 米、
+            //     净位移 ΔY=336 / ΔZ=523，而工件只有 866×539×862。
+            // 第二十七轮（用户 2026-11-11 拍板）改成**基座 +X，机器人正面**：
+            //   这一侧没有夹具/背架、机器人一定探得到，先退到工件前方再平移过去，最短也最安全。
+            var liftDir = BuildLiftVector();
+            if (liftDir != null)
+            {
+                p.liftDirX = liftDir[0];
+                p.liftDirY = liftDir[1];
+                p.liftDirZ = liftDir[2];
+                App.Log("GEN", null,
+                    $"空移让开方向(点云系) = ({p.liftDirX:F3}, {p.liftDirY:F3}, {p.liftDirZ:F3})，" +
+                    $"界面口径 = {LiftDirName()}");
+            }
+            else
+            {
+                App.Log("GEN", null,
+                    "空移让开方向未指定 → 沿内部 +Z 让开；立式/侧装工件会把空移绕到工件外面一大圈");
+            }
+
             // 组织 xyz 数组
             var xyz = new double[_cloud.Count * 3];
             for (int i = 0; i < _cloud.Count; i++)
@@ -1788,6 +1838,17 @@ namespace SprayTrajViewer
 
         /// <summary>当前视图显示在哪个坐标系里（给界面/日志用）。</summary>
         string DisplayFrameName() => DisplayPose() == null ? "点云原坐标系（相机系）" : "机器人基座系";
+
+        /// <summary>当前「空移让开方向」选的是哪一种口径（给日志/提示用）。</summary>
+        string LiftDirName() => CmbLiftDir.SelectedIndex switch
+        {
+            0 => "基座 +X（机器人正面）",
+            1 => "基座 −X",
+            2 => "重力向上",
+            3 => "重力向下",
+            4 => "自定义三分量",
+            _ => "未指定（库默认 +Z）",
+        };
 
         /// <summary>把一个点搬到显示坐标系。M=null 时原样返回，不做任何浮点运算。</summary>
         (double x, double y, double z) DispP(double x, double y, double z)
@@ -2530,6 +2591,78 @@ namespace SprayTrajViewer
             if (PanelUpCustom == null) return;
             PanelUpCustom.Visibility = CmbUpDir.SelectedIndex == 4
                 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        void CmbLiftDir_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+        {
+            if (PanelLiftCustom == null) return;
+            PanelLiftCustom.Visibility = CmbLiftDir.SelectedIndex == 4
+                ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        /// <summary>
+        /// 界面「空移让开方向」→ 点云系里的向量（不必归一化），填给 <c>SprayTrajParams.liftDir</c>。
+        ///
+        /// 口径（2026-11-11 用户拍板）：**默认基座 +X，机器人正面**。
+        /// 空移段（枪关）抬枪绕行时，先沿这个方向退到"安全面"、在安全面上平移、再降回
+        /// 下一面枪位 —— 整条避障路径都按这根轴算。选错轴的代价实测过：
+        ///   · 沿内部 +Z（最早口径）：背板在工件前面横划 400~900mm；
+        ///   · 沿重力 +Y（第二十六轮口径）：空移从工件顶上翻过去，单段走 1.8 米，
+        ///     净位移 ΔY=336 / ΔZ=523，而工件只有 866×539×862。
+        /// 基座 +X 是"机器人伸臂的方向"，这一侧没有夹具/背架、机器人一定探得到，
+        /// 沿它退让最短也最不容易撞。
+        ///
+        /// 换算方式：基座 +X 在**点云系**里的表示，就是 T_base_in_cloud 旋转部分的第 1 列。
+        /// 没拿基座位姿（自动假设）时无从换算，按点云 +X 处理并在日志里说明。
+        /// </summary>
+        double[]? BuildLiftVector()
+        {
+            switch (CmbLiftDir.SelectedIndex)
+            {
+                // ---------- 基座 ±X：换算到点云系 ----------
+                case 0:
+                case 1:
+                    {
+                        var bp = BuildBasePose();
+                        double sx, sy, sz;
+                        if (bp != null)
+                        {
+                            // R_base = T_base_in_cloud 的旋转部分（行主序）；
+                            // 基座 +X 在点云系 = R_base·(1,0,0) = 第 1 列。
+                            sx = bp[0]; sy = bp[4]; sz = bp[8];
+                        }
+                        else
+                        {
+                            // 自动假设基座位姿：没有矩阵可换，点云系即参照系
+                            sx = 1; sy = 0; sz = 0;
+                        }
+                        return CmbLiftDir.SelectedIndex == 1
+                            ? new[] { -sx, -sy, -sz }
+                            : new[] { sx, sy, sz };
+                    }
+
+                // ---------- 重力向上 / 向下：与「重力向上」下拉同一个口径 ----------
+                case 2:
+                case 3:
+                    {
+                        var up = BuildUpVector() ?? new double[] { 0, 0, 1 };
+                        return CmbLiftDir.SelectedIndex == 3
+                            ? new[] { -up[0], -up[1], -up[2] }
+                            : up;
+                    }
+
+                // ---------- 自定义三分量 ----------
+                case 4:
+                    {
+                        double lx = ParseDouble(TxtLiftX.Text, 1);
+                        double ly = ParseDouble(TxtLiftY.Text, 0);
+                        double lz = ParseDouble(TxtLiftZ.Text, 0);
+                        if (Math.Abs(lx) < 1e-9 && Math.Abs(ly) < 1e-9 && Math.Abs(lz) < 1e-9) return null;
+                        return new[] { lx, ly, lz };
+                    }
+
+                default: return null;   // 交回库默认（+Z）
+            }
         }
 
         /// <summary>

@@ -156,10 +156,22 @@ int main(int argc, char** argv){
         // 所以可喷侧恒为朝相机侧（更低 Z），这是事实不是参数，一般不用传。
         // 只有点云已被搬到别的坐标系（如手眼变换后的基座系，+Z 竖直向上）时，才用 0,0,1 覆盖。
         if(!strcmp(argv[i],"-up"))    _putenv_s("SPRAYTRAJ_UP", argv[i+1]);
+        // -lift x,y,z：空移让开方向（点云坐标系里"朝哪一侧离开工件"）。
+        // 与 -up 是**两个完全不同的东西**：-up 是可喷侧（相机看得见那一面，随工件怎么摆变），
+        // -lift 是空移抬枪绕行时朝哪侧退（由工件相对机器人怎么放决定）。
+        // 侧装/立式工件上两者近乎垂直，混用会让空移贴着工件横扫或从顶上翻过去。
+        // 不传 = 退回沿内部 +Z 让（旧口径）。现场口径是基座 +X（= 手眼 R 第 1 行）。
+        if(!strcmp(argv[i],"-lift")){
+            double a=0,b=0,c=0;
+            if(std::sscanf(argv[i+1], "%lf,%lf,%lf", &a,&b,&c) == 3){
+                p.liftDirX = a; p.liftDirY = b; p.liftDirZ = c;
+            }
+        }
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f\n",
+    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f lift=(%.2f,%.2f,%.2f)\n",
         p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
-        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross, p.shellThick);
+        p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross, p.shellThick,
+        p.liftDirX, p.liftDirY, p.liftDirZ);
     // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
     printf("[abi] sizeof Plane=%zu Point=%zu Result=%zu\n",
         sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
