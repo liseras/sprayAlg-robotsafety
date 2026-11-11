@@ -1,0 +1,75 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    离线逆解探针（DensoIkProbe）。
+
+    ─────────────── 这个工程存在的理由 ───────────────
+    把主城序（DensoArmKine）那套**已在真机上验证过**的阻尼最小二乘逆解，链接进来对
+    喷涂轨迹逐点求解，回答一个问题：这条轨迹能不能被 VS-087 **连续走通**。
+
+    它与主城序的关系是「只读引用」：Kinematics/ 与 Models/ 下的源码**链接**（不复制），
+    所以主城序修 bug 这里自动跟随，不会出现「两套逆解实现各说各话」。
+
+    ─────────────── 硬约束：绝不动机器人 ───────────────
+    刻意**只链接**以下 7 个文件（纯数学 + 纯数据，零 I/O）：
+        Models/RobotModel.cs        纯数据结构
+        Models/DensoLibrary.cs      连杆尺寸库
+        Kinematics/Mat4.cs          4x4 齐次变换
+        Kinematics/EulerZyx.cs      欧拉角互转
+        Kinematics/FkSolver.cs      正解
+        Kinematics/InverseKinematics.cs  逆解（DLS 核心）
+        Kinematics/IkSeeds.cs       多起点策略
+
+    刻意**不链接**以下内容（一旦链接就等于给了「动真机」的能力）：
+        Hardware/**       b-CAP 客户端、串口、控制器通信
+        IkCompareCli.cs   Run() 需要 ip 参数，会连真机
+        LiveCheck.cs / LiveCompare.cs / LiveLog.cs  实时对拍
+        Motion/**         运动指令下发
+    本工程 OutputType=Exe、TargetFramework=net8.0（**非** windows + 无 WPF），
+    编译产物里不含任何 DENSO 通信 DLL，物理上不具备连接控制器的能力。
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RootNamespace>DensoIkProbe</RootNamespace>
+    <AssemblyName>DensoIkProbe</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- CS1574: IkSeeds 内的 <see cref="IkCompare"/> / TrajPlayer 属主城序其它文件，
+         本工程刻意不链接它们，故 cref 解析不到。只是文档注释警告，不影响任何行为。 -->
+    <NoWarn>$(NoWarn);CS1574;CS1587</NoWarn>
+  </PropertyGroup>
+
+  <!-- 主城序源码路径（相对本 csproj：tools\DensoIkProbe -> tools\DensoArmKine 在另一个仓库） -->
+  <PropertyGroup>
+    <DensoArmKineRoot>D:\Code\SprayVisionSimple\SprayVisionSimple\tools\DensoArmKine</DensoArmKineRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="$(DensoArmKineRoot)\Models\RobotModel.cs">
+      <Link>Linked\Models\RobotModel.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Models\DensoLibrary.cs">
+      <Link>Linked\Models\DensoLibrary.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Kinematics\Mat4.cs">
+      <Link>Linked\Kinematics\Mat4.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Kinematics\EulerZyx.cs">
+      <Link>Linked\Kinematics\EulerZyx.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Kinematics\FkSolver.cs">
+      <Link>Linked\Kinematics\FkSolver.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Kinematics\InverseKinematics.cs">
+      <Link>Linked\Kinematics\InverseKinematics.cs</Link>
+    </Compile>
+    <Compile Include="$(DensoArmKineRoot)\Kinematics\IkSeeds.cs">
+      <Link>Linked\Kinematics\IkSeeds.cs</Link>
+    </Compile>
+  </ItemGroup>
+
+</Project>
