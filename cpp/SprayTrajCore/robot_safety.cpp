@@ -43,18 +43,81 @@ struct Prof {
     bool on = false;
     // 并行求解时 +1 会竞争，用 relaxed 原子（计数只在 RS_PROFILE 时看，精度要求不高）
     std::atomic<long long> ik{0}, seg{0}, evals{0};
+    // eval 内部的分项耗时（纳秒，多线程累加）。只回答一个问题：
+    // 「139μs/次的 eval 到底花在 IK、建碰撞体，还是点云查询」——这三条优化方向完全不同。
+    std::atomic<long long> nsIk{0}, nsBuild{0}, nsSeg{0}, nsSelf{0};
+    // IK 内部统计：ik() 一次调用里到底跑了几个 ikOnce、以及退化为"全种子搜"的比例。
+    // 这三个数决定优化方向：若 seed 解本身已经几何收敛，只是关节超限，
+    // 那么把 29 组种子全跑一遍去"换个不超限的支"就是纯浪费。
+    std::atomic<long long> ikOnceN{0}, ikFast{0}, ikOver{0}, ikFail{0};
+    // 「超限 → 全种子搜」这条最贵路径的投入产出：总 ikOnce、换来合法解的次数、白跑的次数
+    std::atomic<long long> ikOverOnce{0}, ikOverHit{0}, ikOverMiss{0};
+    // ikOnce 的迭代总次数：除以 ikOnceN 就是"平均迭代几次"，用来验证停滞退出生效。
+    // **不要**在迭代循环里加 Prof::Scope 级的计时：实测即使 g_prof.on=false，
+    // 三处计时也会让整个热循环慢 17%（编译器被迫跨原子写做保守假设）。
+    // 内层各段占比是一次性测过的：fk 43% · 6x6 解 25% · 雅可比/正规阵 12% · 其余 20%。
+    std::atomic<long long> ikIters{0};
+    // 「超限多深 → 全种子搜能不能救回」直方图。阈值不靠猜：
+    // 浅超限（几度）换个解支有可能滑回行程内，深超限（几十度）是"这块够不到"，
+    // 再搜 28 组种子也是白跑。分桶后按实测救回率决定跳过界限。
+    static constexpr int kOverBucketN = 7;
+    static constexpr double kOverEdges[kOverBucketN] = {2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 1e9};
+    const char* const kOverNames[kOverBucketN] = {"0-2°", "2-5°", "5-10°", "10-20°",
+                                                  "20-30°", "30-45°", "45°+"};
+    std::atomic<long long> overCnt[kOverBucketN] = {};
+    std::atomic<long long> overHitB[kOverBucketN] = {};
+    // 全种子搜里有多少组种子是**重复**的（与前面某一组逐位相同）。
+    // 重复种子必然给出逐位相同的结果，跑第二遍是纯粹的浪费 —— 这是唯一
+    // 一种"剪掉不影响任何输出"的剪枝。实测重复率 0%，所以没有可剪的。
+    std::atomic<long long> sweepSeeds{0}, sweepDup{0};
+    long long lastEvals = 0;    // mark() 用：本阶段新增的 eval 次数
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last = t0;
 
     void reset() {
         ik = 0; seg = 0; evals = 0;
+        nsIk = 0; nsBuild = 0; nsSeg = 0; nsSelf = 0;
+        ikOnceN = 0; ikFast = 0; ikOver = 0; ikFail = 0;
+        ikOverOnce = 0; ikOverHit = 0; ikOverMiss = 0;
+        ikIters = 0;
+        sweepSeeds = 0; sweepDup = 0;
+        for (int i = 0; i < kOverBucketN; ++i) { overCnt[i] = 0; overHitB[i] = 0; }
+        lastEvals = 0;
     }
+
+    // margin 为负表示超限，负数越大超得越多。桶按"超限的度数"划分。
+    void bucketOver(double margin, bool hit) {
+        double dep = -margin;
+        int k = 0;
+        while (k < kOverBucketN - 1 && dep > kOverEdges[k]) ++k;
+        ++overCnt[k];
+        if (hit) ++overHitB[k];
+    }
+
+    // eval 内部计时用：只在 RS_PROFILE 时读时钟（steady_clock::now 约 20ns，可接受）
+    struct Scope {
+        bool on;
+        std::atomic<long long>& acc;
+        std::chrono::steady_clock::time_point b;
+        Scope(bool on_, std::atomic<long long>& a) : on(on_), acc(a) {
+            if (on) b = std::chrono::steady_clock::now();
+        }
+        ~Scope() {
+            if (!on) return;
+            acc.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - b).count(),
+                          std::memory_order_relaxed);
+        }
+    };
     void mark(const char* what) {
         if (!on) return;
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double, std::milli>(now - last).count();
         double all = std::chrono::duration<double, std::milli>(now - t0).count();
-        std::fprintf(stderr, "  [prof] %-14s %9.1f ms（累计 %9.1f）\n", what, dt, all);
+        long long ev = evals.load();
+        std::fprintf(stderr, "  [prof] %-14s %9.1f ms（累计 %9.1f）· eval +%lld\n",
+                     what, dt, all, ev - lastEvals);
+        lastEvals = ev;
         last = now;
     }
 };
@@ -412,6 +475,9 @@ struct IkSol {
     double rotErrDeg = 0.0;
     bool over = false;
     double margin = 0.0;
+    // 条件数**不在这里算**：它要一次 6x6 雅可比 + Jacobi 特征值分解（最多 60 轮），
+    // 而 ik() 每次调用平均会产生 19 个候选解、其中 18 个直接丢弃。
+    // 只在最终入选的那个解上算一次（eval 里已有 fk(sol.theta) 的 FK 结果，顺手就出）。
     double cond = 0.0;
 };
 
@@ -484,9 +550,15 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
     const double wRot = 100.0;   // 1rad 姿态误差 ≈ 100mm 位置误差，把两行拉到同一量纲
     double lam = 30.0;
     double bestErr = 1e300;
+    int stall = 0;               // 连续"没把误差压下去"的迭代次数
+    int iters = 0;
+    // FkOut 约 1.2KB（7 个 Pose + origins + axes），声明在循环里等于每轮先把
+    // 这些 double 全部置零一遍，而 fk() 每轮会把每个字段都写满 —— 这层清零是纯浪费。
+    // 提到循环外不改变任何数值：fk 只读自己上一轮写过的 frames[i]，不读初值。
+    FkOut f;
 
     for (int it = 0; it < 90; ++it) {
-        FkOut f;
+        ++iters;
         fk(th, toolLen, f);
         V3 ep = pTarget - f.tcp.t;
         V3 er = matToRotvec(m3mul(RTarget, m3T(f.tcp.R)));
@@ -494,19 +566,34 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
         double en = 0.0;
         for (int i = 0; i < 6; ++i) en += err[i] * err[i];
         en = std::sqrt(en);
+        const double prevBest = bestErr;
         if (en < bestErr) {
             bestErr = en;
             lam = std::max(lam * 0.7, 0.5);
         } else {
             lam = std::min(lam * 0.5 + lam, 5e3);
         }
+        // 停滞按**相对**进步判定：一次只压下去 0.5% 也算停住。
+        // 只看"绝对没进步"抓不到真实情况 —— 实测界面口径下 ikOnce 平均要跑 64.8 次，
+        // 就是因为每十来次挤出一点点进步，把绝对版 stall 反复清零。
+        if (en < prevBest * 0.995) stall = 0;
+        else ++stall;
         if (norm(ep) < 0.02 && norm(er) * kRad < 0.02) break;
 
+        // ---- 停滞提前退出（不改变任何返回值的语义）
+        // 这个 DLS 的阻尼是"不进步就 ×1.5"单调涨的，连涨十几次就接近上限 5e3，
+        // 步长已经小到 1e-3 量级，后面几十次迭代只是在原地磨 —— 这类种子本来就收敛不了。
+        // 提前退出对判据**无副作用**：
+        //   · 未收敛的解 ok=false，进不了 valid()，也永远排不到 rankCmp 的已收敛解之前；
+        //   · bestErr 只用于调阻尼，不参与返回，th 仍是当前迭代值（和跑满 90 次一样是它）。
+        // 门槛 bestErr > 0.5（加权单位，≈ 位置 0.5mm）保证"已经快收敛的不动"。
+        if (stall >= 8 && bestErr > 0.5) break;
+
         double J[6][6];
+        double JJt[6][6];
         jacobian(f, J);
         for (int i = 3; i < 6; ++i)
             for (int j = 0; j < 6; ++j) J[i][j] *= wRot;
-        double JJt[6][6];
         for (int i = 0; i < 6; ++i)
             for (int j = 0; j < 6; ++j) {
                 double s = 0.0;
@@ -530,8 +617,9 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
         }
         for (int i = 0; i < 6; ++i) th[i] += dth[i] * kRad;
     }
+    if (g_prof.on) g_prof.ikIters += iters;   // 常开会在 8 线程间抢同一条缓存行
 
-    FkOut f;
+    // 退出循环时 th 已经走了一步（最后一轮的 dth 已加），所以 f 是过期的，必须重算。
     fk(th, toolLen, f);
     IkSol sol;
     for (int i = 0; i < 6; ++i) sol.theta[i] = th[i];
@@ -540,7 +628,7 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
     sol.ok = (sol.posErr <= std::max(0.02 * 20, 0.5) && sol.rotErrDeg <= std::max(0.02 * 20, 0.5));
     sol.over = overLimit(th);
     sol.margin = limitMarginMin(th);
-    sol.cond = condNumber(f);
+    // cond 不在这里算：见 IkSol::cond 的注释（19 个候选里 18 个会被丢弃）。
     return sol;
 }
 
@@ -592,7 +680,7 @@ constexpr double kCacheContinuityTrigDeg = 5.0;
 
 // 种子顺序：上一点解（连续性）→ 解析种子（解支正确）→ 固定种子表（兜底）
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
-    ++g_prof.ik;
+    if (g_prof.on) ++g_prof.ik;   // 仅诊断计数：常开时 8 线程抢同一条缓存行，实测有 2~3% 开销
     double seeds[1 + 16 + 12][6];
     int ns = 0;
     if (seed) {
@@ -613,27 +701,56 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
     IkSol bestValid;
     bool hasValid = false;
     double bestValidDist = 1e300;
+    // 本点是否走的是"种子收敛但超限"这条最贵的路，以及最终有没有换来合法分支。
+    // 只用于决定要不要继续压缩这条路径，不参与任何判据。
+    bool seedOver = false;
+    double seedMargin = 0.0;
+    int nOnce = 0;
 
     // 先跑上一点种子：连续且合法就直接返回，保持主路径速度。
     if (seed) {
         IkSol sol = ikOnce(pTarget, RTarget, toolLen, seed);
+        if (g_prof.on) ++g_prof.ikOnceN;
+        ++nOnce;
         best = sol;
         hasBest = true;
         if (valid(sol)) {
-            if (maxJointDelta(sol.theta, seed) <= kBranchContinuityTrigDeg) return sol;
+            if (maxJointDelta(sol.theta, seed) <= kBranchContinuityTrigDeg) {
+                if (g_prof.on) ++g_prof.ikFast;
+                return sol;
+            }
             // 跳得大：先把它作为“最近的合法解”的兜底，再找有没有更近的解支。
             bestValid = sol;
             hasValid = true;
             bestValidDist = jointDist2(sol.theta, seed);
+        } else if (sol.ok) {
+            // 几何收敛但关节超限：后面的 28 组种子就是为了找"换个支不超限"。
+            if (g_prof.on) ++g_prof.ikOver;
+            seedOver = true;
+            seedMargin = sol.margin;
+        } else {
+            if (g_prof.on) ++g_prof.ikFail;
         }
     }
 
     // 解析种子 / 固定种子。有 seed 且上一点解跳得大时，选关节距离最近的合法解；
     // 没有 seed 时保持旧行为（第一个合法解直接返回）。
     for (int i = (seed ? 1 : 0); i < ns; ++i) {
+        // 诊断：这组种子是否与前面某组逐位相同（相同则结果必然相同，跑它也白跑）
+        if (g_prof.on) {
+            ++g_prof.sweepSeeds;
+            for (int q = 0; q < i; ++q) {
+                bool same = true;
+                for (int k = 0; k < 6; ++k)
+                    if (seeds[q][k] != seeds[i][k]) { same = false; break; }
+                if (same) { ++g_prof.sweepDup; break; }
+            }
+        }
         IkSol sol = ikOnce(pTarget, RTarget, toolLen, seeds[i]);
+        if (g_prof.on) ++g_prof.ikOnceN;
+        ++nOnce;
         if (valid(sol)) {
-            if (!seed) return sol;
+            if (!seed) { if (g_prof.on) ++g_prof.ikFast; return sol; }
             double dist = jointDist2(sol.theta, seed);
             if (!hasValid || dist < bestValidDist) {
                 bestValid = sol;
@@ -644,6 +761,14 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         if (!hasBest || rankCmp(sol, best) < 0) {
             best = sol;
             hasBest = true;
+        }
+    }
+    if (seedOver) {
+        // 「超限 → 全种子搜」这条路的投入产出：跑了多少 ikOnce、有没有换来合法解。
+        if (g_prof.on) {
+            g_prof.ikOverOnce += nOnce;
+            if (hasValid) ++g_prof.ikOverHit; else ++g_prof.ikOverMiss;
+            g_prof.bucketOver(seedMargin, hasValid);
         }
     }
     if (hasValid) return bestValid;
@@ -853,7 +978,7 @@ public:
     // 线段到点云的最短距离；超过 radius 直接返回 radius（= 只报下界）
     double segmentDist(const V3& a, const V3& b, double radius) const {
         if (nodes_.empty()) return radius;
-        ++g_prof.seg;
+        if (g_prof.on) ++g_prof.seg;
         double best = radius;
         queryRec(root_, a, b, best);
         return best;
@@ -1191,7 +1316,7 @@ public:
     // （θ2=154°、J2 超限 19°、小臂从工件底下穿过去 24.7mm）。
     bool eval(const V3& face, const V3& d, const V3* refX, const double* seed,
               double tiltDeg, double azDeg, bool checkLinks, PR& out) const {
-        ++g_prof.evals;
+        if (g_prof.on) ++g_prof.evals;
         V3 zTool = -unit(d);
         V3 pC = face + d * p_.standoff;
 
@@ -1211,6 +1336,7 @@ public:
             buildToolSegs(toBaseP(pC) - toBaseV(zTool) * p_.toolLen, toBaseP(pC), sz_, segs);
             double worstTool = 1e300;
             const Seg* segTool = nullptr;
+            Prof::Scope _p(g_prof.on, g_prof.nsSeg);
             for (const Seg& s : segs) {
                 double limit = std::min(p_.search, (worstTool < 1e299) ? worstTool + s.r : p_.search);
                 double surface = cloud_.segmentDist(toCloudP(s.a), toCloudP(s.b), limit) - s.r;
@@ -1257,17 +1383,26 @@ public:
                 Rc.setCol(2, zTool);
             }
         }
-        IkSol sol = ik(toBaseP(pC), toBaseR(Rc), p_.toolLen, seed);
+        IkSol sol;
+        {
+            Prof::Scope _p(g_prof.on, g_prof.nsIk);
+            sol = ik(toBaseP(pC), toBaseR(Rc), p_.toolLen, seed);
+        }
         if (!sol.ok) return false;
 
         FkOut f;
         fk(sol.theta, p_.toolLen, f);
         std::vector<Seg> segs;
-        buildSegments(f, sz_, p_.includeBase, segs);
+        {
+            Prof::Scope _p(g_prof.on, g_prof.nsBuild);
+            buildSegments(f, sz_, p_.includeBase, segs);
+        }
 
         double worstTool = 1e300, worstLink = 1e300;
         const Seg* segTool = nullptr;
         const Seg* segLink = nullptr;
+        {
+        Prof::Scope _p(g_prof.on, g_prof.nsSeg);
         for (const Seg& s : segs) {
             if (!checkLinks && s.group != SG_TOOL) continue;
             bool isTool = (s.group == SG_TOOL);
@@ -1282,14 +1417,18 @@ public:
                 else { worstLink = surface; segLink = &s; }
             }
         }
+        }
         const Seg* worstSeg = (worstTool <= worstLink) ? segTool : segLink;
         double worst = std::min(worstTool, worstLink);
         double selfGap = 1e300;
+        {
+        Prof::Scope _p(g_prof.on, g_prof.nsSelf);
         for (const auto& pr : pairs_) {
             const Seg& sa = segs[pr.first];
             const Seg& sb = segs[pr.second];
             double dax = segSegDist(sa.a, sa.b, sb.a, sb.b);
             selfGap = std::min(selfGap, dax - sa.r - sb.r);
+        }
         }
 
         out.idx = -1;
@@ -1308,7 +1447,7 @@ public:
         out.ikOk = true;
         out.over = sol.over;
         out.margin = sol.margin;
-        out.cond = sol.cond;
+        out.cond = condNumber(f);      // 只对最终入选的这个解算一次
         for (int i = 0; i < 6; ++i) out.theta[i] = sol.theta[i];
         out.pos = pC;
         out.gun = -d;
@@ -2942,6 +3081,18 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         int ffClr = 0;      // 0 <= 间隙 < hardClearance：只是余量不足，没撞
         int ffJoint = 0;    // 关节超限
         int ffIk = 0;       // 解不出逆解
+        // 「过不了硬约束 → 同方位 ±倾角步长 救援」的产出比。
+        // 只回答一个问题：这些救援 eval 有多少真的把点救回来了（其余的纯烧时间）。
+        int rescueEvals = 0, rescueHit = 0;
+        // 按**救援前的失败类型**分桶（互斥，口径与 hardOk 一致，同 ff* 那套）。
+        // 超限深度不预示救援成败（实测各深度档都是 0.2% 左右），
+        // 但失败类型可能预示得很准：IK 解不出来 / 真穿透 / 自碰撞 / 关节超限 / 只差余量，
+        // 五种情况里"改倾角能不能救"完全不同。分桶后按救回率决定跳过哪一类。
+        int rkEvals[5] = {0, 0, 0, 0, 0};
+        int rkHit[5] = {0, 0, 0, 0, 0};
+        // 被救回的点里，救援前超限最深的那个（margin 最负）。用来定"超限跳过"的阈值：
+        // 阈值只要不比它更负，就一个救得回来的点都不会漏。
+        double hitMarginWorst = 0.0;
     };
 
     // 违规位单点判定。阶段 3 和后面的「回退段统一姿态」都会改位姿，两处必须同口径，
@@ -3107,7 +3258,27 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     // 靠倾转让它"更好解"等于换一条空移路径 —— 实测开口盒子 819 个空移点
                     // 就是这样被退回 35°/55° 的倾斜位姿（TCP 偏 57~105mm，还导致喷角假告警）。
                     // 真的撞就交给下面的「过渡点抬升」按 +Z 抬枪解决，姿态一列不改。
-                    if (!hardOk(pr, p) && t.spray[i]) {
+                    // ---- 关节已经超出限位过多、倾角救援够不着的点：不再试解
+                    // 倾角改的是腕部朝向，改不了臂展。关节超限是"这块够不到"，
+                    // 同方位的小幅倾角只能让最差关节再挪一点，救不回来。
+                    // 实测背板件（9598 点）：不跳过时救援 20608 次 eval、救回 142 点；
+                    // 跳过深超限的点后只剩 6623 次 eval、仍救回 139 点 ——
+                    // 三分之二的救援开销换 3 个点，而整件本来就是 REJECT。
+                    // 代价是实测的：背板 5/9678 点由"已救回"退回违规（其中 1 点 P0），
+                    // cx 1/5560 点。判定结论不变（两边都是 REJECT）。
+                    //
+                    // 阈值不写死，按**本次救援的实际幅度**算：
+                    //   救援最多把倾角改 ±rescueSpan（面级常量模式 = 2×步长 = 10°；
+                    //   逐点倾角模式 = 一直到 tiltMax），倾角到关节的放大实测不到 2 倍，
+                    //   所以超限超过 2×rescueSpan 就不可能靠这次救援回到限位内。
+                    // 面级常量模式 → 阈值 20°，正是"滑回行程内"能成立的上限；
+                    // 逐点倾角模式救援幅度大，阈值自动放宽（多数情况等于不跳过，行为不变）。
+                    // 超限的点照实报 JOINT_LIMIT，判据一条不少，只是不再反复试解。
+                    const double rescueSpan = p.tiltPerPoint
+                        ? std::max(p.tiltStepDeg, p.tiltMaxDeg - tilt)
+                        : 2.0 * p.tiltStepDeg;
+                    const bool overFar = pr.over && pr.margin < -2.0 * rescueSpan;
+                    if (!hardOk(pr, p) && t.spray[i] && !overFar) {
                         // fast 模式的救援：同方位、倾角 ±1/±2 步（最多 4 次 eval，只在失败点上花）。
                         //
                         // 为什么给到 ±2：面级姿态是**抽样**选的（每组 ≤8 点），单点级别的冲突
@@ -3123,6 +3294,18 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                         const int mMax2 = p.tiltPerPoint
                             ? (int)std::floor((p.tiltMaxDeg - tilt) / p.tiltStepDeg + 1e-9)
                             : 2;
+                        const double marginBefore = pr.margin;   // 救援前超限有多深（诊断用）
+                        // 救援前失败类型（与 ff* 同口径，互斥按严重度）
+                        // 实测（背板件）：IK失败 0/0 · 穿透 163 点/救回 0 · 自碰撞 8/2
+                        //               · 关节超限 2017/137 · 仅余量不足 13/0
+                        // 也就是说**只有关节超限这一类救得回来**。但不要因此就
+                        // "只在关节超限时救援"：穿透那 163 点只占 489 次 eval（7%），
+                        // 剪掉它省不了什么，却要新增一条会漏救的判据。
+                        const int rk = !pr.ikOk ? 0
+                                     : (pr.clearance < 0.0 ? 1
+                                     : (pr.selfGap < 0.0 ? 2
+                                     : (pr.over ? 3 : 4)));
+                        ++acc.rkEvals[rk];
                         for (int m = 1; m <= mMax2; ++m) {
                             bool fixed = false;
                             for (int sgn = -1; sgn <= 1 && !fixed; sgn += 2) {
@@ -3130,6 +3313,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                                 if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
                                 V3 d2 = dirOf(nrm, uUp, axis, t2, az);
                                 PR pr2;
+                                ++acc.rescueEvals;
                                 if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
                                              hasSeed ? prevTheta : nullptr, t2, az, checkLinks, pr2))
                                     continue;
@@ -3139,6 +3323,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                                 pr2.reverted = true;
                                 pr = pr2;
                                 ++acc.reverted;
+                                ++acc.rescueHit;
+                                ++acc.rkHit[rk];
+                                if (marginBefore < acc.hitMarginWorst) acc.hitMarginWorst = marginBefore;
                                 fixed = true;
                             }
                             if (fixed) break;
@@ -3271,6 +3458,10 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         }
         for (auto& th : pool) th.join();
         int ffPierce = 0, ffSelf = 0, ffClr = 0, ffJoint = 0, ffIk = 0;
+        int rescueEvals = 0, rescueHit = 0;
+        int rkEvals[5] = {0, 0, 0, 0, 0};
+        int rkHit[5] = {0, 0, 0, 0, 0};
+        double hitMarginWorst = 0.0;
         for (const auto& a : accs) {
             recomputed += a.recomputed;
             reverted += a.reverted;
@@ -3278,6 +3469,22 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
             ffPierce += a.ffPierce; ffSelf += a.ffSelf; ffClr += a.ffClr;
             ffJoint += a.ffJoint;   ffIk += a.ffIk;
+            rescueEvals += a.rescueEvals; rescueHit += a.rescueHit;
+            for (int k = 0; k < 5; ++k) { rkEvals[k] += a.rkEvals[k]; rkHit[k] += a.rkHit[k]; }
+            if (a.hitMarginWorst < hitMarginWorst) hitMarginWorst = a.hitMarginWorst;
+        }
+        if (g_prof.on && rescueEvals > 0) {
+            std::fprintf(stderr, "  [rs] 救援 eval %d 次 · 救回 %d 点（%.1f%%）· 白跑 %d 次"
+                                 " · 被救回点救援前最深超限 %.1f°\n",
+                         rescueEvals, rescueHit, 100.0 * rescueHit / rescueEvals,
+                         rescueEvals - rescueHit, hitMarginWorst);
+            // 失败类型 → 救回率。顺序与 rk 编码一致。
+            static const char* const kNm[5] = {"IK失败", "穿透", "自碰撞", "关节超限", "仅余量不足"};
+            std::fprintf(stderr, "  [rs] 失败类型 → 救回：");
+            for (int k = 0; k < 5; ++k)
+                std::fprintf(stderr, "%s%s %d 点/救回 %d", k ? " · " : "",
+                             kNm[k], rkEvals[k], rkHit[k]);
+            std::fprintf(stderr, "\n");
         }
         if (g_prof.on)
             std::fprintf(stderr, "  [fb] 面级姿态过不了硬约束 %d 点：穿透 %d · 自碰撞 %d · 间隙不足 %d · 关节 %d · IK %d\n",
@@ -4012,6 +4219,50 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                      total, n, n ? total / n : 0.0, g_prof.ik.load(), g_prof.evals.load(),
                      n ? (double)g_prof.evals.load() / n : 0.0, g_prof.seg.load(),
                      n ? (double)g_prof.seg / n : 0.0, cloud.size());
+        // eval 内部分项（多线程累加，按 CPU 时间算，若 > 单墙钟是并行导致的正常现象）
+        double evals = (double)std::max(1LL, (long long)g_prof.evals.load());
+        std::fprintf(stderr,
+                     "  [prof] eval 内部分项 CPU 占比（%/总）：IK %.0f%% · 建碰撞体 %.0f%% · "
+                     "点云查询 %.0f%% · 自碰撞 %.0f%%（每次 eval：IK %.1f μs / 建 %.2f μs / "
+                     "查询 %.1f μs / 自 %.2f μs）\n",
+                     100.0 * (double)g_prof.nsIk / 1e6 / (total * 1.0) * 1.0,
+                     100.0 * (double)g_prof.nsBuild / 1e6 / (total * 1.0),
+                     100.0 * (double)g_prof.nsSeg / 1e6 / (total * 1.0),
+                     100.0 * (double)g_prof.nsSelf / 1e6 / (total * 1.0),
+                     (double)g_prof.nsIk / 1e3 / evals, (double)g_prof.nsBuild / 1e3 / evals,
+                     (double)g_prof.nsSeg / 1e3 / evals, (double)g_prof.nsSelf / 1e3 / evals);
+        double ikN = (double)std::max(1LL, (long long)g_prof.ik.load());
+        std::fprintf(stderr,
+                     "  [prof] ikOnce 总 %lld 次（每次 ik() 平均 %.1f 次）· 种子直接命中 %lld（%.0f%%）"
+                     " · 种子几何收敛但超限 %lld（%.0f%%）· 种子失败 %lld（%.0f%%）\n",
+                     (long long)g_prof.ikOnceN, (double)g_prof.ikOnceN / ikN,
+                     (long long)g_prof.ikFast, 100.0 * (double)g_prof.ikFast / ikN,
+                     (long long)g_prof.ikOver, 100.0 * (double)g_prof.ikOver / ikN,
+                     (long long)g_prof.ikFail, 100.0 * (double)g_prof.ikFail / ikN);
+        if (g_prof.ikOver > 0) {
+            double ov = (double)g_prof.ikOver;            std::fprintf(stderr,
+                         "  [prof] 超限分支：总 ikOnce %lld（平均 %.1f 次/点）· 换来合法解 %lld（%.0f%%）"
+                         " · 白跑 %lld（%.0f%%）\n",
+                         (long long)g_prof.ikOverOnce, (double)g_prof.ikOverOnce / ov,
+                         (long long)g_prof.ikOverHit, 100.0 * (double)g_prof.ikOverHit / ov,
+                         (long long)g_prof.ikOverMiss, 100.0 * (double)g_prof.ikOverMiss / ov);
+            // 超限深度直方图：每一档里"换了种子之后有没有救回来"
+            std::fprintf(stderr, "  [prof] 超限深度 → 救回率：");
+            for (int i = 0; i < Prof::kOverBucketN; ++i) {
+                long long c = g_prof.overCnt[i].load();
+                long long h = g_prof.overHitB[i].load();
+                std::fprintf(stderr, "%s%s %lld 次/救回 %lld",
+                             i ? " · " : "", g_prof.kOverNames[i], c, h);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        if (g_prof.sweepSeeds > 0)
+            std::fprintf(stderr, "  [prof] 全种子搜 %lld 组 · 其中与前组逐位重复 %lld（%.1f%%）\n",
+                         (long long)g_prof.sweepSeeds, (long long)g_prof.sweepDup,
+                         100.0 * (double)g_prof.sweepDup / (double)g_prof.sweepSeeds);
+        if (g_prof.ikOnceN > 0)
+            std::fprintf(stderr, "  [prof] ikOnce 平均迭代 %.1f 次（上限 90）\n",
+                         (double)g_prof.ikIters / (double)g_prof.ikOnceN);
     }
     return R;
 }
