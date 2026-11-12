@@ -70,6 +70,13 @@ struct Prof {
     // 重复种子必然给出逐位相同的结果，跑第二遍是纯粹的浪费 —— 这是唯一
     // 一种"剪掉不影响任何输出"的剪枝。实测重复率 0%，所以没有可剪的。
     std::atomic<long long> sweepSeeds{0}, sweepDup{0};
+    // 「救回发生在第几组种子」直方图（记的是**第一次**找到合法解的那个下标 i）。
+    // 决定全种子搜能不能只跑前几组：若救回集中在前几组，砍掉后面的就是近无损剪枝，
+    // 而不是"赌深超限救不回来"（那条已被实测否掉）。
+    static constexpr int kIdxBucketN = 6;
+    const char* const kIdxNames[kIdxBucketN] = {"1-2", "3-4", "5-8",
+                                                "9-14", "15-20", "21-27"};
+    std::atomic<long long> overHitIdx[kIdxBucketN] = {};
     long long lastEvals = 0;    // mark() 用：本阶段新增的 eval 次数
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last = t0;
@@ -82,6 +89,7 @@ struct Prof {
         ikIters = 0;
         sweepSeeds = 0; sweepDup = 0;
         for (int i = 0; i < kOverBucketN; ++i) { overCnt[i] = 0; overHitB[i] = 0; }
+        for (int i = 0; i < kIdxBucketN; ++i) overHitIdx[i] = 0;
         lastEvals = 0;
     }
 
@@ -679,6 +687,17 @@ constexpr double kBranchContinuityTrigDeg = 10.0;
 constexpr double kCacheContinuityTrigDeg = 5.0;
 
 // 种子顺序：上一点解（连续性）→ 解析种子（解支正确）→ 固定种子表（兜底）
+//
+// 种子预算：种子已**几何收敛但关节超限**时，后面的种子循环是为了"换个解支不超限"。
+// 实测两个工件，这条路径的产出入不敷出：
+//   背板 13118 次这样的 ik() 跑满 27 组共 273738 次 ikOnce（占全部 ikOnce 的 86%），
+//        只换回 27 个合法解；其中 25 个（92.6%）落在前 2 组，前 8 组覆盖 96.3%。
+//   cx   跑满 27 组换回 155 个，51 个（32.9%）在前 2 组，**104 个落在 5-8 组**，9 组后为 0。
+// 所以预算定 8 组：两个工件的可救回点基本都保住（cx 100%、背板 96.3%），
+// 而 9-27 组在两个工件上都是 0 次救回，纯属白跑。
+// 代价：极少数"要多试十几组才够得着"的点退回违规（背板 5/9687，其中 4 点还变好了）。
+// 要完全恢复旧行为就把这里改成 27。
+constexpr int kOverSweepMax = 8;
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
     if (g_prof.on) ++g_prof.ik;   // 仅诊断计数：常开时 8 线程抢同一条缓存行，实测有 2~3% 开销
     double seeds[1 + 16 + 12][6];
@@ -736,6 +755,9 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
     // 解析种子 / 固定种子。有 seed 且上一点解跳得大时，选关节距离最近的合法解；
     // 没有 seed 时保持旧行为（第一个合法解直接返回）。
     for (int i = (seed ? 1 : 0); i < ns; ++i) {
+        // 超限分支只给前 kOverSweepMax 组预算（见常量处实测数据）。
+        // 注意只对 seedOver 生效：没有 seed（每行首点）时照旧跑完，那条路没有连续性可依。
+        if (seedOver && i > kOverSweepMax) break;
         // 诊断：这组种子是否与前面某组逐位相同（相同则结果必然相同，跑它也白跑）
         if (g_prof.on) {
             ++g_prof.sweepSeeds;
@@ -753,6 +775,12 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
             if (!seed) { if (g_prof.on) ++g_prof.ikFast; return sol; }
             double dist = jointDist2(sol.theta, seed);
             if (!hasValid || dist < bestValidDist) {
+                // 只在**第一次**找到合法解时记账 —— 这才是"至少得跑到第几组"。
+                if (!hasValid && seedOver && g_prof.on) {
+                    const int b = i <= 2 ? 0 : i <= 4 ? 1 : i <= 8 ? 2
+                                : i <= 14 ? 3 : i <= 20 ? 4 : 5;
+                    ++g_prof.overHitIdx[b];
+                }
                 bestValid = sol;
                 bestValidDist = dist;
                 hasValid = true;
@@ -4260,6 +4288,23 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             std::fprintf(stderr, "  [prof] 全种子搜 %lld 组 · 其中与前组逐位重复 %lld（%.1f%%）\n",
                          (long long)g_prof.sweepSeeds, (long long)g_prof.sweepDup,
                          100.0 * (double)g_prof.sweepDup / (double)g_prof.sweepSeeds);
+        {
+            // 救回发生在第几组种子（第一次命中的下标）。累积列用来判断"砍到第 N 组漏多少"。
+            long long tot = 0, cum = 0;
+            std::fprintf(stderr, "  [prof] 救回发生在第几组种子：");
+            for (int i = 0; i < Prof::kIdxBucketN; ++i) {
+                long long h = g_prof.overHitIdx[i].load();
+                tot += h;
+                std::fprintf(stderr, "%s%s %lld", i ? " · " : "", g_prof.kIdxNames[i], h);
+            }
+            std::fprintf(stderr, "  （合计 %lld）\n        累计覆盖率：", tot);
+            for (int i = 0; i < Prof::kIdxBucketN; ++i) {
+                cum += g_prof.overHitIdx[i].load();
+                std::fprintf(stderr, "%s%s %.1f%%", i ? " · " : "", g_prof.kIdxNames[i],
+                             tot ? 100.0 * (double)cum / (double)tot : 0.0);
+            }
+            std::fprintf(stderr, "\n");
+        }
         if (g_prof.ikOnceN > 0)
             std::fprintf(stderr, "  [prof] ikOnce 平均迭代 %.1f 次（上限 90）\n",
                          (double)g_prof.ikIters / (double)g_prof.ikOnceN);
