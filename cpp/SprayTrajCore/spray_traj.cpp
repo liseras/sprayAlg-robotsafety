@@ -1458,9 +1458,19 @@ enum GunSideVerdict { GUN_SIDE_OK = 0, GUN_SIDE_FLIP = 1, GUN_SIDE_REJECT = 2 };
 // ---------- 步骤 1：面内均匀取样，实测 ±n 两侧自由距离 ----------
 // 重新实测而不复用 fo.freePlus/freeMinus：那组值是按 classify 当时的 n 算的，
 // 后面"内壁喷距法向翻转朝腔"（pl.n = fo.n）之后，两侧标签已经对不上当前 n。
+//
+// localNor（可选）：逐点局部法向（CloudNormals::nor，下标与 P 一致）。
+// **曲面块必须传**。为什么：曲面块只有一个"整块拟合的平均平面法向" pl.n，
+// 而曲型板的局部法向与它相差可达几十度 —— 沿平均法向从面上的一点打射线，
+// 等于贴着曲面擦过去，1~3mm 就打回曲面自身，于是被判"枪埋在材料里 → 两侧都
+// 伸不进枪 → 整块拒喷"。实测曲型板（440×546×312，弧高 300）：
+//   沿平均法向 +n 中位 1.2mm（±1~3）  → 拒喷，93% 点数一行不出
+//   沿逐点法向 12/12 采样点 400mm 内无命中 → 空间完全自由
+// 平面块的两者一致，所以默认走 pl.n，行为与原来逐位相同。
 static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
                              const PlaneSeg& s, double standoff,
-                             double& freePlus, double& freeMinus)
+                             double& freePlus, double& freeMinus,
+                             const std::vector<Vec3>* localNor = nullptr)
 {
     const double maxFree = std::max(400.0, standoff*4.0);
     const double hitR = 1.5, collR = 5.0;
@@ -1476,8 +1486,18 @@ static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
         size_t k = (size_t)((double)i/(double)want*(double)N);
         if(k >= N) k = N-1;
         const Vec3 p = P[s.inl[k]];
-        dp.push_back(ray_free_dist(P, tree, p + n*0.4,  n,         maxFree, hitR, collR));
-        dm.push_back(ray_free_dist(P, tree, p - n*0.4,  n*(-1.0),  maxFree, hitR, collR));
+        Vec3 d = n;
+        if(localNor){
+            const Vec3 ln = (*localNor)[(size_t)s.inl[k]];
+            if(len(ln) > 1e-9){
+                d = norm(ln);
+                // PCA 法向无符号：与面级可喷侧对齐，否则 "+n/-n" 会各自乱跳，
+                // 中位数就失去意义。
+                if(dot(d, n) < 0.0) d = d*(-1.0);
+            }
+        }
+        dp.push_back(ray_free_dist(P, tree, p + d*0.4,  d,         maxFree, hitR, collR));
+        dm.push_back(ray_free_dist(P, tree, p - d*0.4,  d*(-1.0),  maxFree, hitR, collR));
     }
     auto med = [](std::vector<double>& v){
         if(v.empty()) return -1.0;
@@ -1493,10 +1513,11 @@ static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
 // 只能"站得住就喷、站不住就拒"，不能靠翻符号洗白。
 static GunSideVerdict verify_gun_side(const std::vector<Vec3>& P, const KdTree& tree,
                                       PlaneSeg& s, const Vec3& partC, double standoff,
-                                      const char* tag, bool allowFlip)
+                                      const char* tag, bool allowFlip,
+                                      const std::vector<Vec3>* localNor = nullptr)
 {
     double fp = -1.0, fm = -1.0;
-    measure_gun_free(P, tree, s, standoff, fp, fm);
+    measure_gun_free(P, tree, s, standoff, fp, fm, localNor);
     // -1 = 量程内无命中 = 完全自由，按大值参与比较
     const double effPlus  = (fp < 0.0) ? 1e9 : fp;
     const double effMinus = (fm < 0.0) ? 1e9 : fm;
@@ -4056,7 +4077,33 @@ static void spray_traj_core(
     // 面级朝向诊断（内壁/外壁）：必须在上面这轮定向之后跑，
     // 否则拿到的是 PCA 的随机符号，n0 与最终 nx 会对不上。
     // 只填 PlaneSeg::fo，不回写 pl.n —— 轨迹输出与本改动前逐字节一致。
-    for(auto& s : segs) s.fo = classify_face_orientation(Pf, cn.tree, s, partC, params->normalFlip);
+    //
+    // 曲面块例外：射线分类是按"整块平均平面法向"测两侧自由距离的，在强曲面上
+    // 这条射线会贴着曲面擦过去、1~3mm 就打回自身，于是把"可喷侧"判到背面
+    // （曲型板实测：+n 侧 1.1mm 命中 → 判 +n 贴材料 → 翻向背面 → angZ 135.8°
+    //  > 130° 窗口 → 93% 点数的整个曲面块一行不出）。曲面块本来就有逐点法向
+    // （surf.n0 已定向朝外、surf.N 逐点对齐），朝向以它为准，这里不再复核；
+    // "内壁"语义对单层外蒙皮也没有意义，记 src=2（几何二义兜底）不触发内壁翻向。
+    for(auto& s : segs){
+        if(s.curved && isCurved){
+            FaceOrient fo;
+            const Vec3& n = s.pl.n;
+            fo.n = n;
+            measure_gun_free(Pf, cn.tree, s, params->standoff,
+                             fo.freePlus, fo.freeMinus, &cn.nor);   // 逐点法向，仅供上报
+            fo.angZ = std::acos(std::max(-1.0, std::min(1.0, n.z)))*180.0/3.141592653589793;
+            fo.tilt = 90.0 - fo.angZ;
+            fo.side = (fo.angZ < 87.0) ? 1 : (fo.angZ > 93.0 ? -1 : 0);
+            fo.isInner = 0;
+            fo.src = 2;
+            s.fo = fo;
+            if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                fprintf(stderr, "[face] 曲面块 n=(%.3f,%.3f,%.3f) angZ=%.1f° 逐点法向自由 +%.1f/-%.1f（不做射线定向）\n",
+                        n.x, n.y, n.z, fo.angZ, fo.freePlus, fo.freeMinus);
+        } else {
+            s.fo = classify_face_orientation(Pf, cn.tree, s, partC, params->normalFlip);
+        }
+    }
 
     // 内壁的喷距法向必须朝腔内。
     // 上面那轮定向（|nz|>0.05 归 +Z 半球 / 近竖直背离质心）对**单层壳内壁**会把法向
@@ -5155,13 +5202,17 @@ static void spray_traj_core(
             char tag[48];
             std::snprintf(tag, sizeof(tag), "面%zu", si);
             const bool allowFlip = !(seg.curved && isCurved);   // 曲面块只判不翻
+            // 曲面块用逐点法向测自由距离：整块平均法向在强曲面上会把射线擦回自身，
+            // 见 measure_gun_free 注释（曲型板曾因此整块拒喷）。平面块仍传 nullptr。
+            const std::vector<Vec3>* ln = (seg.curved && isCurved) ? &cn.nor : nullptr;
             ProfStage psGate("4b0.枪位验收");
             const GunSideVerdict gv = verify_gun_side(Pf, cn.tree, seg, partC,
-                                                      params->standoff, tag, allowFlip);
+                                                      params->standoff, tag, allowFlip, ln);
             if(gv == GUN_SIDE_REJECT){
                 ++nGunReject;
-                fprintf(stderr, "[skip] 面%zu 枪位验收未通过：两侧都伸不进枪（自由 +n=%.1fmm / -n=%.1fmm），"
-                                "不布行（内点数 %zu）\n", si, seg.fo.freePlus, seg.fo.freeMinus, inl.size());
+                fprintf(stderr, "[skip] 面%zu 枪位验收未通过：两侧都伸不进枪（按%s测得 +n=%.1fmm / -n=%.1fmm），"
+                                "不布行（内点数 %zu）\n", si, ln ? "逐点法向" : "面法向",
+                        seg.fo.freePlus, seg.fo.freeMinus, inl.size());
                 continue;
             }
             if(gv == GUN_SIDE_FLIP){
