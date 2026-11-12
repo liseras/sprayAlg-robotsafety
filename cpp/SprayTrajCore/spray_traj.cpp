@@ -319,6 +319,77 @@ namespace {
 
 struct TrajPoint { Vec3 pos; Vec3 dir; double speed; int spray; };
 
+// ---------------- 体素降采样（大点云的第一道闸） ----------------
+// 为什么需要：算法里所有"逐点"阶段（SOR 邻域、法向 PCA、区域生长、枪位净空过滤）
+// 成本都是 O(N × 局部密度)。线扫点云到 100 万点时点间距已到 0.3~0.5mm，而工艺
+// 只要点距 4mm、行距 12mm —— 超出工艺需求的采样对轨迹没有任何贡献，只是把每一段
+// 都拖慢十几倍。实测 212 万点整条流程 128s，其中 116s 花在「内点枪位过滤」这一个
+// 逐点 KD 查询上。降采样后同一块板 15 万点，全流程进 2s 量级，且**点数不再随
+// 扫描仪分辨率增长**（分辨率翻倍只是把体素填得更满，输出点数不变）。
+//
+// 分辨率口径：见 auto_voxel_leaf()——由**工艺行距**定档，下限守住点距/2（采样定理：
+// 点距 p 的点云几何信息只到 p/2），上限 10mm。行距 60 → 7.5mm；行距 12 → 2mm。
+// 点数通常降到 1/5 ~ 1/50。
+//
+// 代表点取"格内最靠近格心的**实测点**"，不是格内均值：
+//   · 不产生点云里不存在的坐标，棱边/薄壁不会被均值拉平（薄壁件最怕这个）；
+//   · 降采样后的点集是原始点的**子集**，几何关系只会变稀、不会变形。
+static std::vector<Vec3> voxel_downsample(const std::vector<Vec3>& P, double leaf)
+{
+    if(leaf <= 1e-9 || P.size() < 20000) return P;   // 小点云不折腾
+    const double inv = 1.0/leaf;
+    struct KV { unsigned long long key; int idx; };
+    std::vector<KV> kv(P.size());
+    // 每轴 21 位（±104 万格；2mm 体素下覆盖 ±2km），加偏移后打包成一个 key，
+    // 排序即分格 —— 比 unordered_map 少几十万次哈希与分配。
+    const long long OFF = 1LL<<20;
+    for(size_t i=0;i<P.size();++i){
+        long long ix = (long long)std::floor(P[i].x*inv) + OFF;
+        long long iy = (long long)std::floor(P[i].y*inv) + OFF;
+        long long iz = (long long)std::floor(P[i].z*inv) + OFF;
+        ix = std::max(0LL, std::min(0x1FFFFFLL, ix));
+        iy = std::max(0LL, std::min(0x1FFFFFLL, iy));
+        iz = std::max(0LL, std::min(0x1FFFFFLL, iz));
+        kv[i].key = ((unsigned long long)ix<<42) | ((unsigned long long)iy<<21) | (unsigned long long)iz;
+        kv[i].idx = (int)i;
+    }
+    std::sort(kv.begin(), kv.end(), [](const KV&a, const KV&b){ return a.key < b.key; });
+    std::vector<Vec3> out; out.reserve(P.size()/4+16);
+    size_t i=0;
+    while(i<kv.size()){
+        const unsigned long long key = kv[i].key;
+        const long long gx = (long long)((key>>42)&0x1FFFFFULL) - OFF;
+        const long long gy = (long long)((key>>21)&0x1FFFFFULL) - OFF;
+        const long long gz = (long long)(key & 0x1FFFFFULL) - OFF;
+        const Vec3 c{ ((double)gx+0.5)*leaf, ((double)gy+0.5)*leaf, ((double)gz+0.5)*leaf };
+        int bestIdx = -1; double bestD = 1e300;
+        for(; i<kv.size() && kv[i].key==key; ++i){
+            const Vec3& p = P[kv[i].idx];
+            const double dx=p.x-c.x, dy=p.y-c.y, dz=p.z-c.z;
+            const double d = dx*dx+dy*dy+dz*dz;
+            if(d < bestD){ bestD = d; bestIdx = kv[i].idx; }
+        }
+        if(bestIdx >= 0) out.push_back(P[bestIdx]);
+    }
+    return out;
+}
+
+// 自动档体素边长：由**工艺行距**定（不是扫描仪分辨率、也不是点距）。
+// 轨迹的唯一硬指标是"每行落在该落的位置"；行距 L 下体素误差只要远小于 L 就不改变轨迹，
+// 取 L/8（L=60mm → 7.5mm，实测轨迹偏差中位 3mm、p95 6mm，≈行距 10%）。
+// 下限守住点距/2（采样定理上限，再细对轨迹无贡献，精细件退回 2mm 口径）；
+// 上限 10mm（实测 10mm 在 8° 斜面上出现 15mm 台阶，最大值翻倍）。
+static double auto_voxel_leaf(const SprayTrajParams* p){
+    const double byRow   = p->scanRowSpacing*0.125;
+    const double byPoint = p->pointSpacing*0.5;
+    return std::min(10.0, std::max(byPoint, byRow));
+}
+// 兜底重试用的临时档位（>0 时覆盖自动档；-1 = 不覆盖）。
+// 为什么需要：双层薄壳在"体素边长大致等于壁厚"的窄带里，两层会被切成两个面、
+// 法向朝壳内，枪位验收判"两侧都伸不进枪"→ 整件不出轨迹（实测 4.0mm 踩中，3/5/7mm 都正常）。
+// 这不是算法错（拒喷是安全侧），但用户没必要为此重跑，退一档重新算即可。
+static double g_voxelLeafOverride = -1.0;
+
 // SOR 去噪
 std::vector<Vec3> sor_filter(const std::vector<Vec3>& P, int k, double z){
     // KnnBuf 是栈上定长桶，K 超过容量会被 init() 截断；这里显式夹一次并提示，
@@ -3793,16 +3864,20 @@ static UpFrame read_up_frame(){
     return f;
 }
 
-SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
-    const double* xyz, int n, const SprayTrajParams* params)
+// 注意：结果**写进出参**，不按值返回。
+// SprayTrajResult 约 289KB；C# P/Invoke 调用时托管侧已经占了一块返回缓冲，
+// 若这一层再多一个按值返回的 289KB 栈帧，UI 线程的 1MB 栈会被直接顶爆
+// （2026-11-12 实测：加了一层 retry 包装后，背板 10.6 万点调用 Stack overflow）。
+static void spray_traj_core(
+    const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out)
 {
-    SprayTrajResult res;
-    std::memset(&res, 0, sizeof(res));
+    SprayTrajResult& res = *out;
+    std::memset(out, 0, sizeof(*out));
     res.error = nullptr;
     ProfStage psTotal("0.总耗时");   // 任意返回路径都会打印
 
     std::string err;
-    if(!xyz || n<10){ err="点云点数不足(<10)"; res.error=_strdup(err.c_str()); return res; }
+    if(!xyz || n<10){ err="点云点数不足(<10)"; res.error=_strdup(err.c_str()); return; }
 
     // 可喷侧参考方向：非 +Z 时先把点云整体旋转到"up = +Z"，出口再转回（见 UpFrame 注释）
     const UpFrame uf = read_up_frame();
@@ -3816,6 +3891,28 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     fprintf(stderr, "[参数] 工艺行距=%.2fmm（只用于布行） 重建几何尺度=%.1fmm（固定，与工艺行距解耦）\n",
             params->scanRowSpacing, kReconGap);
 
+    // ---- 体素降采样：把点云分辨率对齐到工艺，而不是扫描仪 ----
+    // 阈值 12 万点：小件（tray 1.4 万 / complex 8.4 万）完全不受影响，行为逐位不变；
+    // 大点云才走这条路。可用 SPRAYTRAJ_VOXEL=<mm> 显式指定，=0 强制关闭。
+    size_t nAfterVoxel = P.size();
+    {
+        double leaf = 0.0;
+        if(const char* e = std::getenv("SPRAYTRAJ_VOXEL")) leaf = std::atof(e);
+        else if(g_voxelLeafOverride > 1e-6) leaf = g_voxelLeafOverride;   // 兜底重试档
+        else if(n > 120000) leaf = auto_voxel_leaf(params);
+        if(leaf > 1e-6){
+            ProfStage ps("0b.体素降采样");
+            const size_t n0 = P.size();
+            std::vector<Vec3> Pd = voxel_downsample(P, leaf);
+            if(Pd.size() >= 500 && Pd.size() < n0){
+                fprintf(stderr, "[体素] %.1fmm 体素: %zu -> %zu 点 (%.0f%%)，按行距 %.1fmm 定档（误差≈行距 1/8）\n",
+                        leaf, n0, Pd.size(), 100.0*(double)Pd.size()/(double)n0, params->scanRowSpacing);
+                P.swap(Pd);
+            }
+            nAfterVoxel = P.size();
+        }
+    }
+
     double tSor=0, tSplit=0, tMesh=0, tTraj=0;
     // 1. 去噪
     std::vector<Vec3> Pf;
@@ -3823,8 +3920,8 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         ProfStage ps("1.SOR去噪", &tSor);
         Pf = sor_filter(P, params->sorK, params->sorZ);
     }
-    res.removed_points = n - (int)Pf.size();
-    if(Pf.size()<10){ err="去噪后点数不足"; res.error=_strdup(err.c_str()); return res; }
+    res.removed_points = (int)nAfterVoxel - (int)Pf.size();   // 只统计 SOR 剔除，不含体素降采样
+    if(Pf.size()<10){ err="去噪后点数不足"; res.error=_strdup(err.c_str()); return; }
     {
         double zmin=Pf[0].z, zmax=Pf[0].z;
         for(auto&p:Pf){ zmin=std::min(zmin,p.z); zmax=std::max(zmax,p.z); }
@@ -3895,7 +3992,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     // 若分割结果为空（极少见），退回单平面
     if(segs.empty()){
         Plane pl; std::vector<int> inl;
-        if(!fit_plane(Pf, params->flatnessTol, pl, inl)){ err="无法重建有效平面"; res.error=_strdup(err.c_str()); return res; }
+        if(!fit_plane(Pf, params->flatnessTol, pl, inl)){ err="无法重建有效平面"; res.error=_strdup(err.c_str()); return; }
         PlaneSeg seg; seg.pl=pl; seg.inl=inl; segs.push_back(std::move(seg));
     }
 
@@ -5042,6 +5139,9 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
         Plane& pl = seg.pl;
         const auto& inl = seg.inl;
         if(inl.size() < 20) continue;
+        if(std::getenv("SPRAYTRAJ_PROF"))
+            fprintf(stderr, "[prof] ==== 面%zu 进入: 内点=%zu curved=%d isCurved=%d ====\n",
+                    si, inl.size(), (int)seg.curved, (int)isCurved);
 
         // ================= 方向过滤硬闸（最后一道，任何上游标签都绕不过） =================
         // 位置很关键：必须在**所有**定向/劈面/拆层/内壁修正之后，在布行之前。
@@ -5055,6 +5155,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             char tag[48];
             std::snprintf(tag, sizeof(tag), "面%zu", si);
             const bool allowFlip = !(seg.curved && isCurved);   // 曲面块只判不翻
+            ProfStage psGate("4b0.枪位验收");
             const GunSideVerdict gv = verify_gun_side(Pf, cn.tree, seg, partC,
                                                       params->standoff, tag, allowFlip);
             if(gv == GUN_SIDE_REJECT){
@@ -5303,9 +5404,12 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
             // 变成 19.4 < 20，蛇形换行的连接段从端点出发必然判失败 → 整面退化成
             // 抬枪绕行。多留 1mm 让连接段有可用余量，覆盖损失 1mm 可忽略。
             const double gunClear = gunClearEff + 1.0;
-            std::vector<int> keep; keep.reserve(inl.size());
-            int drop = 0;
-            for(int i : inl){
+            // 逐点独立，且只读点云/面几何（KD 查询是 const），可直接分块并行。
+            // 大点云（68 万点）上这一段原本是整条流程 87% 的耗时。
+            std::vector<unsigned char> keepFlag(inl.size(), 1);
+            std::atomic<int> dropN{0};
+            parallel_for((int)inl.size(), [&](int ii){
+                const int i = inl[(size_t)ii];
                 Vec3 q = Pf[i] + pl.n*params->standoff;
                 // 只判 "d < gunClear"，用半径上界查询；远点 O(log n) 剪枝。
                 double d = partTree.nearestWithinExcept(q, gunClear, faceSkipMask[si]);
@@ -5313,16 +5417,21 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
                 // 为什么必须补这一条：上面那次查询会剪掉本面（faceSkipMask[si]），
                 // 法向一旦反了，枪位就正好藏在本面材料里，而本面点又被剪掉 → 查不到 → 放行。
                 // 正常面枪位离本面就是 standoff(100mm)，这条恒过、不误杀；法向反了会立刻掉到个位数。
-                {
-                    KnnBuf kb;
-                    partTree.knn(q, 1, kb);
-                    if(kb.n > 0) d = std::min(d, std::sqrt(kb.d2[0]));
-                }
+                //
+                // 这里**必须**用 nearestWithin 而不是精确 knn(q,1)：
+                // 枪位天然在工件外 standoff(100mm) 处，精确 KNN 要把半径 100mm 球内的
+                // 分支全部展开，薄壳点云上等于每次遍历 3 万+ 点（实测单次 ~200μs），
+                // 整个过滤退化成 O(N × 3万)。而本处只判 "d < gunClear"，
+                // nearestWithin 返回 min(真实最近距离, gunClear)，对这条判据逐位等价。
+                d = std::min(d, partTree.nearestWithin(q, gunClear));
                 d = std::min(d, planeClearAt(q, (int)si));   // 面几何（棱边点可能被去噪删掉）
                 d = std::min(d, edgeClearAt(q, (int)si));    // 棱边/边界线
-                if(d < gunClear){ ++drop; continue; }
-                keep.push_back(i);
-            }
+                if(d < gunClear){ keepFlag[(size_t)ii] = 0; ++dropN; }
+            });
+            std::vector<int> keep; keep.reserve(inl.size());
+            for(size_t ii=0; ii<inl.size(); ++ii)
+                if(keepFlag[ii]) keep.push_back(inl[ii]);
+            const int drop = dropN.load();
             if(drop > 0 && keep.size() >= 20){
                 seg.inl.swap(keep);        // inl 是 seg.inl 的引用，内容随之更新
                 if(std::getenv("SPRAYTRAJ_FACE_DBG"))
@@ -6536,7 +6645,7 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
 
     if(allPts.empty()){
         err = nDownSkip>0 ? "无有效扫描行（所有面可喷侧朝下，超出角度窗口被滤除）" : "无有效扫描行";
-        res.error=_strdup(err.c_str()); return res;
+        res.error=_strdup(err.c_str()); return;
     }
     res.rows = totalRows;
 
@@ -6603,7 +6712,44 @@ SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
     }
     res.seg_len_mean = segCnt>0? sm/segCnt:0;
     res.seg_len_max = smax;
-    return res;
+}
+
+// ---- 对外入口：核心流程 + 体素档位兜底重试 ----
+// 只处理一种可自愈的失败：整件因为"枪位验收不过"而没出行。
+// 成因是双层薄壳正好被体素切成两层（见 auto_voxel_leaf 上方注释），退一档
+// （粗 1.6×，两层合并）即可恢复；多花 0.3~0.5s，且只在失败时发生。
+// 不动"朝下被角度窗口滤除"那种——那是工艺判定，退档不会变好，白等。
+// 用户显式指定了 -voxel / SPRAYTRAJ_VOXEL 时不介入（他要的就是那个档）。
+//
+// 全程只写 out，不产生按值返回的大结构体：调用方（P/Invoke 或栈上局部）
+// 只需要一块 289KB 的结果区，栈占用与改造前一致。
+static void run_with_retry(const double* xyz, int n, const SprayTrajParams* params,
+                           SprayTrajResult* out)
+{
+    spray_traj_core(xyz, n, params, out);
+    if(out->error && params && n > 120000 && !std::getenv("SPRAYTRAJ_VOXEL")
+       && std::strstr(out->error, "无有效扫描行") && !std::strstr(out->error, "朝下")){
+        double leaf = auto_voxel_leaf(params);
+        for(int k=0;k<2;++k){
+            leaf *= 1.6;                                  // 7.5 → 12 → 19
+            if(leaf > 25.0) break;
+            fprintf(stderr, "[体素] 整件无有效行（薄壳/档位巧合），退档重试 %.1fmm\n", leaf);
+            spray_traj_free(out);
+            g_voxelLeafOverride = leaf;
+            spray_traj_core(xyz, n, params, out);
+            if(!out->error) break;
+        }
+        g_voxelLeafOverride = -1.0;
+    }
+}
+
+SPRAYTRAJ_API SprayTrajResult spray_traj_generate(
+    const double* xyz, int n, const SprayTrajParams* params)
+{
+    // 返回值直接用 sret 槽（NRVO），不额外复制：这里不能再有第二个大结构体局部变量。
+    SprayTrajResult r;
+    run_with_retry(xyz, n, params, &r);
+    return r;
 }
 
 SPRAYTRAJ_API void spray_traj_free(SprayTrajResult* res){
@@ -6621,9 +6767,8 @@ SPRAYTRAJ_API int spray_traj_generate_ex(const double* xyz, int n,
                                          const SprayTrajParams* params, SprayTrajResult* out){
     if(!out) return -1;
     std::memset(out, 0, sizeof(*out));
-    SprayTrajResult r = spray_traj_generate(xyz, n, params);
-    *out = r;                       // points/error 指针所有权随之转移，调用方负责 spray_traj_free
-    return r.error ? 1 : 0;
+    run_with_retry(xyz, n, params, out);      // 直接写进调用方缓冲区，不产生栈上大副本
+    return out->error ? 1 : 0;
 }
 
 SPRAYTRAJ_API void spray_traj_abi_sizes(int* paramsSize, int* planeSize, int* resultSize){
