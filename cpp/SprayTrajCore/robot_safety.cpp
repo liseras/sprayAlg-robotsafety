@@ -551,6 +551,16 @@ int analyticSeeds(const V3& pTcp, const M3& RTcp, double toolLen, double out[][6
     return cnt;
 }
 
+// IK 收敛容差。原先迭代跑到 0.02mm / 0.02° 才 break，而验收标准 valid() 只要 0.05 ——
+// 也就是说每个种子都要多磨十几轮，去够一个没人用的精度，而真正的验收在 2.5 倍之外。
+// 喷涂工艺上 0.1mm / 0.1° 早已远超需要：喷距 100mm 时 0.1° 只对应 0.17mm 的横向偏移，
+// 远小于漆膜本身的宽度。故把"迭代目标"和"验收门槛"一起按工艺尺度定档。
+constexpr double kIkPosTolMM = 0.10;    // 迭代收敛判据（位置）
+constexpr double kIkRotTolDeg = 0.10;   // 迭代收敛判据（姿态）
+constexpr double kIkValidPosMM = 0.20;  // 判定「这个解能用」的门槛（位置）
+constexpr double kIkValidRotDeg = 0.20; // 判定「这个解能用」的门槛（姿态）
+constexpr int kIkMaxIters = 40;         // 原 90；配合上面的容差，跑满 40 的基本都是真失败（再降到 30 实测只快 4%，已到边际）
+
 // 阻尼最小二乘的单次迭代
 IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double seed[6]) {
     double th[6];
@@ -565,7 +575,7 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
     // 提到循环外不改变任何数值：fk 只读自己上一轮写过的 frames[i]，不读初值。
     FkOut f;
 
-    for (int it = 0; it < 90; ++it) {
+    for (int it = 0; it < kIkMaxIters; ++it) {
         ++iters;
         fk(th, toolLen, f);
         V3 ep = pTarget - f.tcp.t;
@@ -586,7 +596,7 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
         // 就是因为每十来次挤出一点点进步，把绝对版 stall 反复清零。
         if (en < prevBest * 0.995) stall = 0;
         else ++stall;
-        if (norm(ep) < 0.02 && norm(er) * kRad < 0.02) break;
+        if (norm(ep) < kIkPosTolMM && norm(er) * kRad < kIkRotTolDeg) break;
 
         // ---- 停滞提前退出（不改变任何返回值的语义）
         // 这个 DLS 的阻尼是"不进步就 ×1.5"单调涨的，连涨十几次就接近上限 5e3，
@@ -713,7 +723,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
     }
 
     auto valid = [](const IkSol& s) {
-        return s.ok && s.posErr < 0.05 && s.rotErrDeg < 0.05 && !s.over;
+        return s.ok && s.posErr < kIkValidPosMM && s.rotErrDeg < kIkValidRotDeg && !s.over;
     };
     IkSol best;
     bool hasBest = false;
