@@ -28,6 +28,18 @@ namespace SprayTrajViewer
         private readonly List<Visual3D> _planeVisuals = new();
         // 点云与轨迹的视觉元素引用（用于独立显隐）
         private PointsVisual3D? _cloudVisual;
+
+        // ── 坐标系指示 ────────────────────────────────────────────────────
+        // 场景内三色轴（箭头 + 标签）的视觉对象，用于整体增删。
+        // 为什么还要一个 2D 的 HUD：face 视角是按「面0」取景的，场景轴可能落在
+        // 画幅之外；而且工件挡住轴是常事。HUD 是叠层，永远在左上角，随相机转。
+        private readonly List<Visual3D> _axisVisuals = new();
+        // 场景内三色轴的臂长（mm）：按工件尺寸自适应，见 RenderAxes()
+        private double _axisLen = 100.0;
+        // X/Y/Z 三色约定，场景轴与 HUD 共用一套，避免两处颜色对不上
+        static readonly Color AxisColorX = Color.FromRgb(0xF2, 0x5B, 0x52);
+        static readonly Color AxisColorY = Color.FromRgb(0x4A, 0xD0, 0x6A);
+        static readonly Color AxisColorZ = Color.FromRgb(0x4C, 0x9A, 0xFF);
         // 喷涂段（spray=1，枪开）：红色
         private readonly List<TubeVisual3D> _trajVisuals = new();
         // 空移段（spray=0，枪关）：亮蓝色。单独留引用是必须的 ——
@@ -55,8 +67,12 @@ namespace SprayTrajViewer
         {
             InitializeComponent();
             InstallSafeCopyCommand();
+            // 左上角坐标轴指示器随视角转：相机一动就重投影三个世界轴。
+            // 订阅 CameraChanged 而不是每帧渲染回调 —— 后者在拖拽时每帧都触发，
+            // 会把 WPF 布局线程拖住（这个 Canvas 每帧重建几十个 Shape）。
+            Viewport.CameraChanged += (_, _) => UpdateAxisHud();
             // ABI 自检：与 C++ `spray_safety.exe --abi` 打印的 sizeof 对齐
-            // （Plane=18664 Point=64 Result=298744 Params=128；SafetyParams=152 SafetyPoint=216 SafetyResult=304）
+            // （Plane=18664 Point=64 Result=298744 Params=128；SafetyParams=160 SafetyPoint=216 SafetyResult=304）
             try
             {
                 App.Log("ABI", null,
@@ -191,6 +207,41 @@ namespace SprayTrajViewer
 
             var rtb = new RenderTargetBitmap((int)w, (int)h, 96, 96, PixelFormats.Pbgra32);
             rtb.Render(Viewport);
+
+            // HUD 是 Viewport 的**兄弟**控件，rtb.Render(Viewport) 拍不到它。
+            // 验收截图里没有坐标轴的话，这个功能等于只在屏幕上有、在证据里没有，
+            // 所以单独渲染一次叠加到同一张位图上。
+            // 注意必须按它在视口里的**实际偏移**落位：它现在挂在底部 StackPanel 里
+            // （左下角、面清单表格上方），直接 DrawImage 到 (0,0) 会跑到左上角去。
+            if (ChkShowAxis?.IsChecked == true && AxisHud != null && AxisHud.Visibility == Visibility.Visible)
+            {
+                try
+                {
+                    AxisHud.UpdateLayout();
+                    int hw = (int)Math.Ceiling(AxisHud.ActualWidth);
+                    int hh = (int)Math.Ceiling(AxisHud.ActualHeight);
+                    if (hw > 0 && hh > 0)
+                    {
+                        var hud = new RenderTargetBitmap(hw, hh, 96, 96, PixelFormats.Pbgra32);
+                        hud.Render(AxisHud);
+
+                        Point off;
+                        try { off = AxisHud.TransformToAncestor(Viewport).Transform(new Point(0, 0)); }
+                        catch { off = new Point(12, 12); }   // 还没进视觉树：退回左上角，至少不崩
+
+                        var dv = new DrawingVisual();
+                        using (var dc = dv.RenderOpen())
+                        {
+                            dc.DrawImage(rtb, new Rect(0, 0, w, h));
+                            dc.DrawImage(hud, new Rect(off.X, off.Y, hw, hh));
+                        }
+                        var merged = new RenderTargetBitmap((int)w, (int)h, 96, 96, PixelFormats.Pbgra32);
+                        merged.Render(dv);
+                        rtb = merged;
+                    }
+                }
+                catch (Exception ex) { App.Log("SHOT/HUD-FAIL", ex); }
+            }
 
             var enc = new PngBitmapEncoder();
             enc.Frames.Add(BitmapFrame.Create(rtb));
@@ -386,6 +437,9 @@ namespace SprayTrajViewer
             if (o.TryGetValue("show-fixed", out v)) ChkShowFixed.IsChecked = v != "0";
             // --show-risk 0：藏掉风险点，只看轨迹本身（截图/讲解时用）
             if (o.TryGetValue("show-risk", out v)) ChkShowRisk.IsChecked = v != "0";
+            // --show-axis 0：藏掉坐标系（场景三色轴 + 左上角指示器）。
+            // 给"对比新旧算法输出"这类验收截图用：画面里多三根箭头会干扰比对。
+            if (o.TryGetValue("show-axis", out v)) ChkShowAxis.IsChecked = v != "0";
 
             App.Log("CLI", null, $"ply={TxtPath.Text}");
             App.Log("CLI", null,
@@ -809,7 +863,10 @@ namespace SprayTrajViewer
         /// <summary>
         /// 步骤 1：读手眼标定矩阵，返回 4×4 行主序（16 个 double）。
         ///
-        /// 约定 p_base = R·p_cam + t，文件可以是 4×4 或 3×4；<c>#</c> 之后当注释。
+        /// 约定 p_base = R·p_cam + t。两种格式都收：
+        ///   · 纯文本：4×4 或 3×4，<c>#</c> 之后当注释（config\handeye_cam2base.txt）；
+        ///   · 标定台 JSON：<c>handeye-cam2base-v3</c>，按 <c>"Matrix"</c> 字段取数
+        ///     （喷涂点云_DENSO可达\handeye_cam2base.json 就是这种）。
         /// 校验只告警不拦：现场标定本身就有几度误差，硬拦下来反而没法用；
         /// 但偏离正交到 1e-2 以上基本就是抄错/行列颠倒，必须让人看见。
         /// </summary>
@@ -830,6 +887,23 @@ namespace SprayTrajViewer
             if (!System.IO.File.Exists(path)) { err = $"手眼矩阵文件不存在：{spec}"; return null; }
 
             string raw = System.IO.File.ReadAllText(path);
+
+            // ---------- 分支 A：标定台导出的 JSON（handeye-cam2base-v3） ----------
+            // 必须按 "Matrix" 字段取数，不能沿用下面的「扫全文件数字」：
+            // 那个口子对纯文本 4×4 是对的，碰上 JSON 会把 "v3" 里的 3、"cam2base" 里的 2、
+            // SolvedAt 的 2026-11-09 16:48:44、ManualSliders 的 6 个滑条值一起抓进来，
+            // 矩阵整体错位两个元素，自检报出来的就是「旋转部分不像纯旋转」。
+            // 2026-11-13 实测：加载 喷涂点云_DENSO可达\handeye_cam2base.json 报 1.4e+6 即此因 ——
+            // 看着像标定错了，其实一个矩阵元素都没读对。
+            if (LooksLikeJson(raw))
+            {
+                double[]? jm = ReadHandEyeJson(raw, out string? jerr);
+                if (jm == null) { err = jerr; return null; }
+                CheckHandEyeMatrix(jm, path, "json");
+                return jm;
+            }
+
+            // ---------- 分支 B：纯文本（4×4 / 3×4，# 之后当注释） ----------
             raw = string.Join("\n", raw.Split('\n').Select(ln =>
             {
                 int k = ln.IndexOf('#');
@@ -857,8 +931,168 @@ namespace SprayTrajViewer
             else
                 for (int i = 0; i < 12; i++) M[i] = nums[i];
 
-            // 正交性/行列式自检：det 不接近 +1 说明不是纯旋转（含缩放或镜像），
-            // 那种矩阵把点云搬过去会变形，比例、尺寸全错。
+            CheckHandEyeMatrix(M, path, "text");
+            return M;
+        }
+
+        /// <summary>
+        /// 内容看着像 JSON 吗（标定台导出的 .json 以 <c>{</c> 开头）。
+        /// 只看第一个非空白字符：文件里带 BOM 也能认出来。
+        /// </summary>
+        static bool LooksLikeJson(string raw)
+        {
+            foreach (char ch in raw)
+            {
+                if (char.IsWhiteSpace(ch) || ch == '\uFEFF') continue;
+                return ch == '{' || ch == '[';
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 读标定台 JSON（handeye-cam2base-v3）里的 4×4 矩阵，返回 16 个 double（行主序）。
+        ///
+        /// 只认 **Matrix 字段**（大小写不敏感，允许嵌在子对象里），绝不扫全文件数字：
+        /// 同一份文件里 Format 的 "v3"、PairCount、RotResidualDeg、SolvedAt 的日期、
+        /// ManualSliders 的 6 个滑条值全是数字陷阱，扫进去就是错位。
+        /// 支持 4×4 / 3×4 嵌套数组，也支持 16 / 12 个数的平铺数组。
+        /// </summary>
+        double[]? ReadHandEyeJson(string raw, out string? err)
+        {
+            err = null;
+            System.Text.Json.JsonDocument doc;
+            try
+            {
+                doc = System.Text.Json.JsonDocument.Parse(raw);
+            }
+            catch (Exception ex)
+            {
+                err = $"手眼矩阵 JSON 解析失败：{ex.Message}";
+                return null;
+            }
+
+            using (doc)
+            {
+                if (!TryFindMatrixField(doc.RootElement, 0, out System.Text.Json.JsonElement el))
+                {
+                    err = "手眼矩阵 JSON 里没找到 Matrix 字段（期望形如 \"Matrix\": [[…4×4…]]）";
+                    return null;
+                }
+                if (el.ValueKind != System.Text.Json.JsonValueKind.Array)
+                {
+                    err = "手眼矩阵 JSON 的 Matrix 字段不是数组";
+                    return null;
+                }
+
+                // 逐元素收数：嵌套数组按行收，平铺数组进 flat
+                var rows = new List<double[]>();
+                var flat = new List<double>();
+                bool nested = false;
+                foreach (System.Text.Json.JsonElement item in el.EnumerateArray())
+                {
+                    if (item.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        nested = true;
+                        var row = new List<double>();
+                        foreach (System.Text.Json.JsonElement v in item.EnumerateArray())
+                        {
+                            if (v.ValueKind != System.Text.Json.JsonValueKind.Number || !v.TryGetDouble(out double d))
+                            {
+                                err = "手眼矩阵 JSON 的 Matrix 里混有非数字元素";
+                                return null;
+                            }
+                            row.Add(d);
+                        }
+                        rows.Add(row.ToArray());
+                    }
+                    else if (item.ValueKind == System.Text.Json.JsonValueKind.Number)
+                    {
+                        if (!item.TryGetDouble(out double d))
+                        {
+                            err = "手眼矩阵 JSON 的 Matrix 里混有非数字元素";
+                            return null;
+                        }
+                        flat.Add(d);
+                    }
+                    else
+                    {
+                        err = "手眼矩阵 JSON 的 Matrix 里混有非数字元素";
+                        return null;
+                    }
+                }
+
+                var M = new double[16];
+                M[15] = 1.0;
+                if (nested)
+                {
+                    int rc = rows.Count;
+                    int cc = rc > 0 ? rows[0].Length : 0;
+                    foreach (var r in rows)
+                        if (r.Length != cc) { err = "手眼矩阵 JSON 的 Matrix 各行长度不一致"; return null; }
+
+                    if (rc == 4 && cc == 4)
+                        for (int r = 0; r < 4; r++)
+                            for (int c = 0; c < 4; c++) M[r * 4 + c] = rows[r][c];
+                    else if (rc == 3 && cc == 4)
+                        for (int r = 0; r < 3; r++)
+                            for (int c = 0; c < 4; c++) M[r * 4 + c] = rows[r][c];
+                    else
+                    {
+                        err = $"手眼矩阵 JSON 的 Matrix 是 {rc}×{cc}，只认 4×4 或 3×4" +
+                              (rc == 4 && cc == 3
+                                  ? "（4×3 通常是把 3×4 存成了转置，请回标定台重新导出）"
+                                  : "");
+                        return null;
+                    }
+                }
+                else
+                {
+                    if (flat.Count >= 16)
+                        for (int i = 0; i < 16; i++) M[i] = flat[i];
+                    else if (flat.Count >= 12)
+                        for (int i = 0; i < 12; i++) M[i] = flat[i];
+                    else
+                    {
+                        err = $"手眼矩阵 JSON 的 Matrix 只有 {flat.Count} 个数，至少要 12 个（3×4）";
+                        return null;
+                    }
+                }
+                return M;
+            }
+        }
+
+        /// <summary>
+        /// 在 JSON 里找 Matrix 字段：先扫本层（优先精确名），再递归进子对象，最多 4 层。
+        /// 标定台是顶层直给；留递归是为了兼容以后包一层 <c>"HandEye": {...}</c> 的导出格式。
+        /// </summary>
+        static bool TryFindMatrixField(System.Text.Json.JsonElement root, int depth,
+                                       out System.Text.Json.JsonElement found)
+        {
+            found = default;
+            if (depth > 4 || root.ValueKind != System.Text.Json.JsonValueKind.Object) return false;
+
+            foreach (System.Text.Json.JsonProperty p in root.EnumerateObject())
+                if (string.Equals(p.Name, "Matrix", StringComparison.OrdinalIgnoreCase) &&
+                    p.Value.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    found = p.Value;
+                    return true;
+                }
+            foreach (System.Text.Json.JsonProperty p in root.EnumerateObject())
+                if (p.Value.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                    TryFindMatrixField(p.Value, depth + 1, out found))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 正交性 / 行列式自检，只告警不拦。
+        ///
+        /// 现场标定本身就有几度误差（这份文件自称手工滑条对齐），硬拦下来反而没法用；
+        /// 但 |RRᵀ−I| 到 1e-2 以上基本就是抄错/行列颠倒，必须让人看见 —— 见提示文案。
+        /// </summary>
+        void CheckHandEyeMatrix(double[] M, string path, string src)
+        {
             double o = 0;
             for (int r = 0; r < 3; r++)
                 for (int c = 0; c < 3; c++)
@@ -873,12 +1107,17 @@ namespace SprayTrajViewer
                 M[2] * (M[4] * M[9] - M[5] * M[8]);
 
             App.Log("HANDEYE/M", null,
-                $"{path} |RR^T-I|max={o:G4} det={det:F6} t=({M[3]:F2},{M[7]:F2},{M[11]:F2})");
+                $"{path} src={src} |RR^T-I|max={o:G4} det={det:F6} t=({M[3]:F2},{M[7]:F2},{M[11]:F2})");
             if (o > 1e-2)
             {
+                // 把 3×3 原样打进日志：对话框一关就看不到数了，行列颠倒/转置肉眼一比就出来
+                App.Log("HANDEYE/R", null, string.Join(" ",
+                    Enumerable.Range(0, 3).Select(r =>
+                        $"({M[r * 4]:F4},{M[r * 4 + 1]:F4},{M[r * 4 + 2]:F4})")));
                 MessageBox.Show(
                     $"手眼矩阵的旋转部分不像纯旋转（|RRᵀ−I| = {o:F4g}）。\n\n" +
-                    "常见原因：行列抄颠倒、把 3×4 当成 4×3 读、或者混进了缩放。\n" +
+                    "常见原因：行列抄颠倒、把 3×4 当成 4×3 读、混进了缩放，" +
+                    "或者导出的 4×4 是转置。\n" +
                     "点云搬过去会变形，尺寸和倾角都会偏。请先核对矩阵再继续。",
                     "手眼矩阵校验", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
@@ -891,7 +1130,6 @@ namespace SprayTrajViewer
                     "这两种情况点云都会变形，建议先修正标定再继续。",
                     "手眼矩阵校验", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
-            return M;
         }
 
         /// <summary>
@@ -1227,6 +1465,10 @@ namespace SprayTrajViewer
             // 两种情况下旧镜头都不再适用（换坐标系时工件整体平移约 1.5 米并转 90° 级，
             // 保住旧镜头会让人看到一片空白，以为程序挂了）。
             Viewport.ZoomExtents(200);
+            // 坐标轴要在 ZoomExtents **之后**画：轴本身伸出工件包围盒 22%，
+            // 若先加进去，ZoomExtents 会把轴也算进范围，画面被无谓地拉远一圈。
+            RenderAxes();
+            ApplyAxisVisibility();
             ApplyCloudVisibility();
             App.Log("CLOUD", null,
                 $"绘制 {pts.Count}/{_cloud.Count} 点（等距抽样 step={step}，点径={_cloudVisual.Size}）");
@@ -1553,7 +1795,7 @@ namespace SprayTrajViewer
                 string kind = p.side > 0 ? "正向" : (p.side < 0 ? "反向" : "竖直");
                 string src = p.sideSrc == 1 ? "射线" : (p.sideSrc == 3 ? "强制"
                            : (p.sideSrc == 4 ? "薄壁" : (p.sideSrc == 5 ? "双面"
-                           : (p.sideSrc == 6 ? "同向" : "兜底"))));
+                           : (p.sideSrc == 6 ? "同向" : (p.sideSrc == 7 ? "回并" : "兜底")))));
                 string fp = p.freePlus < 0 ? "∞" : p.freePlus.ToString("F0");
                 string fm = p.freeMinus < 0 ? "∞" : p.freeMinus.ToString("F0");
 
@@ -1561,6 +1803,7 @@ namespace SprayTrajViewer
                 if (!hasDiag) note = "无诊断数据（旧 DLL）";
                 else if (dual) note = $"薄板双面：按壁厚 {p.layerThick:F1}mm 补出的另一面";
                 else if (single) note = "单层壳：这一面在点云里只有一层点，没有壁厚";
+                else if (p.sideSrc == 7) note = "同向回并：两片平行且投影重合，已合回一张面（间距≤8mm，重合度≥85%）";
                 else if (p.sideSrc == 6) note = "拆层同向：两片朝向一致，是台阶/两层平台，不是壁的两侧（各自布行）";
                 else if (p.sideSrc == 4) note = p.isInner > 0
                     ? "薄壁拆层：内壁（法向朝腔体）"
@@ -2024,6 +2267,9 @@ namespace SprayTrajViewer
             // ---------- 步骤 6：坐标系标签 ----------
             // 常驻显示，避免"看着像算法错了其实是坐标系没切"这类误判。
             TxtFrameTag.Text = $"视图坐标系：{DisplayFrameName()}";
+            // 坐标系跟着一起重画：工件换了位置/尺度，轴的落点和臂长都要跟着变
+            RenderAxes();
+            ApplyAxisVisibility();
             BdFrameTag.Background = new SolidColorBrush(DisplayPose() == null
                 ? Color.FromArgb(0xCC, 0x37, 0x41, 0x51)      // 相机系：灰蓝
                 : Color.FromArgb(0xCC, 0x06, 0x5F, 0x46));    // 基座系：墨绿，一眼区分
@@ -3429,6 +3675,212 @@ namespace SprayTrajViewer
         }
 
         /// <summary>
+        /// 场景内的三色坐标轴：画在工件包围盒的角落外侧，长度按工件尺寸自适应。
+        ///
+        /// 位置选在包围盒 (minX, minY, minZ) 再往 -X/-Y/-Z 各退开 6% 跨度，
+        /// 这样轴不会插进点云里 —— 插进去就会被当成面片的一部分，读数全乱。
+        /// 用 Lambert 材质：受光后三个面亮暗不同，能看出是圆柱体而不是三条线。
+        /// </summary>
+        void RenderAxes()
+        {
+            foreach (var v in _axisVisuals) Viewport.Children.Remove(v);
+            _axisVisuals.Clear();
+            if (_cloud.Count == 0 && _planes.Count == 0 && _trajVisuals.Count == 0) return;
+
+            var b = ComputeSceneBounds();
+            if (b is not Rect3D r || r.IsEmpty) return;
+            double span = Math.Max(Math.Max(r.SizeX, r.SizeY), Math.Max(r.SizeZ, 1.0));
+            _axisLen = span * 0.22;              // 22% 跨度：够看清，又不喧宾夺主
+            double dia = _axisLen * 0.022;        // 轴径按臂长走，长短轴视觉粗细一致
+            double head = _axisLen * 0.20;
+
+            // 原点退到包围盒的 (minX,minY,minZ) 角外侧，并往相机方向稍抬一点，
+            // 避免正好贴在工件最低表面上被面片遮住。
+            double off = span * 0.06;
+            var o = new Point3D(r.X - off, r.Y - off, r.Z - off);
+
+            void AddAxis(Vector3D dir, Color col, string label)
+            {
+                var tip = o + dir * _axisLen;
+                var arrow = new ArrowVisual3D
+                {
+                    Point1 = o,
+                    Point2 = tip,
+                    Diameter = dia,
+                    HeadLength = head,
+                    Fill = new SolidColorBrush(col),
+                };
+                Viewport.Children.Add(arrow);
+                _axisVisuals.Add(arrow);
+
+                var txt = new BillboardTextVisual3D
+                {
+                    Position = o + dir * (_axisLen * 1.13),
+                    Text = label,
+                    Foreground = new SolidColorBrush(col),
+                    FontSize = 13,
+                    FontWeight = FontWeights.Bold,
+                    // 深色背景打底：工件是亮的、背景是深灰的，纯文字在两种底上都会糊
+                    Background = new SolidColorBrush(Color.FromArgb(0xB0, 0x00, 0x00, 0x00)),
+                    BorderBrush = new SolidColorBrush(Color.FromArgb(0x40, 0xFF, 0xFF, 0xFF)),
+                    Padding = new Thickness(2, 0, 2, 0),
+                };
+                Viewport.Children.Add(txt);
+                _axisVisuals.Add(txt);
+            }
+
+            AddAxis(new Vector3D(1, 0, 0), AxisColorX, "X");
+            AddAxis(new Vector3D(0, 1, 0), AxisColorY, "Y");
+            AddAxis(new Vector3D(0, 0, 1), AxisColorZ, "Z");
+
+            App.Log("AXIS", null,
+                $"场景坐标轴：原点=({o.X:F1},{o.Y:F1},{o.Z:F1}) 臂长={_axisLen:F1}mm " +
+                $"（工件跨度={span:F1}mm，显示系：{DisplayFrameName()}）");
+        }
+
+        void ApplyAxisVisibility()
+        {
+            if (Viewport == null || ChkShowAxis == null) return;
+            bool show = ChkShowAxis.IsChecked.GetValueOrDefault(true);
+            foreach (var v in _axisVisuals)
+            {
+                bool inTree = Viewport.Children.Contains(v);
+                if (show && !inTree) Viewport.Children.Add(v);
+                else if (!show && inTree) Viewport.Children.Remove(v);
+            }
+            // HUD 是普通 2D 控件，直接改 Visibility
+            if (AxisHud != null) AxisHud.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            if (show) UpdateAxisHud();
+        }
+
+        /// <summary>
+        /// 左上角指示器：把三个世界轴**只按相机旋转**投影到屏幕，画成三根短线。
+        ///
+        /// 关键点：这里只取相机基（right/up/forward），不含任何平移与缩放 ——
+        /// 所以工件挪到 1.5 米外、镜头拉远到 3 米，指示器的长度和朝向都不受影响，
+        /// 它回答的是"我现在从哪个方向看工件"，这正是"分不清哪个轴"时要的答案。
+        ///
+        /// 屏幕 y 轴向下，所以世界 up 方向要取负号，否则 Z 会画到下方、与直觉相反。
+        /// </summary>
+        void UpdateAxisHud()
+        {
+            if (AxisCanvas == null || TxtAxisFrame == null) return;
+            if (ChkShowAxis?.IsChecked != true) return;
+
+            AxisCanvas.Children.Clear();
+            TxtAxisFrame.Text = $"视图坐标系：{DisplayFrameName()}";
+
+            var cam = Viewport.Camera;
+            if (cam == null) return;
+
+            // 相机基：视线方向的反向就是「朝屏幕里」，再差乘出右/上
+            var look = cam.LookDirection;
+            if (look.Length < 1e-9) return;
+            look.Normalize();
+            var view = -look;                          // 屏幕外 → 里
+            var right = Vector3D.CrossProduct(cam.UpDirection, view);
+            if (right.Length < 1e-9) return;
+            right.Normalize();
+            var up = Vector3D.CrossProduct(view, right);
+            up.Normalize();
+
+            double cx = AxisCanvas.Width / 2, cy = AxisCanvas.Height / 2;
+            // 0.62 而不是 0.85：给箭头与字母留出边距，短轴也不会顶到画布边界
+            double scale = Math.Min(cx, cy) * 0.62;
+
+            // 先画**伸向屏幕里**的轴，再画屏幕内的，最后画朝观察者的 ——
+            // 靠绘制顺序模拟遮挡，避免三根线在原点糊成一团。
+            var axes = new (Vector3D dir, Color col, string label)[]
+            {
+                (new Vector3D(1, 0, 0), AxisColorX, "X"),
+                (new Vector3D(0, 1, 0), AxisColorY, "Y"),
+                (new Vector3D(0, 0, 1), AxisColorZ, "Z"),
+            };
+            var ordered = axes
+                .Select(a => new
+                {
+                    a.dir, a.col, a.label,
+                    depth = Vector3D.DotProduct(a.dir, view),   // >0 = 伸进屏幕
+                    sx = cx + Vector3D.DotProduct(a.dir, right) * scale,
+                    sy = cy - Vector3D.DotProduct(a.dir, up) * scale,
+                })
+                .OrderByDescending(a => a.depth)
+                .ToList();
+
+            foreach (var a in ordered)
+            {
+                // 伸进屏幕越深，线条越淡 —— 一眼看出哪根朝里、哪根朝外（朝外的饱满）
+                double t = (a.depth + 1.0) / 2.0;               // 0=朝外 1=朝里
+                byte alpha = (byte)(70 + 185 * (1.0 - t));
+                var brush = new SolidColorBrush(a.col) { Opacity = alpha / 255.0 };
+                double thick = 2.0 + 1.2 * (1.0 - t);
+
+                double len = Math.Sqrt((a.sx - cx) * (a.sx - cx) + (a.sy - cy) * (a.sy - cy));
+                if (len < 0.6)
+                {
+                    // 正对观察者（或正背面）：投影退化成一个点，画个圆点表示"这根轴朝你/背你"
+                    var dot = new System.Windows.Shapes.Ellipse
+                    {
+                        Width = 7, Height = 7,
+                        Fill = new SolidColorBrush(a.col) { Opacity = 0.95 },
+                        Stroke = Brushes.Black,
+                        StrokeThickness = 0.5,
+                    };
+                    System.Windows.Controls.Canvas.SetLeft(dot, cx - 3.5);
+                    System.Windows.Controls.Canvas.SetTop(dot, cy - 3.5);
+                    AxisCanvas.Children.Add(dot);
+                }
+                else
+                {
+                    var line = new System.Windows.Shapes.Line
+                    {
+                        X1 = cx, Y1 = cy, X2 = a.sx, Y2 = a.sy,
+                        Stroke = brush,
+                        StrokeThickness = thick,
+                        StrokeEndLineCap = PenLineCap.Round,
+                        StrokeStartLineCap = PenLineCap.Round,
+                    };
+                    AxisCanvas.Children.Add(line);
+
+                    // 箭头：按线段方向的单位向量往外退 11px 画小三角
+                    var vx = (a.sx - cx) / len; var vy = (a.sy - cy) / len;
+                    double px = a.sx - vx * 2, py = a.sy - vy * 2;   // 箭头尖
+                    double bx = px - vx * 6, by = py - vy * 6;       // 底边中点
+                    var tri = new System.Windows.Shapes.Polygon
+                    {
+                        Fill = brush,
+                        Points = new PointCollection
+                        {
+                            new System.Windows.Point(px, py),
+                            new System.Windows.Point(bx - vy * 3.2, by + vx * 3.2),
+                            new System.Windows.Point(bx + vy * 3.2, by - vx * 3.2),
+                        },
+                    };
+                    AxisCanvas.Children.Add(tri);
+                }
+
+                // 字母标签放在轴末端再外推 9px，并做一次简单边界钳制
+                double lx = cx + (a.sx - cx) * 1.0 + ((a.sx - cx) / Math.Max(len, 1e-6)) * 9;
+                double ly = cy + (a.sy - cy) * 1.0 + ((a.sy - cy) / Math.Max(len, 1e-6)) * 9;
+                var tb = new System.Windows.Controls.TextBlock
+                {
+                    Text = a.label,
+                    Foreground = new SolidColorBrush(a.col),
+                    FontSize = 11,
+                    FontWeight = FontWeights.Bold,
+                };
+                tb.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                lx = Math.Max(0, Math.Min(AxisCanvas.Width - tb.DesiredSize.Width, lx - tb.DesiredSize.Width / 2));
+                ly = Math.Max(0, Math.Min(AxisCanvas.Height - tb.DesiredSize.Height, ly - tb.DesiredSize.Height / 2));
+                System.Windows.Controls.Canvas.SetLeft(tb, lx);
+                System.Windows.Controls.Canvas.SetTop(tb, ly);
+                AxisCanvas.Children.Add(tb);
+            }
+        }
+
+        void ChkShowAxis_Changed(object sender, RoutedEventArgs e) => ApplyAxisVisibility();
+
+        /// <summary>
         /// 相机预设：让界面验证可复现（同一样本每次都用同一视角截图）。
         /// 轴向视图（top/front/side）用正交相机：轨迹悬在离面 standoff 处，
         /// 透视相机下会被按距离放大（615/(615-100)≈1.19 倍），看起来像"轨迹溢出重建面"——
@@ -3487,6 +3939,10 @@ namespace SprayTrajViewer
                 };
                 App.Log("VIEW", null,
                     $"正交 face n=({nf.X:F3},{nf.Y:F3},{nf.Z:F3}) center=({c0.X:F1},{c0.Y:F1},{c0.Z:F1}) span={span0:F1} width={span0 * 1.15:F1}");
+                // 这里不靠 CameraChanged 事件，显式重画一次：
+                // 截图（--shot）是"设完相机 700ms 就抓"，事件如果在下一帧才到，
+                // 抓到的 HUD 还是旧视角的轴向 —— 那正好废掉了这个功能的意义。
+                UpdateAxisHud();
                 return;
             }
 
@@ -3544,8 +4000,8 @@ namespace SprayTrajViewer
                 App.Log("VIEW", null,
                     $"透视 {m} center=({center.X:F1},{center.Y:F1},{center.Z:F1}) span={span:F1} dist={dist:F1}");
             }
+            UpdateAxisHud();   // 同 face 分支：截图前保证 HUD 已是新视角
         }
-
         void ChkShowPlane_Changed(object sender, RoutedEventArgs e)
         {
             RenderPlane();

@@ -1587,7 +1587,8 @@ static GunSideVerdict verify_gun_side(const std::vector<Vec3>& P, const KdTree& 
 //   - 剥离出的"主平面外点"里混着主面自身的过渡带碎带，二次拟合拟出
 //     散布多处的伪面。区域生长按局部法向归属，折型板两折面各成一整块。
 std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormals& cn,
-                                   double tol, double curvatureTol, int minPts){
+                                   double tol, double curvatureTol, int minPts, double rowSpacing,
+                                   double standoff){
     std::vector<PlaneSeg> out;
 
     // ---- 第一步：RANSAC 拟合主平面，确定高度方向 n ----
@@ -2178,6 +2179,156 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
                     members[a].insert(members[a].end(), members[b].begin(), members[b].end());
                     members.erase(members.begin()+(long)b);
                     did = true;
+                }
+            }
+        }
+    }
+
+    // ---- 窄条并面：窄平面 + 同方向 + 法向差不大 → 同一张面 ----
+    // 口径（2026-11-13 用户拍板）：窄平面之间只要朝向一致、法向差不大，就是同一张面，
+    // 不该为了十几度的法向差各布一套行、各来一次换面空移——尤其是"面宽小于一个行距"
+    // 的细条，一条行本来就能盖住，分几张面就是同一块地方反复喷。
+    // 判据（四条同时满足）：
+    //   ① 窄：两块自身短向跨度都 <= narrowW（默认 = 行距）。这是本条的**前提**：
+    //      "窄"保证了并完仍然是一条行能盖住的带，误差有界；
+    //   ② 同向：法向夹角 <= stripAng（默认 45°，比上面的通用 15° 宽，但只对窄条放开）；
+    //   ③ 相邻：KNN 图里有边横跨两面（同一次扫描的连续数据，排除同向孤岛）；
+    //   ④ 并后仍可喷：重拟合后短向跨度 <= narrowW，且到重拟合平面的最大偏差
+    //      <= devCap（默认 8mm，低于面级平面性门 max(3,0.12*standoff)=12mm，
+    //      保证并出来的面不会被下游当"假面"拒掉）。
+    // 为什么"窄"才放开角度：宽板之间的缓角是真实翘曲/折边的链式漂移，一路并会塌成
+    // 一张平板（这是 8° 硬门限存在的理由）；而窄条之间的缓角几乎总是同一张面被扫描
+    // 条带/噪声切开，并了以后几何误差仍然有界，代价只有表面偏离几毫米。
+    if(out.size() > 1 && out.size() <= 48){
+        const size_t F0 = out.size();
+        std::vector<int> lab(P.size(), -1);
+        for(size_t i=0;i<F0;++i) for(int k : out[i].inl) lab[k] = (int)i;
+        std::vector<char> adj(F0*F0, 0);
+        for(size_t i=0;i<P.size();++i){
+            int a = lab[i]; if(a < 0) continue;
+            const int* row = &knnFlat[i*(size_t)K];
+            for(int t=0;t<K;++t){
+                int j = row[t]; if(j<0) continue;
+                int b = lab[j];
+                if(b >= 0 && b != a) adj[(size_t)a*F0+b] = adj[(size_t)b*F0+a] = 1;
+            }
+        }
+        const double Lrow = (rowSpacing > 1.0) ? rowSpacing : 80.0;
+        double narrowW = Lrow;            // 窄条上限：一条行能盖住
+        double stripAng = 60.0;           // 窄条之间允许的法向差（实测 45° 卡掉半棍子一次可并的 49.4°）
+        double devCap = std::max(4.0, 0.08*Lrow);   // 并后偏离上限（默认 L=80 → 6.4mm）
+        if(const char* e = std::getenv("SPRAYTRAJ_STRIP_W"))  { double v=atof(e); if(v>1.0) narrowW=v; }
+        if(const char* e = std::getenv("SPRAYTRAJ_STRIP_ANG")){ double v=atof(e); if(v>0.0) stripAng=v; }
+        if(const char* e = std::getenv("SPRAYTRAJ_STRIP_DEV")){ double v=atof(e); if(v>0.1) devCap=v; }
+        const char* dumpEnv2 = std::getenv("SPRAYTRAJ_DUMP");
+        const bool dbg2 = dumpEnv2 && dumpEnv2[0] == '1';
+        const double cosS = std::cos(stripAng*3.141592653589793/180.0);
+        Vec3 partC2{0,0,0};
+        for(const auto& p : P) partC2 = partC2 + p;
+        partC2 = partC2*(1.0/(double)std::max<size_t>(1,P.size()));
+        auto orient2 = [&](Vec3 n, const Vec3& c){
+            if(std::fabs(n.z) > 0.05){ if(n.z < 0) n = n*(-1.0); }
+            else if(dot(n, c - partC2) < 0) n = n*(-1.0);
+            return n;
+        };
+        // 面内两个正交方向的跨度（mm）
+        auto extents = [&](const Plane& pl, const std::vector<int>& inl, double& eu, double& ev){
+            Vec3 ax = (std::fabs(pl.n.x) < 0.9) ? Vec3{1.0,0.0,0.0} : Vec3{0.0,1.0,0.0};
+            Vec3 u = norm(cross(ax, pl.n));
+            Vec3 v = cross(pl.n, u);
+            double u0=1e30,u1=-1e30,v0=1e30,v1=-1e30;
+            for(int k : inl){
+                const Vec3 w = P[(size_t)k] - pl.c;
+                const double a = dot(w,u), b = dot(w,v);
+                u0=std::min(u0,a); u1=std::max(u1,a);
+                v0=std::min(v0,b); v1=std::max(v1,b);
+            }
+            eu = u1-u0; ev = v1-v0;
+        };
+        std::vector<std::vector<int>> mem(F0);
+        for(size_t i=0;i<F0;++i) mem[i] = {(int)i};
+        // 并后枪能不能站住：并面的法向是各成员的平均，弧面上的并面法向会偏开局部径向，
+        // 100mm 枪位沿它走出去就可能擦回工件（整根管实测：并面 +n 自由只剩 46.7mm，
+        // 等于 2R·cos21°，枪直接撞在对面内壁上）。所以每条合并候选先用同一套几何
+        // （点云最近距离）验一遍枪位空间，过不了就不并——宁可多一张面，不能并出一张喷不了的面。
+        KdTree kdStrip;
+        { ProfStage psKd("2e.窄条并面-KD"); kdStrip.init(P); }
+        const double soRef = (standoff > 1.0) ? standoff : 100.0;
+        // 与下游 verify_gun_side 完全同一口径：6 个采样点沿 ±n 打射线，取中位自由距离，
+        // 两侧取大者 >= 0.85·standoff 才算"枪站得住"。
+        auto gunCanStand = [&](const std::vector<int>& all, const Vec3& n)->bool{
+            const size_t N = all.size();
+            if(!N) return false;
+            const double maxFree = std::max(400.0, soRef*4.0);
+            const int want = 6;
+            std::vector<double> dp, dm;
+            dp.reserve((size_t)want); dm.reserve((size_t)want);
+            for(int i=0;i<want;++i){
+                size_t k = (size_t)((double)i/(double)want*(double)N);
+                if(k >= N) k = N-1;
+                const Vec3 p = P[(size_t)all[k]];
+                dp.push_back(ray_free_dist(P, kdStrip, p + n*0.4,  n,        maxFree, 1.5, 5.0));
+                dm.push_back(ray_free_dist(P, kdStrip, p - n*0.4,  n*(-1.0), maxFree, 1.5, 5.0));
+            }
+            auto med = [](std::vector<double>& v){
+                if(v.empty()) return -1.0;
+                std::nth_element(v.begin(), v.begin()+v.size()/2, v.end());
+                return v[v.size()/2];
+            };
+            const double fp = med(dp), fm = med(dm);
+            const double effPlus  = (fp < 0.0) ? 1e9 : fp;
+            const double effMinus = (fm < 0.0) ? 1e9 : fm;
+            return std::max(effPlus, effMinus) >= soRef*0.85;
+        };
+        bool did2 = true;
+        while(did2 && out.size() > 1){
+            did2 = false;
+            for(size_t a=0; a<out.size() && !did2; ++a){
+                for(size_t b=a+1; b<out.size() && !did2; ++b){
+                    double eua,eva,eub,evb;
+                    extents(out[a].pl, out[a].inl, eua, eva);
+                    extents(out[b].pl, out[b].inl, eub, evb);
+                    const double wa = std::min(eua,eva), wb = std::min(eub,evb);
+                    if(wa > narrowW || wb > narrowW) continue;          // ① 窄
+                    const double ang = std::acos(std::max(-1.0, std::min(1.0,
+                        dot(orient2(out[a].pl.n, out[a].pl.c), orient2(out[b].pl.n, out[b].pl.c)))))*180.0/3.141592653589793;
+                    if(ang > stripAng) continue;                        // ② 同向
+                    if(std::cos(ang*3.141592653589793/180.0) < cosS) continue;
+                    bool touch = false;
+                    for(int x : mem[a]){ for(int y : mem[b]) if(adj[(size_t)x*F0+y]){ touch=true; break; } if(touch) break; }
+                    if(!touch) continue;                                // ③ 相邻（同一片扫描数据）
+                    std::vector<int> all = out[a].inl;
+                    all.insert(all.end(), out[b].inl.begin(), out[b].inl.end());
+                    std::sort(all.begin(), all.end());
+                    all.erase(std::unique(all.begin(), all.end()), all.end());
+                    Vec3 nf, cf;
+                    if(!ls_plane(P, all, nf, cf)) continue;
+                    Vec3 orientN = orient2(nf, cf);
+                    if(dot(orientN, out[a].pl.n) < 0) nf = nf*(-1.0);
+                    Plane pf{nf, -dot(nf,cf), cf};
+                    double eu,ev; extents(pf, all, eu, ev);
+                    const double wm = std::min(eu,ev);
+                    if(wm > narrowW) continue;                          // ④ 并后仍是一条行能盖住
+                    double dev = 0.0;
+                    for(int k : all) dev = std::max(dev, std::fabs(dot(P[(size_t)k]-cf, nf)));
+                    if(dev > devCap){
+                        if(dbg2) fprintf(stderr, "[dbg] 窄条并面放弃: 面%zu-%zu 夹角%.1f° 并后偏差%.2f > %.2f\n",
+                                         a, b, ang, dev, devCap);
+                        continue;
+                    }
+                    if(!gunCanStand(all, nf)){
+                        if(dbg2) fprintf(stderr, "[dbg] 窄条并面放弃: 面%zu-%zu 夹角%.1f° 并后枪位站不住\n",
+                                         a, b, ang);
+                        continue;
+                    }
+                    fprintf(stderr, "[split] 窄条并面(法向%.1f° 宽%.1fmm 偏差%.1fmm): 面%zu(%zu点) + 面%zu(%zu点) -> %zu点\n",
+                            ang, wm, dev, a, out[a].inl.size(), b, out[b].inl.size(), all.size());
+                    out[a].pl = pf;
+                    out[a].inl = std::move(all);
+                    out.erase(out.begin()+(long)b);
+                    mem[a].insert(mem[a].end(), mem[b].begin(), mem[b].end());
+                    mem.erase(mem.begin()+(long)b);
+                    did2 = true;
                 }
             }
         }
@@ -3987,7 +4138,8 @@ static void spray_traj_core(
                 CloudNormals cnRes;
                 cnRes.build(Pres);
                 auto sub = split_planes(Pres, cnRes, params->flatnessTol, params->curvatureTol,
-                                        std::max(20, (int)(Pf.size()*0.02)));
+                                        std::max(20, (int)(Pf.size()*0.02)), params->scanRowSpacing,
+                                        params->standoff);
                 for(auto& s : sub){
                     for(int& k : s.inl) k = back[k];
                     segs.push_back(std::move(s));
@@ -4006,7 +4158,9 @@ static void spray_traj_core(
             segs.insert(segs.begin(), std::move(cs));
             (void)rss;
         } else {
-            segs = split_planes(Pf, cn, params->flatnessTol, params->curvatureTol, std::max(20, (int)(Pf.size()*0.02)));
+            segs = split_planes(Pf, cn, params->flatnessTol, params->curvatureTol,
+                                std::max(20, (int)(Pf.size()*0.02)), params->scanRowSpacing,
+                                params->standoff);
         }
     }
 
@@ -4164,7 +4318,7 @@ static void spray_traj_core(
         std::vector<PlaneSeg> outerSegs, innerSegs;
         outerSegs.reserve(segs.size());
         innerSegs.reserve(segs.size());
-        int nSplit = 0, nSplitPeak = 0, nSameDir = 0;
+        int nSplit = 0, nSplitPeak = 0, nSameDir = 0, nDupMerge = 0;
 
         // 直方图双峰检测：返回分界位置（沿法向，相对块质心）。
         auto twoPeaks = [](const std::vector<double>& h, double& mid)->bool{
@@ -4290,10 +4444,28 @@ static void spray_traj_core(
                 // 每片厚度上限 max(1.5, 0.35×间距)：壁厚 4mm 时允许 1.5mm 起伏，
                 // 现场点云噪声 1mm 级也过得去，但"厚实块"会被挡下来。
                 const double tolR = std::max(1.5, 0.35*thk);
-                if(!okFit || angLR > 25.0 || thk < 1.5 || r1 > tolR || r2 > tolR){
+                // 分离度：真两层是"两片薄点、中间空"——每片沿法向只有噪声那么厚。
+                // 而一张连续的面被假双峰劈开时，两片各自本身就铺开好几毫米，
+                // RMS 挡不住这种情况（劈出来的两半各自非常平，r1/r2 都很小）：
+                // 棕槽实测 间距 5.8mm、两片各摊 2.9mm、maxGap 只有 0.08mm，
+                // 一路过了夹角/间距/RMS 三道校验，被切成 17371+21640 两半。
+                auto span98 = [&](const std::vector<int>& v){
+                    if(v.size() < 10) return 1e9;
+                    std::vector<double> h2; h2.reserve(v.size());
+                    for(int k : v) h2.push_back(dot(Pf[k]-c0, n));
+                    std::sort(h2.begin(), h2.end());
+                    return h2[(size_t)((h2.size()-1)*0.98)] - h2[(size_t)((h2.size()-1)*0.02)];
+                };
+                const double t1 = span98(lo), t2 = span98(hi);
+                double kSpan = 0.35;   // 调到 1.0 等于关掉这道校验（真双层被误挡时用）
+                if(const char* e = std::getenv("SPRAYTRAJ_PEAK_SPAN")){ double v=atof(e); if(v>0) kSpan=v; }
+                const double tolT = std::max(1.2, kSpan*thk);
+                if(!okFit || angLR > 25.0 || thk < 1.5 || r1 > tolR || r2 > tolR
+                   || std::max(t1,t2) > tolT){
                     if(std::getenv("SPRAYTRAJ_FACE_DBG"))
-                        fprintf(stderr,"[split] 块%zu 双峰但否决: 夹角=%.1f° 间距=%.2f r1=%.2f r2=%.2f tol=%.2f\n",
-                                si2, angLR, thk, r1, r2, tolR);
+                        fprintf(stderr,"[split] 块%zu 双峰但否决: 夹角=%.1f° 间距=%.2f r1=%.2f r2=%.2f "
+                                       "片厚=%.2f/%.2f (tol=%.2f/%.2f)\n",
+                                si2, angLR, thk, r1, r2, t1, t2, tolR, tolT);
                     s.layerCnt = 1; outerSegs.push_back(std::move(s)); continue;
                 }
                 ++nSplitPeak;
@@ -4329,6 +4501,89 @@ static void spray_traj_core(
             // 两片各按自己的法向布行（都朝 +Z 就都喷），谁也不许被翻过来。
             const bool facing = dot(so.pl.n, sn.pl.n) < -0.5;
             if(!facing){
+                // ---- 同向回并：这两片其实是同一张脸被缝隙劈开的 ----
+                // 现象（2026-11-13 现场）：一张完整平面沿法向铺开 5.8mm，点排序后
+                // 出现一段 1.5mm 以上的空档，判据一就把这张脸劈成高低两片；两片共用
+                // 源块法向、只差一个平移，界面上就是"同一个位置两个平面、法向完全
+                // 一样"，各自布行 = 同一块地方喷两遍、膜厚翻倍。
+                //
+                // 判据一缺的就是"两片到底分没分开"这一问：它只看空档大小，不看两片
+                // 自身的厚度。真双层是"两片薄点、中间空"，而一张起伏面排序后同样有
+                // 空档，但两片各自本身就铺开好几毫米。
+                //
+                // 回并判据（三条全中，缺一条都会把真台阶吞掉）：
+                //   ① 平行：两片法向夹角 <= 5°（劈出来的两片本来就共用源块 n，必过）；
+                //   ② 贴得近：沿法向间距 <= dupGap（默认 8mm，可用环境变量覆盖）；
+                //   ③ 投影重合：面内 2mm 网格的 IoU >= 0.85。
+                // 真台阶的两级在面内一般错开，IoU 低，保持两片；上一级完全盖住下一级
+                // 时 IoU 高，但那种下级本来就喷不到，并成一片也是对的。
+                bool doDup = true;
+                if(const char* e = std::getenv("SPRAYTRAJ_DUP_MERGE")) doDup = (e[0] != '0');
+                double dupGap = 8.0, dupIoU = 0.85;
+                if(const char* e = std::getenv("SPRAYTRAJ_DUP_GAP")){ double v=atof(e); if(v>0) dupGap=v; }
+                if(const char* e = std::getenv("SPRAYTRAJ_DUP_IOU")){ double v=atof(e); if(v>0) dupIoU=v; }
+                const double dupThk = std::fabs(dot(sn.pl.c - so.pl.c, n));
+                if(doDup && dupThk <= dupGap && dot(so.pl.n, sn.pl.n) > 0.9962){
+                    auto cellsOf = [&](const std::vector<int>& v){
+                        std::vector<long long> c; c.reserve(v.size());
+                        for(int k : v){
+                            const long long a = (long long)std::floor(dot(Pf[k],bu)/2.0);
+                            const long long b = (long long)std::floor(dot(Pf[k],bv)/2.0);
+                            c.push_back(a*1000003LL + b);
+                        }
+                        std::sort(c.begin(), c.end());
+                        c.erase(std::unique(c.begin(), c.end()), c.end());
+                        return c;
+                    };
+                    const std::vector<long long> ca = cellsOf(so.inl), cb = cellsOf(sn.inl);
+                    size_t ia=0, ib=0, inter=0;
+                    while(ia<ca.size() && ib<cb.size()){
+                        if(ca[ia]==cb[ib]){ ++inter; ++ia; ++ib; }
+                        else if(ca[ia]<cb[ib]) ++ia; else ++ib;
+                    }
+                    const double iou = (double)inter /
+                                       (double)std::max<size_t>(1, ca.size()+cb.size()-inter);
+                    // 两条口径取"或"，对应两种误拆形态：
+                    //   ① 重叠型：两片占同一块地方（IoU 高）——劈在同一个面上；
+                    //   ② 相邻型：一张面被从中间劈成左右两半（IoU 很低），但两半
+                    //      共面，小片到大片平面的高度 p95 只有 1mm 级。
+                    //      棕槽实测就是这种：质心 y 差 38mm、法向完全相同、间距 5.8mm。
+                    // 真台阶的 p95 ≈ 台阶高（5mm 级），过不了 ②。
+                    PlaneSeg* big = (so.inl.size() >= sn.inl.size()) ? &so : &sn;
+                    PlaneSeg* sml = (big == &so) ? &sn : &so;
+                    std::vector<double> hh2; hh2.reserve(sml->inl.size());
+                    for(int k : sml->inl) hh2.push_back(std::fabs(dot(Pf[k]-big->pl.c, big->pl.n)));
+                    double h95 = 1e9;
+                    if(!hh2.empty()){
+                        const size_t q = (size_t)(0.95*(double)(hh2.size()-1));
+                        std::nth_element(hh2.begin(), hh2.begin()+q, hh2.end());
+                        h95 = hh2[q];
+                    }
+                    const double dupH = 2.0;
+                    if(iou >= dupIoU || h95 <= dupH){
+                        // 保留点数多那片的归属，但平面要按合并后的点重拟合：
+                        // 直接用某一侧的平面会让另一侧的点整体偏 dupThk，喷距跟着错。
+                        big->inl.insert(big->inl.end(), sml->inl.begin(), sml->inl.end());
+                        std::sort(big->inl.begin(), big->inl.end());
+                        big->inl.erase(std::unique(big->inl.begin(), big->inl.end()), big->inl.end());
+                        Vec3 nf2, cf2;
+                        if(ls_plane(Pf, big->inl, nf2, cf2)){
+                            if(dot(nf2, n) < 0) nf2 = nf2*(-1.0);
+                            big->pl.n = nf2; big->pl.c = cf2; big->pl.d = -dot(nf2, cf2);
+                        }
+                        big->layerCnt = 0;                       // 合回一张面，不再是双层
+                        orient_piece_after_split(Pf, cn.tree, *big, partC);
+                        big->fo.isInner = 0;
+                        big->fo.src = 7;                         // 7 = 同向回并
+                        ++nDupMerge;
+                        if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                            fprintf(stderr,"[split] 同向回并: 间距=%.2fmm 重合度=%.2f 共面p95=%.2f → %zu点 "
+                                           "(阈值 gap<=%.1f IoU>=%.2f h<=%.1f)\n",
+                                    dupThk, iou, h95, big->inl.size(), dupGap, dupIoU, dupH);
+                        outerSegs.push_back(std::move(*big));
+                        continue;
+                    }
+                }
                 // src=6 与"薄壁拆层(4)"区分开：清单里要能一眼看出这两片不是壁的两侧，
                 // 而是被间隙误分成两片的一张脸，两片都该喷。
                 so.fo.isInner = 0; sn.fo.isInner = 0;
@@ -4362,9 +4617,9 @@ static void spray_traj_core(
         segs.reserve(outerSegs.size()+innerSegs.size());
         for(auto& s : outerSegs) segs.push_back(std::move(s));
         for(auto& s : innerSegs) segs.push_back(std::move(s));
-        if(nSplit) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（内壁 %d 面，其中双峰判据 %d 块；"
-                                   "同向两面 %d 块按普通面各自布行）\n",
-                           nSplit, segs.size(), nSplit-nSameDir, nSplitPeak, nSameDir);
+        if(nSplit || nDupMerge) fprintf(stderr, "[split] 薄壁拆段: %d 块 → %zu 段（内壁 %d 面，其中双峰判据 %d 块；"
+                                   "同向两面 %d 块按普通面各自布行；同向回并 %d 块合回单面）\n",
+                           nSplit, segs.size(), nSplit-nSameDir, nSplitPeak, nSameDir, nDupMerge);
     }
 
     // ---- 薄壳双面：一层点代表一张板，板有两面 ----
@@ -4713,10 +4968,24 @@ static void spray_traj_core(
             // 行数按跨度/行距四舍五入（行距允许比设定值大 20% 以内——喷涂本来有
             // 20~30% 搭接余量）；超过 20% 才补一条，防止窄面上两条行被拉得太开。
             // 不能用 floor 起算的老写法：那样末行由固定网格决定，最多少掉近一个行距。
-            int nIv = std::max(1, (int)std::floor((y1-y0)/L + 0.5));
-            if((y1-y0)/(double)nIv > 1.2*L) ++nIv;
-            nRow  = nIv + 1;
-            stepA = (y1-y0)/(double)nIv;
+            // 跨度不足半个行距时只走一条中心行：喷幅本身有 20~30% 搭接余量，
+            // 一条行足以盖住整条窄带。旧写法用 max(1,...) 保证 nIv>=1，等于强制
+            // 布两行，行距被压成面宽的一半——实测 26mm 宽的窄面被布成 13mm 行距，
+            // 同一块地方喷两遍，行程直接翻倍（半棍子 6 个面因此从 3.3m 涨到 6.6m）。
+            // nRow==1 时下方 yc 走 (y0+y1)/2 分支，中心行压在中线上，不会偏。
+            // 跨度不超过一个行距时只走一条中心行：行带按 |Δy| <= L/2 采集，一条行
+            // 的喷幅正好盖住整条带，布两条只是把同一块地方喷两遍。
+            // （旧写法门槛是 0.5L，0.5L~1L 这一段仍被布成两条行，行距被压成面宽。）
+            int nIv = 0;
+            if((y1-y0) <= L){
+                nRow  = 1;
+                stepA = L;
+            }else{
+                nIv = (int)std::floor((y1-y0)/L + 0.5);
+                if((y1-y0)/(double)nIv > 1.2*L) ++nIv;
+                nRow  = nIv + 1;
+                stepA = (y1-y0)/(double)nIv;
+            }
         }
         std::vector<Row> raw;
         for(int ri=0; ri<nRow; ++ri){

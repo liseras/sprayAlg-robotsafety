@@ -203,6 +203,11 @@
                                           ToolTip="spray=0 的过渡段：抬枪、跨面、下枪。用亮蓝色和红色喷涂段分开画（修正层里对应紫色）。&#x0a;关掉后只留喷涂段，方便检查行距/覆盖。"
                                           Checked="ChkShowMove_Changed" Unchecked="ChkShowMove_Changed"/>
 
+                                <CheckBox x:Name="ChkShowAxis" Content="显示坐标系（场景内三色轴 + 左上角指示器）"
+                                          Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
+                                          ToolTip="场景内的红/绿/蓝三色轴画在工件左下角外侧，长度按工件尺寸自适应；&#x0a;左上角的指示器随视角旋转，任何时候都能看出当前是 X 还是 Y 正面朝向。&#x0a;截图验收（--shot）时坐标轴会一起进画面，不想看到就关掉这一项。"
+                                          Checked="ChkShowAxis_Changed" Unchecked="ChkShowAxis_Changed"/>
+
                                 <TextBlock x:Name="TxtResult" Text="" Margin="0,14,0,0" TextWrapping="Wrap"
                                            FontSize="12" Foreground="#1F2937"/>
                             </StackPanel>
@@ -463,14 +468,37 @@
 
         <!-- 右侧：3D 视图 -->
         <Grid Grid.Column="1">
+            <!-- CameraRotationMode 必须显式设 Trackball：
+                 HelixToolkit 默认是 Turntable，文档写的是 "constrained to two axes of
+                 rotation (model up and right direction)"。而 ApplyViewPreset 给每个视角预设
+                 都把 UpDirection 固定成世界 Z / Y，于是水平拖动 = 绕 Z 轴转，视觉上就是
+                 "只能在 XY 平面里拖"，翻不到侧面/底面。Trackball 是虚拟轨迹球，任意方向自由转。
+                 视角预设本身仍照常工作（它只设一次相机），只是设完之后不再被锁死。 -->
             <hx:HelixViewport3D x:Name="Viewport" Background="#1E1E24"
-                                ShowCoordinateSystem="False" ShowViewCube="True">
+                                ShowCoordinateSystem="False" ShowViewCube="True"
+                                CameraRotationMode="Trackball">
                 <hx:DefaultLights/>
                 <hx:GridLinesVisual3D Width="600" Length="600" MajorDistance="100" MinorDistance="10" Thickness="0.02"/>
             </hx:HelixViewport3D>
 
-            <!-- 面级法向清单：上排=真实法向（射线判定），"内外反"提示喷距方向与该面真实可喷侧相反 -->
+            <!-- 面级法向清单：上排=真实法向（射线判定），"内外反"提示喷距方向与该面真实可喷侧相反。
+                 坐标轴指示器（AxisHud）作为这个 StackPanel 的第一个子元素插在表格**上方**：
+                 放同一个竖排容器里就不用算表格高度，表格行数变化时指示器自动让位，
+                 不会出现"多一行就把轴盖住"。 -->
             <StackPanel VerticalAlignment="Bottom" Margin="12,0,12,12">
+
+                <Border x:Name="AxisHud" HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                        Margin="0,0,0,6" Background="#C0000000" BorderBrush="#33FFFFFF" BorderThickness="1"
+                        CornerRadius="6" Padding="6,4" IsHitTestVisible="False">
+                    <StackPanel>
+                        <TextBlock x:Name="TxtAxisFrame" Text="显示坐标系"
+                                   FontSize="10" Foreground="#9CA3AF" HorizontalAlignment="Center"/>
+                        <Canvas x:Name="AxisCanvas" Width="104" Height="104" Margin="0,1,0,0"/>
+                        <TextBlock Text="X 红 · Y 绿 · Z 蓝" FontSize="10" Foreground="#C7CBD1"
+                                   HorizontalAlignment="Center" Margin="0,1,0,0"/>
+                    </StackPanel>
+                </Border>
+
                 <Border Background="#E6FFFFFF" BorderBrush="#33000000" BorderThickness="1,1,1,0"
                         Padding="8,4" CornerRadius="4,4,0,0">
                     <TextBlock x:Name="TxtFaceStat" FontSize="11" Foreground="#4B5563"

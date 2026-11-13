@@ -26,6 +26,7 @@ model（建模坐标，z=高度，通常 z 中心小）
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -63,11 +64,44 @@ def rot_matrix(mode: str, flip_v: bool = False) -> np.ndarray:
     return R
 
 
+def handeye_nums_from_json(raw: str) -> list[float]:
+    """从标定台导出的 JSON（handeye-cam2base-v3）里取 Matrix 并摊平成数字列表。
+
+    只认 "Matrix" 字段（大小写不敏感，允许嵌一层），**绝不扫全文件数字**：
+    同一份文件里 Format 的 "v3"、PairCount、RotResidualDeg、SolvedAt 的日期、
+    ManualSliders 的 6 个滑条值全带数字，扫进去矩阵就整体错位两个元素 ——
+    自检会报「不像纯旋转」，看着像标定错了，其实一个元素都没读对。
+    （2026-11-13 WPF 界面读 handeye_cam2base.json 踩的就是这个坑。）
+
+    支持 4×4 / 3×4 嵌套数组，也支持 16 / 12 个数的平铺数组。
+    """
+    def find(o, depth: int = 0):
+        if depth > 4 or not isinstance(o, dict):
+            return None
+        for k, v in o.items():
+            if k.lower() == "matrix" and isinstance(v, list):
+                return v
+        for v in o.values():
+            r = find(v, depth + 1)
+            if r is not None:
+                return r
+        return None
+
+    m = find(json.loads(raw))
+    if m is None:
+        raise SystemExit("手眼矩阵 JSON 里没找到 Matrix 字段")
+    a = np.asarray(m, dtype=float)
+    if a.ndim == 2 and a.shape not in ((4, 4), (3, 4)):
+        raise SystemExit(f"手眼矩阵 JSON 的 Matrix 是 {a.shape[0]}×{a.shape[1]}，只认 4×4 或 3×4")
+    return [float(x) for x in a.ravel()]
+
+
 def load_handeye(spec: str) -> tuple[np.ndarray, np.ndarray]:
     """读手眼标定矩阵 p_base = R·p_cam + t。
 
     spec 可以是：
       · 一个文本文件（4 行 4 列，或 12/16 个数连续排列，逗号/空格/分号都行）；
+      · 标定台导出的 JSON（只按 "Matrix" 字段取数）；
       · 直接内联的数字串，例如 "R 的 9 个数 + t 的 3 个数"。
 
     相机系点云走到基座系全靠它，所以这里把校验做实：
@@ -79,11 +113,15 @@ def load_handeye(spec: str) -> tuple[np.ndarray, np.ndarray]:
     p = Path(spec)
     if p.exists():
         raw = p.read_text(encoding="utf-8", errors="replace")
-        # 注释行必须剔掉：文件头里常写"860 高 × 399 宽"这类说明，正则会把数字一起抓进来
-        raw = "\n".join(ln.split("#", 1)[0] for ln in raw.splitlines())
+        if raw.lstrip("\ufeff \t\r\n").startswith(("{", "[")):
+            nums = handeye_nums_from_json(raw)
+        else:
+            # 注释行必须剔掉：文件头里常写"860 高 × 399 宽"这类说明，正则会把数字一起抓进来
+            raw = "\n".join(ln.split("#", 1)[0] for ln in raw.splitlines())
+            nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)]
     else:
         raw = spec
-    nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)]
+        nums = [float(x) for x in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)]
     if len(nums) < 12:
         raise SystemExit(f"手眼矩阵需要至少 12 个数（3x4），只解析到 {len(nums)} 个：{spec}")
     if len(nums) >= 16:
