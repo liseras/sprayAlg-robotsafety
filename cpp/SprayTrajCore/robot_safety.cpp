@@ -1665,16 +1665,39 @@ inline bool j5RescueTilt(const V3& nB, const V3& aB,
 //
 // α 与"悬垂面"都用 dot(n, ref)，不再写死 n.z。ref=(0,0,1) 时两者逐位等价。
 // ref 传的是**倾角基准**（Params::tiltRefW），不是重力向上 —— 见上面 tiltRefW 的说明。
+// ⚠ 比例是**全量程**的：tilt = tiltNonUpDeg × α/90°，**不按 tiltMaxDeg 截断**。
+//   用户口径（2026-11-16）："比例是 60/90，那么面法向与 +X 差 120° 就给 120−120×60/90 = 40°"，
+//   即「枪位偏离 +X = α − tilt = α·(1 − k/90)」这条式子必须一路成立到 α 的物理上限。
+//   旧版在这里 `if (t > tiltMaxDeg) t = tiltMaxDeg;`，默认 tiltMax=60 ⟹ α>90° 的面全部被
+//   削到 60°，α=120° 的面方向落在 60° 而不是 40° —— 现象就是"大角度面倾角不生效、
+//   方向跑到正方向外面去了"，而且加系数也救不回来（60 是硬封顶）。
+//   tiltMaxDeg 从此只当**额外搜索/救援的加档预算**（needTilt、阶段 2/3 的候选网格），
+//   不再参与基准倾角的计算。
+//
+// 唯一的硬门是**物理门**：tilt ≥ 90° 时 d 与面法向的点积 = cos(tilt) ≤ 0，枪会翻到面的
+// 另一侧（穿进工件本体），所以压到 89°。k=60 时它对应 α≈134°，正好与下面"背离面归 0"
+// 的阈值一致 —— 两者不是重复，是为了 k 被调大（>60）时也不会翻过 90°。
 inline double tiltNeedDeg(const V3& nIn, const V3& ref, const Params& p) {
     V3 n = unit(nIn);
     double c = dot(n, ref);
     c = std::max(-1.0, std::min(1.0, c));
     double alphaDeg = std::acos(c) * kRad;
     double t = p.tiltNonUpDeg * (alphaDeg / 90.0);
-    if (t > p.tiltMaxDeg) t = p.tiltMaxDeg;
-    // 背离基准方向的面：扳过去会把枪顶进工件本体，这条路物理上不成立，不做线性外推
+    const double kTiltPhysMax = 89.0;     // 见上：≥90° 会把枪翻到面背面
+    if (t > kTiltPhysMax) t = kTiltPhysMax;
+    // 背离基准方向的面（α>134°）：比例外推到这里已经贴着物理门，扳过去只会把枪顶进工件，
+    // 这条路不成立 → 回 0（正对喷法向），不做无意义的线性外推。
     if (c < -0.7) t = 0.0;
     return t;
+}
+
+// 倾角**搜索/救援**的上界（与 tiltNeedDeg 的"基准值"分开，别混）。
+// 基准倾角按比例给、可以超过 tiltMax：α=120° 的面基准就是 80°，而 tiltMax 默认 60。
+// 搜索/救援若仍拿 tiltMax 当上界，这一档点就既加不上去也降不下来（候选全被 continue 掉）
+// —— 现象是大角度面上"救援等于关掉"，P0 只好照实报。
+// 所以上界取 max(tiltMax, 本点基准倾角)，再压到 89°（≥90° 会把枪翻到面背面）。
+inline double tiltSearchHi(const Params& p, double baseDeg) {
+    return std::min(89.0, std::max(p.tiltMaxDeg, baseDeg));
 }
 
 // 「站位侧」方位角：机器人基座相对该加工点在哪一侧，枪就往那一侧倾。
@@ -1823,11 +1846,11 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
     // 倾角需求按法向**线性**给，而不是"非朝上就一律 ±20°"的阶梯：
     //   δ = 法向与 +Z（"正位置"，即采集/相机拍过去的方向）的夹角
     //       （0° = 正朝上，90° = 竖直侧壁，180° = 完全倒挂）
-    //   tilt0 = tiltNonUpDeg · (δ / 90°)，封顶 tiltMaxDeg
+    //   tilt0 = tiltNonUpDeg · (δ / 90°)，**全量程比例、不按 tiltMax 截断**（见 tiltNeedDeg）
     // 系数 2026-10-26 由 30 提到 60（用户口径"60°×δ/90"）：侧壁（δ=90）直接给满 60°，
     // 即"把枪尽量扳到正位置再压下去"；δ<45 的面仍只给 <30° 的轻微补偿。
     // 取 90° 作满量程锚点是因为它物理上就是"面立起来了"的界限：此时给满基准倾角，
-    // 比侧壁更倒挂的面（δ>90°）继续线性增长，直到上限。
+    // 比侧壁更倒挂的面（δ>90°）继续线性增长（120° 面 → 80°），只受 89° 物理门约束。
     // 阶梯做法在 45° 边界上产生 20° 的阶跃，反映到轨迹上就是相邻点倾角突跳，
     // 实机过不了；线性化之后法向连续 → δ 连续 → 倾角需求连续。
     double tilt0 = tiltNeedDeg(n, p.tiltRefW, p);
@@ -1850,7 +1873,8 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
         // curved idx 2990 实测：网格版 40° 自碰撞间隙 +1.18mm，漂移版 36.48° 为 −1.16mm。
         double g = std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg;
         while (g <= tilt0 + 1e-9) g += p.tiltStepDeg;   // 网格首档必须严格大于 tilt0
-        for (double tt = g; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg)
+        const double tHi = tiltSearchHi(p, tilt0);      // 上界不能被 tiltMax 卡住（见 tiltSearchHi）
+        for (double tt = g; tt <= tHi + 1e-9; tt += p.tiltStepDeg)
             cand.push_back({tt, azPref});
     }
 
@@ -1923,7 +1947,7 @@ void needTilt(const Evaluator& ev, const Params& p, const TrajIn& t, int i,
             while (az > 180.0) az -= 360.0;
             for (int m = 0; m < 4; ++m) {
                 double tt = std::max(std::ceil(tilt0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg, ttBase[m]);
-                if (tt > p.tiltMaxDeg + 1e-9) continue;
+                if (tt > tiltSearchHi(p, tilt0) + 1e-9) continue;
                 PR got;
                 if (tryCand(tt, az, got)) {
                     outTilt = tt;
@@ -2415,7 +2439,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         // ---- 逐点连续口径（RS_POSE_TILT_PERP）
         //
         // 倾角只由**该点法向**决定：δ = 法向与「正位置」(+Z，即采集/相机拍过去的方向)的夹角，
-        // tilt = tiltNonUpDeg × δ/90，封顶 tiltMaxDeg。法向连续 ⟹ 倾角连续，
+        // tilt = tiltNonUpDeg × δ/90，全量程比例（不按 tiltMax 截断，只受 89° 物理门）。法向连续 ⟹ 倾角连续，
         // 一圈桶壁就是一条平滑的倾角曲线，不会再出现 0°/25° 两块台阶。
         //
         // 为什么不走面级择优：面级常量的唯一好处是"面内姿态绝对不动"，代价是**换面即跳变**。
@@ -2552,7 +2576,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 cand.push_back(need0);
                 double g0 = std::ceil(need0 / p.tiltStepDeg - 1e-9) * p.tiltStepDeg;
                 if (g0 <= need0 + 1e-9) g0 += p.tiltStepDeg;   // 网格首档严格大于需求（同 needTilt 口径）
-                for (double tt = g0; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg)
+                const double tHi0 = tiltSearchHi(p, need0);    // 需求超过 tiltMax 时上界跟着放开
+                for (double tt = g0; tt <= tHi0 + 1e-9; tt += p.tiltStepDeg)
                     cand.push_back(tt);
 
                 int K = std::min<int>(24, (int)P.size());
@@ -2683,7 +2708,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             // （阶段 1 的兜底只在需用倾角上试方位 ±30/±60，且从没试过 55° 与方位 60° 的组合）。
             if (!degenerate && pool.front().s.p0() > 0) {
                 std::vector<Cand> wide;
-                for (double tt = tilt0; tt <= p.tiltMaxDeg + 1e-9; tt += p.tiltStepDeg) {
+                const double tHiW = tiltSearchHi(p, tilt0);
+                for (double tt = tilt0; tt <= tHiW + 1e-9; tt += p.tiltStepDeg) {
                     for (int a = -180; a < 180; a += 30) {
                         double aa = (double)a;
                         // 与 pushAz 同一条工艺边界：只允许"上翻方向左右 60° 内"
@@ -3170,6 +3196,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
     };
 
+    // 救援/加档能用的倾角上界（见 tiltSearchHi：基准倾角可以超过 tiltMax）
+    auto tiltHi = [&](double t0) { return tiltSearchHi(p, t0); };
+
     auto runRange3 = [&](int a, int b, Acc3& acc) {
         double prevTheta[6] = {0, 0, 0, 0, 0, 0};
         bool hasSeed = false;
@@ -3227,13 +3256,13 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     if (t.spray[i]) {
                         if (p.fastPose) mMax = 1;
                         else if (p.tiltPerPoint)
-                            mMax = (int)std::floor((p.tiltMaxDeg - tilt) / p.tiltStepDeg + 1e-9);
+                            mMax = (int)std::floor((tiltHi(tilt) - tilt) / p.tiltStepDeg + 1e-9);
                         else mMax = 3;
                     }
                     for (int m = 1; m <= mMax && !rescued; ++m) {
                         for (int sgn = 1; sgn >= -1 && !rescued; sgn -= 2) {
                             double t2 = tilt + sgn * m * p.tiltStepDeg;
-                            if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                            if (t2 < -1e-9 || t2 > tiltHi(tilt) + 1e-9) continue;
                             V3 d2 = dirOf(nrm, uUp, axis, t2, az);
                             PR pr2;
                             if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
@@ -3313,7 +3342,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     // 逐点倾角模式救援幅度大，阈值自动放宽（多数情况等于不跳过，行为不变）。
                     // 超限的点照实报 JOINT_LIMIT，判据一条不少，只是不再反复试解。
                     const double rescueSpan = p.tiltPerPoint
-                        ? std::max(p.tiltStepDeg, p.tiltMaxDeg - tilt)
+                        ? std::max(p.tiltStepDeg, tiltHi(tilt) - tilt)
                         : 2.0 * p.tiltStepDeg;
                     const bool overFar = pr.over && pr.margin < -2.0 * rescueSpan;
                     if (!hardOk(pr, p) && t.spray[i] && !overFar) {
@@ -3330,7 +3359,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                         // 这个点真过不了（自碰撞/连杆撞件）就单独往上抬，别为了一行连续
                         // 让整条轨迹不可用（长板实测：只 ±2 步时 P0=825，面级常量时 93）。
                         const int mMax2 = p.tiltPerPoint
-                            ? (int)std::floor((p.tiltMaxDeg - tilt) / p.tiltStepDeg + 1e-9)
+                            ? (int)std::floor((tiltHi(tilt) - tilt) / p.tiltStepDeg + 1e-9)
                             : 2;
                         const double marginBefore = pr.margin;   // 救援前超限有多深（诊断用）
                         // 救援前失败类型（与 ff* 同口径，互斥按严重度）
@@ -3348,7 +3377,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                             bool fixed = false;
                             for (int sgn = -1; sgn <= 1 && !fixed; sgn += 2) {
                                 double t2 = tilt + sgn * m * p.tiltStepDeg;
-                                if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                                if (t2 < -1e-9 || t2 > tiltHi(tilt) + 1e-9) continue;
                                 V3 d2 = dirOf(nrm, uUp, axis, t2, az);
                                 PR pr2;
                                 ++acc.rescueEvals;
@@ -3391,7 +3420,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                         for (int m = 1; m <= 3 && !fixed; ++m) {
                             for (int sgn = -1; sgn <= 1 && !fixed; sgn += 2) {
                                 double t2 = tilt + sgn * m * p.tiltStepDeg;
-                                if (t2 < -1e-9 || t2 > p.tiltMaxDeg + 1e-9) continue;
+                                if (t2 < -1e-9 || t2 > tiltHi(tilt) + 1e-9) continue;
                                 V3 d2 = dirOf(nrm, uUp, axis, t2, az);
                                 PR pr2;
                                 if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr, hasSeed ? prevTheta : nullptr,

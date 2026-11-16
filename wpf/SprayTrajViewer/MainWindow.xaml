@@ -342,7 +342,8 @@
                                         <TextBox x:Name="TxtMaxSprayAngle" Text="30" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
                                     <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,8,0,0">
-                                        <TextBlock Text="倾角搜索上限 (deg)" FontSize="11" Foreground="#6B7280"/>
+                                        <TextBlock Text="倾角搜索上限 (deg)" FontSize="11" Foreground="#6B7280"
+                                                   ToolTip="只限「额外搜索/救援」的加档，不截断按比例算出的基准倾角。&#x0a;基准倾角 = 系数 × 面法向与正方向(+X)的夹角/90°（系数默认 60），全量程比例，只受 89° 物理门约束（≥90° 会把枪翻到面背面）。&#x0a;所以面法向与 +X 差 120° 时给 80° 倾角、方向落在 +X 偏 40° —— 与这里填多少无关。"/>
                                         <TextBox x:Name="TxtTiltMax" Text="60" Padding="4" Margin="0,2,0,0"/>
                                     </StackPanel>
 
@@ -405,7 +406,7 @@
 
                                 <CheckBox x:Name="ChkTiltPerPoint" Content="倾角逐点连续（按法向线性）"
                                           Margin="0,8,0,0" VerticalContentAlignment="Center"
-                                          ToolTip="勾上 = 倾角只由该点法向决定：δ=法向与「正位置」(+Z，即采集/相机拍过去的方向)的夹角，tilt = 60°×δ/90（侧壁给满 60°，δ&lt;45° 的面不足 30°）。&#x0a;法向连续 ⟹ 倾角连续，一圈桶壁不再被切成 0°/25° 两块。&#x0a;个别点光靠线性值过不了（自碰撞/连杆撞件）时，只把那个点单独往上抬，不连累整面。&#x0a;注意：倾角就是喷角，超过「最大喷角」会报 SPRAY_ANGLE 告警 —— 系数调到 60 后，δ&gt;45° 的面都会落在 30° 喷角之外，要么把喷角上限一起放宽，要么这一项就只是提示。&#x0a;不勾（默认）= 面级常量：一个面组锁一个 (倾角,方位)，面内绝对不跳，换面才变。"/>
+                                          ToolTip="勾上 = 倾角只由该点法向决定：δ=法向与「正位置」(+X，基座→工件)的夹角，tilt = 60°×δ/90（侧壁给满 60°，δ&lt;45° 的面不足 30°），**全量程比例、不封顶**（δ=120° 给 80°，只受 89° 物理门约束）。&#x0a;法向连续 ⟹ 倾角连续，一圈桶壁不再被切成 0°/25° 两块。&#x0a;个别点光靠线性值过不了（自碰撞/连杆撞件）时，只把那个点单独往上抬，不连累整面。&#x0a;注意：倾角就是喷角，超过「最大喷角」会报 SPRAY_ANGLE 告警 —— 系数调到 60 后，δ&gt;45° 的面都会落在 30° 喷角之外，要么把喷角上限一起放宽，要么这一项就只是提示。&#x0a;不勾（默认）= 面级常量：一个面组锁一个 (倾角,方位)，面内绝对不跳，换面才变。"/>
 
                                 <CheckBox x:Name="ChkAutoExport" Content="自动导出（点云同名 + 模拟平台 JSON）"
                                           Margin="0,8,0,0" VerticalContentAlignment="Center" IsChecked="True"
