@@ -1,0 +1,156 @@
+{
+ "big": {
+  "faces": 1,
+  "rows": 39,
+  "points": 9979,
+  "rms": 1.783,
+  "sec": 1.1,
+  "n_lift": 0,
+  "nRow": 39,
+  "rowLen": 1006.5,
+  "rowLenMin": 1002.2
+ },
+ "bin": {
+  "faces": 3,
+  "rows": 30,
+  "points": 5627,
+  "rms": 3.718,
+  "sec": 0.7,
+  "n_lift": 0,
+  "nRow": 12,
+  "rowLen": 92.0,
+  "rowLenMin": 43.3
+ },
+ "box": {
+  "faces": 5,
+  "rows": 122,
+  "points": 2253,
+  "rms": 0.299,
+  "sec": 0.4,
+  "n_lift": 0,
+  "nRow": 24,
+  "rowLen": 358.1,
+  "rowLenMin": 357.9
+ },
+ "box_user": {
+  "faces": 9,
+  "rows": 41,
+  "points": 430,
+  "rms": 0.299,
+  "sec": 0.6,
+  "n_lift": 0,
+  "nRow": 7,
+  "rowLen": 243.1,
+  "rowLenMin": 89.5
+ },
+ "cao": {
+  "faces": 4,
+  "rows": 30,
+  "points": 1672,
+  "rms": 3.977,
+  "sec": 0.4,
+  "n_lift": 0,
+  "nRow": 24,
+  "rowLen": 232.0,
+  "rowLenMin": 136.0
+ },
+ "complex": {
+  "faces": 5,
+  "rows": 42,
+  "points": 5526,
+  "rms": 9.182,
+  "sec": 1.2,
+  "n_lift": 0,
+  "nRow": 42,
+  "rowLen": 417.7,
+  "rowLenMin": 68.5
+ },
+ "curved": {
+  "faces": 3,
+  "rows": 35,
+  "points": 3232,
+  "rms": 5.631,
+  "sec": 0.7,
+  "n_lift": 0,
+  "nRow": 37,
+  "rowLen": 178.1,
+  "rowLenMin": 34.6
+ },
+ "longstripe": {
+  "faces": 2,
+  "rows": 47,
+  "points": 12078,
+  "rms": 4.636,
+  "sec": 0.7,
+  "n_lift": 0,
+  "nRow": 47,
+  "rowLen": 1007.2,
+  "rowLenMin": 1000.3
+ },
+ "norim": {
+  "faces": 10,
+  "rows": 195,
+  "points": 12139,
+  "rms": 91.995,
+  "sec": 2.1,
+  "n_lift": 0,
+  "nRow": 125,
+  "rowLen": 326.8,
+  "rowLenMin": 108.0
+ },
+ "rim": {
+  "faces": 9,
+  "rows": 226,
+  "points": 13634,
+  "rms": 2.008,
+  "sec": 3.4,
+  "n_lift": 0,
+  "nRow": 130,
+  "rowLen": 364.0,
+  "rowLenMin": 302.0
+ },
+ "rim_st4": {
+  "faces": 9,
+  "rows": 226,
+  "points": 13634,
+  "rms": 2.008,
+  "sec": 3.5,
+  "n_lift": 0,
+  "nRow": 130,
+  "rowLen": 364.0,
+  "rowLenMin": 302.0
+ },
+ "tray": {
+  "faces": 2,
+  "rows": 20,
+  "points": 1541,
+  "rms": 5.104,
+  "sec": 0.3,
+  "n_lift": 0,
+  "nRow": 20,
+  "rowLen": 252.0,
+  "rowLenMin": 149.0
+ },
+ "zhe": {
+  "faces": 2,
+  "rows": 12,
+  "points": 2006,
+  "rms": 2.469,
+  "sec": 0.6,
+  "n_lift": 0,
+  "nRow": 12,
+  "rowLen": 593.0,
+  "rowLenMin": 306.2
+ },
+ "curved_user": {
+  "faces": 3,
+  "rows": 35,
+  "points": 3237,
+  "rms": 5.631,
+  "sec": 0.7,
+  "n_lift": 0,
+  "nRow": 37,
+  "rowLen": 179.2,
+  "rowLenMin": 34.6
+ }
+}

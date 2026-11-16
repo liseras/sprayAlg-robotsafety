@@ -1,19 +1,31 @@
-# 手眼标定矩阵 T_base_cam：p_base = R · p_cam + t
-# 来源：标定软件界面截图（2026-11-09，REDMI K80 拍屏）
-# 用法：python align_cloud_to_robot.py --src <点云目录> --dst <输出目录> --handeye config/handeye_cam2base.txt
+# 手眼标定矩阵 T_base_cam：p_base = R · p_cam + t（4×4 行主序，单位 mm）
+# 本文件是 SprayTrajViewer 界面 / 命令行工具的默认手眼配置
+#（界面默认路径 config\handeye_cam2base.txt，构建时由 csproj 同步到 exe 旁）。
+#
+# 来源沿革：
+#   · 2026-11-09 标定软件界面截图（REDMI K80 拍屏），仅两位小数，正交残差 1.6e-3；
+#   · 2026-11-14 改用 SprayVision Simple 模组 M1 的 Config\handeye_M1.json 全精度值
+#     （handeye-cam2base-v3 / FrameAlign=pointcloud / Source=手工录入 /
+#      SolvedAt 2026-11-13 15:49:36 / PairCount=0）。两次是同一份标定，
+#      最大元素差 0.0031，仅提升精度，未改坐标系语义。
+#   · 两位小数版备份：temp\handeye_backup\repo_config_handeye_cam2base.txt.bak-20261114-2digit
+#     （exe 旁旧版同目录：exe_config_handeye_cam2base.txt.bak-20261114-2digit）
+#   · M1 独立文件：config\handeye_M1_cam2base.txt（同格式）、
+#                  config\handeye_M1_cam2base.json（含元数据，软件亦可直接识别）。
+#
+# 用法：python align_cloud_to_robot.py --src <点云目录> --dst <输出目录> --handeye config\handeye_cam2base.txt
 #
 # 坐标系语义（三列 = 点云 xyz 三轴在基座系里的指向）：
-#   点云 x 轴 → 基座 (-0.04, 1.00, 0.00)  ≈ 基座 +Y（水平横向量）
-#   点云 y 轴 → 基座 ( 0.00, 0.00, 1.00)  =  基座 +Z（**重力向上**）
-#   点云 z 轴 → 基座 ( 1.00, 0.04, 0.00)  ≈ 基座 +X（指向机器人 / 深度轴）
+#   点云 x 轴 → 基座 (-0.0424,  0.9991,  0.0017)  ≈ 基座 +Y（水平横向量）
+#   点云 y 轴 → 基座 (-0.0013, -0.0018,  1.0000)  =  基座 +Z（**重力向上**）
+#   点云 z 轴 → 基座 ( 0.9991,  0.0424,  0.0014)  ≈ 基座 +X（指向机器人 / 深度轴）
+# 重力向上在点云系 = R 的第 3 行 ≈ (0, 1, 0) ⇒ 安全层 upCloud = +Y
+#（点云 y 轴竖直，与「工件立着挂、相机正对拍摄」一致）。
 #
-# 重力向上在点云系 = R 的第 3 行 = (0, 1, 0)  ⇒ 安全层 upCloud = +Y
-# （点云 y 轴是竖直方向，与「工件立着挂、相机正对拍摄」一致：
-#   煤气灶背板变换后 860 高 × 399 宽 × 124 厚，主面法向与重力夹角 86.3°）
-#
-# 校验：|RRᵀ−I|max = 1.6e-3，det = 1.0016 —— 屏幕四舍五入到两位小数的正常残差。
+# FrameAlign=pointcloud：统一相机系 + 真旋转，可直接换算，无需镜像对齐。
+# 校验：|RRᵀ−I|max = 9.98e-7，det(R) = 1.00000006，第 4 行 = (0,0,0,1)。
 
- -0.04   0.00   1.00   -450.62
-  1.00   0.00   0.04  -1395.05
-  0.00   1.00   0.00     711.65
-  0.00   0.00   0.00       1.00
+ -0.042395  -0.001325   0.999100  -450.619421
+  0.999099  -0.001801   0.042393 -1395.053068
+  0.001743   0.999998   0.001400   711.650885
+  0.000000   0.000000   0.000000     1.000000

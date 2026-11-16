@@ -1,0 +1,45 @@
+{
+  "source_ply": "E:\\Code\\新喷涂框架\\SprayVision\\docs\\SprayVisionSimple\\src\\SprayVisionSimple.App\\bin\\Debug\\net8.0-windows\\export\\双长板.ply",
+  "before": {
+    "points": 47,
+    "length_mm": 183.2,
+    "angle_deg": -21.25,
+    "rows": 1
+  },
+  "after": {
+    "原始点云_新DLL": {
+      "points": 143,
+      "length_mm": 565.4,
+      "angle_cam_XY_deg": -0.16,
+      "angle_base_YZ_deg": -0.06,
+      "cam_x": [
+        -19.3,
+        546.1
+      ],
+      "cam_y": [
+        202.6,
+        204.2
+      ],
+      "cam_z_const": 1191.8,
+      "base_z_const": 917.2
+    },
+    "清理点云_新DLL_推荐": {
+      "points": 143,
+      "length_mm": 566.4,
+      "angle_cam_XY_deg": 0.22,
+      "angle_base_YZ_deg": 0.32,
+      "cam_x": [
+        -20.3,
+        546.0
+      ],
+      "cam_y": [
+        183.8,
+        186.0
+      ],
+      "cam_z_const": 1191.8,
+      "base_z_const": 898.7
+    }
+  },
+  "regress": "14 用例与改动前 DLL 逐位一致（4 个 11-14 已知基线回归，无新增）",
+  "dll_md5": "f04c286cb3134ee75eb796987c5dfd9b"
+}

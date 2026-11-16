@@ -890,7 +890,8 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, doubl
                              std::vector<Vec2>& outVerts, std::vector<int>& outTris,
                              int maxVerts, int maxTris,
                              std::vector<char>* keepMask = nullptr,
-                             std::vector<Vec2>* fillRectOut = nullptr)
+                             std::vector<Vec2>* fillRectOut = nullptr,
+                             std::vector<std::vector<Vec2>>* loopsOut = nullptr)
 {
     const int n = (int)uv.size();
     if(n < 20) return false;
@@ -1223,6 +1224,10 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, doubl
             outTris.push_back(base+tris[k+1]);
             outTris.push_back(base+tris[k+2]);
         }
+        // 输出"重建轮廓多边形"（已是世界无关的 2D 局部坐标），供轨迹阶段把行裁剪
+        // 在重建面内——这是抑制"轨迹出框"最直接的一环：面的轮廓已经算出来了，
+        // 布行却仍按 P0.5/P99.5 包围盒走，等于算完不用。
+        if(loopsOut) loopsOut->push_back(poly);
     }
     return !outTris.empty();
 }
@@ -4681,6 +4686,15 @@ static void spray_traj_core(
     // 窄条补全记录：补全面要让轨迹也铺满整个矩形，不能只跟着点云走
     std::vector<char> planeFilled(segs.size(), 0);
     std::vector<std::array<Vec3,4>> planeFillRect(segs.size());
+    // 每个面重建出来的轮廓多边形（面局部 u,v 坐标，与 planeBase 配套）。
+    // 布行时用它把行端点夹在面内 —— 轮廓已经算出来了，布行却按 P0.5/P99.5 包围盒走，
+    // 等于白算：包围盒会把"面在这一行没有材料"的空档也算进去，实测出框 338mm。
+    std::vector<std::vector<std::vector<Vec2>>> planeLoops(segs.size());
+    // 面局部基（uf,vf）与面心，用于把 (u,v) 与世界坐标互转（与 res.planes 上的 ux/uy 同源）
+    std::vector<Vec3> planeBaseC(segs.size()), planeBaseU(segs.size()), planeBaseV(segs.size());
+    // 重建网格是否碎片化（碎成多块且最大块 <= 50%）：这类面必须按轮廓切段，
+    // 否则行会横穿两块材料之间的空档。在重建阶段算一次，轨迹阶段直接用。
+    std::vector<char> planeFrag(segs.size(), 0);
     std::vector<int> planeSeg;          // res.planes[wi] 对应的 segs 下标（拆薄壁行时要用）
     for(size_t i=0;i<segs.size() && wi<SPRAYTRAJ_PLANE_SLOTS;++i){
         Plane& P = segs[i].pl;
@@ -4812,6 +4826,7 @@ static void spray_traj_core(
             }
             std::vector<char> keepMask;
             std::vector<Vec2> fillRect;
+            std::vector<std::vector<Vec2>> meshLoops;   // 重建轮廓（局部 u,v），供布行裁剪
             bool okMesh = false;
             {
                 ProfStage ps("3.轮廓重建", &tMesh);
@@ -4832,7 +4847,7 @@ static void spray_traj_core(
                                           verts, tris,
                                           SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
                                           SPRAYTRAJ_PLANE_MAX_POLY_TRIS,
-                                          &keepMask, &fillRect);
+                                          &keepMask, &fillRect, &meshLoops);
             }
             // 补全面：记下矩形四角的世界坐标，轨迹阶段据此在补全区布行
             if(!fillRect.empty() && fillRect.size() >= 4){
@@ -4840,17 +4855,50 @@ static void spray_traj_core(
                 for(int k=0;k<4;++k)
                     planeFillRect[i][k] = P.c + uf*fillRect[k].x + vf*fillRect[k].y;
             }
+            // 记下该面的重建轮廓与局部基，供轨迹阶段裁剪行端点。
+            // **坐标系必须统一**：build_plane_mesh 产出的轮廓是 PCA 旋转后基 (uf,vf) 下
+            // 的坐标，而轨迹阶段的 P2/行坐标用的是 (uu,vv)=cross(z,n)/cross(n,uu)。
+            // 两者相差一个 ang 旋转（uf=uu*ca+vv*sa, vf=vv*ca-uu*sa），这里就地转成
+            // (uu,vv) 口径存下来，轨迹侧再乘 theta 旋转即可直接和 xs/xe/yc 比较。
+            {
+                const double ca=std::cos(ang), sa=std::sin(ang);
+                std::vector<std::vector<Vec2>> conv; conv.reserve(meshLoops.size());
+                for(auto& lp : meshLoops){
+                    std::vector<Vec2> q; q.reserve(lp.size());
+                    for(auto& t : lp)
+                        q.push_back(Vec2{ t.x*ca - t.y*sa, t.x*sa + t.y*ca });  // (uf,vf) -> (uu,vv)
+                    conv.push_back(std::move(q));
+                }
+                planeLoops[i] = std::move(conv);
+            }
+            planeBaseC[i] = P.c; planeBaseU[i] = uf; planeBaseV[i] = vf;
             res.planes[wi].polyVertCount = 0;
             res.planes[wi].polyTriCount  = 0;
-            // 用重建面掩膜回筛内点：稀疏混入的孤立扫描线已被开运算剔除，
-            // 这些点不能再参与后面按面生成轨迹，否则轨迹会拉到工件外面。
+            // ---- 内点回筛（去掉"面外散点"）----
+            // 语义：重建出来的多边形是"这个面到底覆盖哪里"的唯一权威。
+            //
+            // 旧写法带一条 `kept >= inl/2` 的保护，本意是怕形态学把好面削光导致丢面；
+            // 但它在"这个面本身就是稀疏过渡带"时必然失效——两个平行面之间的棱带被区域
+            // 生长拟合成一个虚面，开运算只留下沿边沿的碎片，回筛只保住 36% 的点，
+            // 条件不成立 ⇒ 整个碎片点集原样进入布行 ⇒ 轨迹按 P0.5/P99.5 包围盒张开
+            // （现场实测：675×418mm 的空框，而重建面只有 3 块共 14,467mm² 的角块）。
+            //
+            // 所以这里改成**无条件按掩膜回筛**：面外散点一律不参与布行。丢面风险由
+            // 下面的 "kept<20 就保持原样" 兜住（点数太少的面本来也布不出行）。
+            //
+            // 注意：**不能按覆盖率/碎片化直接丢面**。真实面也可能是稀疏或碎片的
+            // （curved 用例的斜面内点 7429 个散在 145,386mm² 上，重建碎成 3 块、
+            // 最大块仅 53%，但它是实实在在的一块面），一律丢面会漏喷。
+            // 真正要抑制的是"行越出面的范围"，那件事在布行阶段按重建轮廓裁剪解决
+            // （build_plane_mesh 现在会回传重建轮廓 loopsOut，genRows 用它夹住行端点）。
             if(okMesh && keepMask.size()==segs[i].inl.size()){
                 std::vector<int> kept; kept.reserve(segs[i].inl.size());
                 for(size_t t=0;t<keepMask.size();++t) if(keepMask[t]) kept.push_back(segs[i].inl[t]);
-                if(kept.size() >= segs[i].inl.size()/2 && kept.size() >= 20){
+                if(kept.size() >= 20){
                     if(kept.size() != segs[i].inl.size())
-                        fprintf(stderr, "[重建] 面片%zu: 剔除离群内点 %zu -> %zu\n",
-                                i, segs[i].inl.size(), kept.size());
+                        fprintf(stderr, "[重建] 面片%zu: 剔除面外内点 %zu -> %zu（保留 %.0f%%）\n",
+                                i, segs[i].inl.size(), kept.size(),
+                                100.0*(double)kept.size()/(double)std::max<size_t>(1,segs[i].inl.size()));
                     segs[i].inl.swap(kept);
                     res.planes[wi].count = (int)segs[i].inl.size();
                 }
@@ -4876,8 +4924,10 @@ static void spray_traj_core(
                 {
                     int nc=0; double lf=0, ar=0;
                     mesh_connect_stats(verts, tris, nc, lf, ar);
-                    fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（规则轮廓）连通块=%d 最大块占比=%.0f%% 面积=%.0fmm2 内点=%zu\n",
-                            wi, nv, nt, nc, lf*100.0, ar, segs[i].inl.size());
+                    planeFrag[i] = (nc > 1 && lf <= 0.50) ? 1 : 0;
+                    fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（规则轮廓）连通块=%d 最大块占比=%.0f%% 面积=%.0fmm2 内点=%zu%s\n",
+                            wi, nv, nt, nc, lf*100.0, ar, segs[i].inl.size(),
+                            planeFrag[i] ? "  ← 碎片化，轨迹按轮廓切段" : "");
                 }
                 // 诊断：非主面内点到主面平面的垂直距离分布。
                 // 极端案例——折型板左侧那片掠射点被拟合成 63° 的"面"，
@@ -4908,6 +4958,52 @@ static void spray_traj_core(
 
     // 3. 对每个分割出的平面段，分别生成 S 形轨迹并拼接
     struct Row { double xs, xe, yc; int segIdx; };  // segIdx: 该行是扫描线与面交集的第几段（环形面会产生多段）
+    // ---- 行端点按"重建轮廓"夹紧 ----
+    // 病灶：布行阶段用 P0.5/P99.5 分位包围盒决定"这一行铺到哪"，而重建面多边形
+    // 早就算出来了却没用上。包围盒会把"面在这一行根本没有材料"的空档也算进长度，
+    // 于是行直接横穿空处。辅助 gapSeg=fillHole(默认 300mm) 更放大了这个问题 —
+    // 300mm 以内的空洞一律被"桥接"成连续行，等于对着空气喷 300mm。
+    // 现场实测：重建面只有 3 块共 14,467mm² 的角块，轨迹却张开成 675×418mm 的框，
+    // 最远超出面轮廓 338mm。
+    //
+    // 修法：把重建轮廓作为行范围的唯一权威。每行先按支撑点聚出初段，再与该
+    // yc 水平线同轮廓的交集求交，交集之外一律不喷。轮廓已经把"孔洞该不该填"
+    // 的决策做完（fillHole 以内的洞在重建时已填实、以外的是真空），所以这里
+    // 不需要再按 gapSeg 猜一次，两侧口径自然一致。
+    auto clipRowByLoops=[&](double yc, double xs, double xe,
+                           const std::vector<std::vector<Vec2>>& loops)->std::vector<std::pair<double,double>>{
+        std::vector<std::pair<double,double>> out;
+        if(loops.empty()){ out.emplace_back(xs,xe); return out; }
+        std::vector<std::pair<double,double>> iv;      // 该 y 高度上的轮廓内部区间（已合并）
+        for(const auto& lp : loops){
+            const size_t n = lp.size();
+            if(n < 3) continue;
+            std::vector<double> xs0;
+            for(size_t k=0;k<n;++k){
+                const Vec2& a = lp[k]; const Vec2& b = lp[(k+1)%n];
+                if((a.y > yc) == (b.y > yc)) continue;   // 不相交 / 水平边
+                const double t = (yc - a.y)/(b.y - a.y);
+                xs0.push_back(a.x + (b.x - a.x)*t);
+            }
+            if(xs0.size() < 2) continue;
+            std::sort(xs0.begin(), xs0.end());
+            for(size_t k=0;k+1<xs0.size();k+=2) iv.emplace_back(xs0[k], xs0[k+1]);
+        }
+        if(iv.empty()) return out;                       // 该行整条不在面内
+        std::sort(iv.begin(), iv.end());
+        std::vector<std::pair<double,double>> mg;         // 合并重叠区间
+        for(auto& r : iv){
+            if(!mg.empty() && r.first <= mg.back().second + 1e-9)
+                mg.back().second = std::max(mg.back().second, r.second);
+            else mg.push_back(r);
+        }
+        const double minKeep = std::max(10.0, kReconGap);  // 短于重建尺度的残段没有喷涂价值
+        for(auto& r : mg){
+            const double a = std::max(xs, r.first), b = std::min(xe, r.second);
+            if(b - a >= minKeep) out.emplace_back(a, b);
+        }
+        return out;
+    };
     double L=params->scanRowSpacing, pstep=params->pointSpacing;
     // 跨行方向外扩：首末行相对点云边界各向外多少（mm）。<0 = 自动 = 0.25×行距，
     // 与行端点外扩 edgeExtend 是两个方向、两套默认值：
@@ -4953,6 +5049,13 @@ static void spray_traj_core(
         // 点云缺陷覆盖重建：间隙 < fillHole 的小洞/缺口视为可填补——直接
         // 跨越生成连续行（重建面已把该洞补齐，行应贴重建面连续无断点）；
         // 间隙 >= fillHole 的真实孔/槽才断开为两段。
+        //
+        // 曾经的尝试：把阈值改成 max(L*1.2, 20) 想抑制"对着空气喷 300mm"。
+        // **不能这么做**——线扫点云沿行方向的相邻点距本身就受扫描遮挡影响，
+        // 稀疏面上 40~80mm 的"点间隙"随处可见（不是真空），阈值降到 1.2L 后
+        // norim 行数 195→864、longstripe 47→113，轨迹碎成一地。
+        // 正确的解耦方式是让"行要不要断开"跟着**重建轮廓**判断，而不是拿点间隙猜：
+        // 见下方按重建轮廓修正行的处理（只对轮廓相对行严重缩水的行动手）。
         const double gapSeg = std::max(fillHole, L*0.5);   // x 间隙超过此值视为两段；以下则跨越填补
         // 跨行外扩不许越出面的真实边界：面外没有材料可喷，扩出去只是空走+撞壁风险。
         // 实测开口盒内壁（行距80、-ea 默认16）：首行被推到 z=316（越顶 16mm），行端点
@@ -5843,6 +5946,41 @@ static void spray_traj_core(
                 haveRectAng = true;
             }
         }
+        // 近水平面（法向与内部 +Z 夹角 < 2.9°）的"行方向被离群点带歪"纠偏。
+        // minAreaRect 取凸包边，起停扫的稀疏斜向线尾 / 重建栅格量化出的斜边，
+        // 会以极少数点把这条边带歪（双长板实测 minAreaRect 与数据主轴差 21.5°，
+        // 行方向映回 3D 便歪 21.25°，还被 clipRowByLoops 夹成 183mm 的斜短线）。
+        // PCA 由全部面内点投票，对这类离群点稳健。
+        // ★ 只做"异常纠偏"而非"替换"：偏差 <= 10° 时保持 minAreaRect 原值，
+        //   正常件（含斜面、侧壁、环形面）逐位不变；只有明显被污染时才切到 PCA，
+        //   避免把全量回归里的行/点数扰动带进现场。
+        if(haveRectAng && P2.size() >= 3 && len(cross(zaxis, pl.n)) < 0.05){
+            double mx=0.0, my=0.0;
+            for(const auto& q : P2){ mx += q.x; my += q.y; }
+            mx /= (double)P2.size(); my /= (double)P2.size();
+            double sxx=0.0, sxy=0.0, syy=0.0;
+            for(const auto& q : P2){
+                double dx=q.x-mx, dy=q.y-my;
+                sxx += dx*dx; sxy += dx*dy; syy += dy*dy;
+            }
+            double thPCA = 0.5*std::atan2(2.0*sxy, sxx-syy);
+            double d = std::atan2(std::sin(thLong-thPCA), std::cos(thLong-thPCA));
+            if(d >  1.5707963267948966) d -= 3.141592653589793;
+            if(d < -1.5707963267948966) d += 3.141592653589793;
+            // 只纠"细长面"：长短轴方差比 > 16（长宽比 > 4）。这类面的长轴是唯一的、
+            // 工艺上也必须沿长边走；近方形 / L 形面 minAreaRect 与 PCA 差 70°+ 属正常
+            // （两条边等长，选哪条都对），一旦纠偏反而把既有布局整片换掉。
+            double disc = std::sqrt((sxx-syy)*(sxx-syy) + 4.0*sxy*sxy);
+            double lam1 = 0.5*(sxx+syy+disc), lam2 = 0.5*(sxx+syy-disc);
+            bool slender = lam2 > 1e-9 && lam1 > 16.0*lam2;
+            bool fix = slender && std::fabs(d) > 10.0*3.141592653589793/180.0;
+            if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+                fprintf(stderr, "[rect] 面%zu 近水平面: minAreaRect %.1f° / PCA %.1f° 偏差 %.1f° 细长=%d -> %s\n",
+                        si, thLong*180.0/3.141592653589793, thPCA*180.0/3.141592653589793,
+                        std::fabs(d)*180.0/3.141592653589793, (int)slender,
+                        fix ? "采用 PCA" : "保持不动");
+            if(fix) thLong = thPCA;
+        }
         if(std::getenv("SPRAYTRAJ_FACE_DBG"))
             fprintf(stderr, "[rect] 面%zu P2=%zu haveRect=%d thLong=%.1f forced=%.1f  c=(%.1f,%.1f,%.1f) n=(%.2f,%.2f,%.2f)\n",
                     si, P2.size(), (int)haveRectAng, thLong*180.0/3.141592653589793,
@@ -5949,6 +6087,109 @@ static void spray_traj_core(
             if(ringish){
                 ringMode = true;
                 nRing = std::max(1, (int)std::floor(rw/L + 0.5));
+            }
+        }
+        // ---- 按重建轮廓裁剪行端点（抑制"轨迹出框"的关键一环）----
+        // bestRows 的 xs/xe 来自 P0.5/P99.5 分位包围盒，会把"面在这一行没有材料"
+        // 的空档也算成行长。这里用该面的重建轮廓多边形把每行夹回面内。
+        // 轮廓已把"fillHole 以内该填、以外是真空"的决策做完了，所以这里不需要
+        // 再按 gapSeg 猜一次——两侧口径一致，不会出现"面没补、轨迹却喷过去"。
+        // 环形面不走这里（同心圆本来就贴着环心/环宽算，没有包围盒问题）。
+        if(!ringMode && !bestRows.empty() && !std::getenv("SPRAYTRAJ_NO_ROWCLIP")){
+            const std::vector<std::vector<Vec2>>& loopsUU = planeLoops[si];
+            if(!loopsUU.empty()){
+                // 轮廓存的是 (uu,vv) 口径，行坐标是再转 theta 之后的口径，这里统一到行系。
+                const double ct=std::cos(theta), st=std::sin(theta);
+                std::vector<std::vector<Vec2>> loops; loops.reserve(loopsUU.size());
+                for(auto& lp : loopsUU){
+                    std::vector<Vec2> q; q.reserve(lp.size());
+                    for(auto& t : lp) q.push_back(Vec2{ ct*t.x + st*t.y, -st*t.x + ct*t.y });
+                    loops.push_back(std::move(q));
+                }
+                // ---- 只做"端点夹紧"，不做切段 ----
+                // 反复试过三种策略，只有这一种在所有用例上单调改善：
+                //   A) 按轮廓切段 → 框形面对了，但稀疏/锯齿轮廓被切成碎屑
+                //      （norim 行数 195→268、zhe 面1 行数 5→2），得不偿失；
+                //   B) 面级判"轮廓可信" → 判据在真框形面和锯齿面之间没有清晰分界，
+                //      同一批用例两边都误判；
+                //   C) 只夹端点（本实现）→ 出框的根本原因是"行端点被稀疏离群点
+                //      或分位包围盒撑到面外"，把端点收回到轮廓交集里就消除 90% 的
+                //      越界；行内部的真空档交给上游 gapSeg（它本来就管这件事）。
+                // 关键：只取"与当前行重叠最长的那一段"并把 xs/xe 收进去，
+                // 段的取舍尽量少改动行数——宁可行短一点，也不要碎成几十段。
+                // ---- 只处理"轮廓相对行严重缩水"的行，其余原样保留 ----
+                // 反复试过四种策略，只有这一种在所有用例上单调改善：
+                //   A) 按轮廓切段 → 框形面对了，但稀疏/锯齿轮廓被切成碎屑
+                //      （norim 行数 195→268、zhe 面1 行数 5→2），得不偿失；
+                //   B) 面级判"轮廓可信" → 判据在真框形面和锯齿面之间没有清晰分界；
+                //   C) 无条件夹端点 → 会漏喷。实测诊断：complex 面1 夹掉 1091mm 里
+                //      58% 有材料支撑、面4 是 67%、cao 面0 是 94% —— 点云在那些位置
+                //      确实有料，只是重建轮廓因形态学开运算"缩"了进去。
+                //   D) 本实现：只对"轮廓相比行缩水严重"的行动手。
+                // 判据：轮廓给出的可喷长度 / 行原长 < 40% 才夹/丢。这个门槛对应
+                // "行有六成以上落在重建面外"，那已经不是边界误差而是整段悬空
+                // （bigplane 面0 是 5%、norim 面2 是 35%），而正常面的边界误差
+                // 都在 90% 以上（complex 面1 = 91%、cao 面0 = 97%）。
+                std::vector<Row> kept; kept.reserve(bestRows.size());
+                int nClip = 0, nDrop = 0;
+                double cutLen = 0.0;
+                // 碎片化面（重建网格碎成多块、最大块 <= 50%）：这类面本身就是
+                // "两块材料被一个空档连着"——行必须按轮廓切段，否则一定横穿空档。
+                // bigplane 面0 就是这种：164 个点被重建成 3 块共 14,467mm²，
+                // 行却按 675×418 的包围盒铺，实测对着空气喷 211mm。
+                // 判据放在面级（不按行判），所以不会像逐行切段那样在锯齿面上碎掉：
+                // 真·锯齿面（norim 面9）连通块 4 但最大块 52%、面积 46,376mm²，
+                // 已经 >= 50% 门槛，走"只夹端点"分支。
+                bool fragmented = planeFrag[si];
+                if(fragmented && std::getenv("SPRAYTRAJ_ROWCLIP_DBG"))
+                    fprintf(stderr, "[traj] 面%zu: 重建网格碎片化 → 行按轮廓切段\n", si);
+                for(const Row& r : bestRows){
+                    auto iv = clipRowByLoops(r.yc, r.xs, r.xe, loops);
+                    const double rowLen = std::max(1e-9, r.xe - r.xs);
+                    if(iv.empty()){
+                        // 整行落在轮廓外：只有"行本身很短"才认为它是噪声（长行整条在面外
+                        // 往往说明轮廓被开运算削掉了，删了就是漏喷）
+                        if(rowLen < 2.0*L || fragmented){ ++nDrop; continue; }
+                        kept.push_back(r); continue;
+                    }
+                    double cov = 0.0;
+                    for(auto& s : iv) cov += std::max(0.0, std::min(s.second, r.xe) - std::max(s.first, r.xs));
+                    if(fragmented){
+                        // 碎片化面：每个区间都是独立的一块材料，逐段保留
+                        if(iv.size() > 1 || cov / rowLen < 0.99){
+                            int keptSeg = 0;
+                            for(size_t k=0;k<iv.size();++k){
+                                if(iv[k].second - iv[k].first < std::max(10.0, L*0.5)) continue;
+                                Row q = r;
+                                q.xs = iv[k].first; q.xe = iv[k].second;
+                                q.segIdx = r.segIdx*8 + (int)k;
+                                kept.push_back(q);
+                                ++keptSeg;
+                                cutLen += rowLen - (q.xe - q.xs);
+                            }
+                            if(keptSeg) ++nClip;
+                            continue;
+                        }
+                    }else if(cov / rowLen >= 0.40){
+                        kept.push_back(r); continue;   // 基本在面内，不动
+                    }
+                    // 缩水严重：取重叠最长一段夹端点
+                    size_t bi = 0; double bl = -1;
+                    for(size_t k=0;k<iv.size();++k){
+                        const double ov = std::min(iv[k].second, r.xe) - std::max(iv[k].first, r.xs);
+                        if(ov > bl){ bl = ov; bi = k; }
+                    }
+                    Row q = r;
+                    q.xs = std::max(r.xs, iv[bi].first);
+                    q.xe = std::min(r.xe, iv[bi].second);
+                    if(q.xe - q.xs < std::max(10.0, L*0.5)){ ++nDrop; continue; }
+                    ++nClip; cutLen += rowLen - (q.xe - q.xs);
+                    kept.push_back(q);
+                }
+                if(!kept.empty() && (nClip || nDrop))
+                    fprintf(stderr, "[traj] 面%zu: 按重建轮廓夹端点 %d 行、丢弃 %d 行（行数 %zu -> %zu，%zu 环，夹掉 %.0fmm）\n",
+                            si, nClip, nDrop, bestRows.size(), kept.size(), loops.size(), cutLen);
+                if(!kept.empty()) bestRows.swap(kept);
             }
         }
         totalRows += ringMode ? nRing : (int)bestRows.size();

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>双长板轨迹方向修复 · 结果</title>
+<style>
+  body{margin:0;padding:32px;background:#ffffff;color:#2c2c2a;font-family:"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.65}
+  .wrap{max-width:920px;margin:0 auto}
+  h1{font-size:20px;font-weight:600;margin:0 0 6px}
+  h2{font-size:15px;font-weight:600;margin:28px 0 10px;padding-bottom:6px;border-bottom:1px solid #e3e1da}
+  .sub{color:#5f5e5a;font-size:13px;margin-bottom:22px}
+  .banner{background:#eaf3de;border:1px solid #97c459;border-radius:10px;padding:14px 18px;margin-bottom:24px}
+  .banner b{font-weight:600;color:#27500a}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border:1px solid #e3e1da;padding:8px 12px;text-align:left}
+  th{background:#f5f4ef;font-weight:600;color:#444441}
+  .bad{color:#a32d2d}.good{color:#3b6d11}
+  .cards{display:flex;gap:16px;margin:16px 0}
+  .card{flex:1;border:1px solid #e3e1da;border-radius:10px;padding:14px}
+  .card h3{font-size:13px;font-weight:600;margin:0 0 10px;color:#444441}
+  code{background:#f5f4ef;padding:1px 5px;border-radius:4px;font-family:Consolas,monospace;font-size:12px}
+  ul{padding-left:20px;margin:8px 0}
+  li{margin:4px 0}
+  .note{background:#faeeda;border-left:3px solid #ba7517;padding:10px 14px;border-radius:0 8px 8px 0;font-size:13px;margin:14px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>双长板 · 轨迹与点云方向对不上 — 修复结果</h1>
+  <div class="sub">2026-11-16 · SprayTraj 核心库增量修复 · 原始点云无需清理即可正确出轨迹</div>
+
+  <div class="banner">
+    <b>已修复。</b> 同一份 <code>双长板.ply</code>、界面同一组参数，轨迹由
+    <span class="bad">47 点 / 183mm / 偏 −21.25°</span> 变为
+    <span class="good">143 点 / 565mm / 偏 −0.16°</span>，沿板长轴覆盖全长、1 行、离面 150mm。
+    新 DLL 已部署到界面目录，<b>重启界面后点「生成轨迹」即生效</b>。
+  </div>
+
+  <h2>俯视对照（相机系 XY）</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>修复前 · 斜穿板边</h3>
+      <svg viewBox="0 0 320 170" width="100%" role="img">
+        <title>修复前轨迹斜穿板边</title>
+        <rect x="30" y="80" width="260" height="26" rx="2" fill="#e6f1fb" stroke="#185fa5" stroke-width="1"/>
+        <polyline points="15,20 48,80" fill="none" stroke="#ba7517" stroke-width="2"/>
+        <polyline points="262,80 295,20" fill="none" stroke="#ba7517" stroke-width="2"/>
+        <line x1="100" y1="72" x2="190" y2="120" stroke="#a32d2d" stroke-width="3"/>
+        <text x="196" y="122" font-size="11" fill="#a32d2d">−21.25°</text>
+        <text x="30" y="150" font-size="11" fill="#5f5e5a">47 点 · 183mm · 板内仅中段</text>
+      </svg>
+    </div>
+    <div class="card">
+      <h3>修复后 · 沿板长轴</h3>
+      <svg viewBox="0 0 320 170" width="100%" role="img">
+        <title>修复后轨迹沿板长轴</title>
+        <rect x="30" y="80" width="260" height="26" rx="2" fill="#e6f1fb" stroke="#185fa5" stroke-width="1"/>
+        <polyline points="15,20 48,80" fill="none" stroke="#ba7517" stroke-width="2"/>
+        <polyline points="262,80 295,20" fill="none" stroke="#ba7517" stroke-width="2"/>
+        <line x1="20" y1="93" x2="292" y2="93" stroke="#3b6d11" stroke-width="3"/>
+        <text x="220" y="115" font-size="11" fill="#3b6d11">−0.16°</text>
+        <text x="30" y="150" font-size="11" fill="#5f5e5a">143 点 · 565mm · 覆盖全长</text>
+      </svg>
+    </div>
+  </div>
+
+  <h2>量化对照</h2>
+  <table>
+    <tr><th>指标</th><th>修复前</th><th>修复后（原始点云直接跑）</th><th>推荐（清理斜尾后）</th></tr>
+    <tr><td>轨迹点数</td><td class="bad">47</td><td class="good">143</td><td class="good">143</td></tr>
+    <tr><td>单段长度</td><td class="bad">183.2 mm</td><td class="good">565.4 mm</td><td class="good">566.4 mm</td></tr>
+    <tr><td>与板长轴夹角（相机系）</td><td class="bad">−21.25°</td><td class="good">−0.16°</td><td class="good">+0.22°</td></tr>
+    <tr><td>与板长轴夹角（基座系）</td><td class="bad">−21.16°</td><td class="good">−0.06°</td><td class="good">+0.32°</td></tr>
+    <tr><td>行数</td><td>1（被轮廓夹掉 2 行 / 360mm）</td><td>1（自然）</td><td>1（自然）</td></tr>
+    <tr><td>行落点 y（板 158.7–210）</td><td>149.7–216.0（穿出板）</td><td>202.6–204.2（板上缘）</td><td>183.8–186.0（板中央）</td></tr>
+    <tr><td>离面 Z</td><td>1191.8</td><td>1191.8</td><td>1191.8</td></tr>
+  </table>
+
+  <h2>改了什么</h2>
+  <p><code>cpp/SprayTrajCore/spray_traj.cpp</code> 面内行方向选择处新增一段<b>细长近水平面的异常纠偏</b>：当法向与内部 +Z 夹角 &lt; 2.9°、面内点长短轴方差比 &gt; 16（长宽比 &gt; 4）、且 <code>minAreaRect</code> 的凸包边方向与面内点 PCA 主轴偏差 &gt; 10° 时，改用 PCA 主轴定行方向。</p>
+  <ul>
+    <li>根因：起停扫的稀疏斜向扫描线尾（737 点）撑出斜凸包边，<code>minAreaRect</code> 把斜边当长边，行方向被带歪 21.5°；<code>clipRowByLoops</code> 再按歪轮廓夹端点，3 行裁成 1 行、夹掉 360mm。</li>
+    <li>只做异常纠偏、不替换正常逻辑：近方形/L 形面（如 <code>bin</code> 面2 偏差 75°）不触发，避免整片换布局。</li>
+    <li>调试开关 <code>SPRAYTRAJ_FACE_DBG=1</code> 会打印 <code>[rect] 面N 近水平面: minAreaRect … / PCA … 偏差 … 细长=… -&gt; 采用/保持</code>。</li>
+  </ul>
+
+  <h2>验证与部署</h2>
+  <table>
+    <tr><th>项目</th><th>结果</th></tr>
+    <tr><td>14 用例全量回归</td><td class="good">与改动前 DLL 逐位一致：4 个 11-14 已知基线回归（complex / curved / curved_user / norim），<b>零新增回归</b></td></tr>
+    <tr><td>DLL 编译</td><td>VS 17 2022 / Release，<code>f04c286cb3134ee75eb796987c5dfd9b</code>，585,728 B</td></tr>
+    <tr><td>三处同步</td><td class="good"><code>build/bin/Release</code>、<code>build_obj</code>、<code>wpf/…/net9.0-windows</code> 哈希一致</td></tr>
+    <tr><td>旧 DLL 备份</td><td><code>wpf/…/SprayTraj.dll.before_20261116</code> 与 <code>temp/_diag_dir_20261116/dll_backup/</code></td></tr>
+  </table>
+  <div class="note">
+    <b>需要你做一步：</b>当前界面进程仍加载着旧 DLL 的内存映像。关闭「喷涂轨迹生成器」窗口再重新打开（无需重新编译），载入 <code>双长板.ply</code> 点「生成轨迹」，即可得到 143 点沿板长轴的轨迹。
+  </div>
+
+  <h2>交付文件</h2>
+  <ul>
+    <li><code>原始点云_新DLL_*.csv / .ply</code> — 不作任何输入处理、直接修复后的轨迹（相机系 <code>_cam</code>、基座系 <code>_base</code>）</li>
+    <li><code>清理点云_新DLL_推荐_*.csv / .ply</code> — 额外剔除 737 个斜尾点，行落在板中央（推荐现场使用）</li>
+    <li><code>双长板_清理输入.ply</code> — 去掉斜尾的输入点云，14,105 点</li>
+    <li><code>SprayTraj.dll</code> — 修复版 DLL 副本，便于同步到其他软件</li>
+    <li><code>验证结果.json</code> — 全部数值指标留档</li>
+  </ul>
+
+  <h2>仍未处理（与本次方向问题无关）</h2>
+  <ul>
+    <li>安全层 <code>REJECT 0/47</code> 全为 <code>IK_FAIL</code>：基座手动 (1373, −715, 508)，轨迹点距基座接近/超过 905mm 臂展，需另查基座标定或可达位平移。</li>
+    <li>SprayVisionSimple 侧 <code>libs/algo/SprayTraj.dll</code> 仍是旧版 <code>e0777975…</code>（HEAD f574668 编译，不含本仓库 11-14 工作区改动）。若要在该软件也生效，需按它自己的 ABI 对账与部署流程同步，本次未擅自改动。</li>
+  </ul>
+</div>
+</body>
+</html>

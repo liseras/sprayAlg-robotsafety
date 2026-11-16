@@ -108,3 +108,15 @@ baseline_tmp/obj/
 tools/DensoIkProbe/bin/
 tools/DensoIkProbe/obj/
 tools/DensoIkProbe/out/
+
+# ---------------------------------------------------------------
+# 2026-11-16 补充
+# ---------------------------------------------------------------
+
+# driver 直接在源码目录跑时留下的点云/轨迹/面片输出（该目录只入库源码与构建脚本）
+cpp/SprayTrajCore/*.csv
+cpp/SprayTrajCore/*.ply
+cpp/SprayTrajCore/_abi_probe/
+
+# 归档目录子文件夹里的点云/轨迹 PLY（可由同名 CSV + 驱动重生成，只留结论页与数值）
+outputs/*/*.ply

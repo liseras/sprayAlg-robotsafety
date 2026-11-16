@@ -1,0 +1,24 @@
+# 手眼标定矩阵 T_base_cam：p_base = R · p_cam + t（4×4 行主序，单位 mm）
+# 来源：SprayVision Simple 模组 M1 —— Config\handeye_M1.json
+#       格式 handeye-cam2base-v3，FrameAlign=pointcloud，Source=手工录入，
+#       SolvedAt 2026-11-13 15:49:36，PairCount=0（手工录入，无 AX=XB 残差统计）。
+# 转换：2026-11-14，取上述 JSON 的 "Matrix" 字段原值全精度转写，未做任何修改、
+#       归一或坐标翻转。本文件与 config\handeye_M1_cam2base.json 数值完全一致。
+#
+# 用法：python align_cloud_to_robot.py --src <点云目录> --dst <输出目录> \
+#           --handeye config\handeye_M1_cam2base.txt
+#       或在 SprayTrajViewer 界面「手眼矩阵」里填 config\handeye_M1_cam2base.txt
+#
+# 坐标系语义（三列 = 点云 xyz 三轴在基座系里的指向）：
+#   点云 x 轴 → 基座 (-0.0424,  0.9991,  0.0017)  ≈ 基座 +Y（水平横向量）
+#   点云 y 轴 → 基座 (-0.0013, -0.0018,  1.0000)  =  基座 +Z（**重力向上**）
+#   点云 z 轴 → 基座 ( 0.9991,  0.0424,  0.0014)  ≈ 基座 +X（指向机器人 / 深度轴）
+# FrameAlign=pointcloud 表示统一相机系 + 真旋转，可直接用于点云换算，无需再做镜像对齐。
+#
+# 校验：|RRᵀ−I|max = 9.98e-7，det(R) = 1.00000006，第 4 行 = (0,0,0,1)。
+# 与旧两位小数版 config\handeye_cam2base.txt 的最大元素差 = 0.0031（同一份标定）。
+
+ -0.042395  -0.001325   0.999100  -450.619421
+  0.999099  -0.001801   0.042393 -1395.053068
+  0.001743   0.999998   0.001400   711.650885
+  0.000000   0.000000   0.000000     1.000000

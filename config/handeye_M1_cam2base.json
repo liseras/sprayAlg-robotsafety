@@ -1,0 +1,39 @@
+{
+  "Format": "handeye-cam2base-v3",
+  "Matrix": [
+    [
+      -0.042395,
+      -0.001325,
+      0.9991,
+      -450.619421
+    ],
+    [
+      0.999099,
+      -0.001801,
+      0.042393,
+      -1395.053068
+    ],
+    [
+      0.001743,
+      0.999998,
+      0.0014,
+      711.650885
+    ],
+    [
+      0,
+      0,
+      0,
+      1
+    ]
+  ],
+  "FrameAlign": "pointcloud",
+  "PairCount": 0,
+  "RotResidualDeg": 0,
+  "TransResidualMm": 0,
+  "MaxTransResidualMm": 0,
+  "MinTransResidualMm": 0,
+  "MaxRotResidualDeg": 0,
+  "MinRotResidualDeg": 0,
+  "SolvedAt": "2026-11-13 15:49:36",
+  "Source": "\u624B\u5DE5\u5F55\u5165"
+}
