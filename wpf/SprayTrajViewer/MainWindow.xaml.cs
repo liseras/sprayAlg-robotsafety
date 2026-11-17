@@ -72,7 +72,7 @@ namespace SprayTrajViewer
             // 会把 WPF 布局线程拖住（这个 Canvas 每帧重建几十个 Shape）。
             Viewport.CameraChanged += (_, _) => UpdateAxisHud();
             // ABI 自检：与 C++ `spray_safety.exe --abi` 打印的 sizeof 对齐
-            // （Plane=18664 Point=64 Result=298744 Params=128；SafetyParams=160 SafetyPoint=216 SafetyResult=304）
+            // （Plane=18664 Point=64 Result=298744 Params=160；SafetyParams=160 SafetyPoint=216 SafetyResult=304）
             try
             {
                 App.Log("ABI", null,
@@ -309,6 +309,7 @@ namespace SprayTrajViewer
             if (o.TryGetValue("speed", out v)) TxtSpeed.Text = v;
             if (o.TryGetValue("turn", out v)) TxtTurnFactor.Text = v;
             if (o.TryGetValue("flat", out v)) TxtFlatness.Text = v;
+            if (o.TryGetValue("minw", out v)) TxtMinFaceWidth.Text = v;
             if (o.TryGetValue("curv", out v)) TxtCurvature.Text = v;
             if (o.TryGetValue("sorK", out v)) TxtSorK.Text = v;
             if (o.TryGetValue("sorZ", out v)) TxtSorZ.Text = v;
@@ -443,7 +444,7 @@ namespace SprayTrajViewer
 
             App.Log("CLI", null, $"ply={TxtPath.Text}");
             App.Log("CLI", null,
-                $"flat={TxtFlatness.Text} curv={TxtCurvature.Text} fill={TxtFillHole.Text} " +
+                $"flat={TxtFlatness.Text} minw={TxtMinFaceWidth.Text} curv={TxtCurvature.Text} fill={TxtFillHole.Text} " +
                 $"row={TxtRowSpacing.Text} pt={TxtPointSpacing.Text} standoff={TxtStandoff.Text} " +
                 $"gc={TxtGunClear.Text} ee={TxtEdgeExtend.Text} ea={TxtEdgeExtendAcross.Text} st={TxtShellThick.Text} " +
                 $"dir={CmbScanDir.SelectedIndex} flip={CmbNormalFlip.SelectedIndex}");
@@ -1490,6 +1491,7 @@ namespace SprayTrajViewer
                 speed          = ParseDouble(TxtSpeed.Text, 200),
                 turnRadiusFactor = ParseDouble(TxtTurnFactor.Text, 0.5),
                 flatnessTol    = ParseDouble(TxtFlatness.Text, 40),
+                minFaceWidth   = ParseDouble(TxtMinFaceWidth.Text, 18),
                 curvatureTol   = ParseDouble(TxtCurvature.Text, 5),
                 sorK           = (int)ParseDouble(TxtSorK.Text, 20),
                 sorZ           = ParseDouble(TxtSorZ.Text, 2.5),

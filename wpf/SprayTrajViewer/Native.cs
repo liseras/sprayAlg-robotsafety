@@ -31,6 +31,9 @@ namespace SprayTrajViewer
         // 三轴全 0（默认）= 退回旧口径（沿内部 +Z 抬，等价于"工件朝上、相机俯拍"）。
         // 调用方应填手眼矩阵 R 的第 3 行（重力向上在点云系的方向）。
         public double liftDirX, liftDirY, liftDirZ;
+        // 最小可喷面宽度 mm：重建面片最小外接矩形短边 < 此值 → 判为线状/退化面，
+        // 不输出重建面、不生成轨迹。<=0 关闭。默认 18。
+        public double minFaceWidth;
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -689,6 +689,22 @@ static double minAreaRect(const std::vector<Vec2>& pts, std::vector<Vec2>& rect)
     return best;
 }
 
+// 面内最小外接矩形的短边（mm）。用于"最小可喷宽度"门限：
+//   点云近似共线时，任意包含这条线的平面残差都≈0，flatnessTol 拦不住；
+//   但它的二维凸包只有一条细带，最小外接矩形短边≈重建格距/点距。
+// 返回值 <0 表示点太少、凸包退化；长边写入 longSide（可为空）。
+static double minRectShortSide(const std::vector<Vec2>& pts, double* longSide = nullptr){
+    std::vector<Vec2> rect;
+    if(minAreaRect(pts, rect) < 0.0){
+        if(longSide) *longSide = -1.0;
+        return -1.0;
+    }
+    const double a = len2(rect[1] - rect[0]);
+    const double b = len2(rect[2] - rect[1]);
+    if(longSide) *longSide = std::max(a, b);
+    return std::min(a, b);
+}
+
 static bool pointInTriStrict(Vec2 p, Vec2 a, Vec2 b, Vec2 c){
     double d1=cross2(b-a,p-a), d2=cross2(c-b,p-b), d3=cross2(a-c,p-c);
     bool neg = (d1<0)||(d2<0)||(d3<0);
@@ -3976,6 +3992,7 @@ SPRAYTRAJ_API SprayTrajParams spray_traj_default_params(void){
     // 侧装/立式悬挂工件必须由调用方填「基座 +X 在点云系里的方向」（手眼 R 第 1 行），
     // 否则会从工件顶上翻过去，一次过渡走出一两米（见 spray_traj.h 的字段注释）。
     p.liftDirX = 0.0; p.liftDirY = 0.0; p.liftDirZ = 0.0;
+    p.minFaceWidth = 18.0;     // 最小可喷面宽度：短边 < 18mm 判为线状/退化面（0=关闭）
     return p;
 }
 
@@ -4045,6 +4062,117 @@ static UpFrame read_up_frame(){
 // SprayTrajResult 约 289KB；C# P/Invoke 调用时托管侧已经占了一块返回缓冲，
 // 若这一层再多一个按值返回的 289KB 栈帧，UI 线程的 1MB 栈会被直接顶爆
 // （2026-11-12 实测：加了一层 retry 包装后，背板 10.6 万点调用 Stack overflow）。
+// 2D 离群小簇过滤：布行前剔除与主面断开的极小孤立簇。
+// 背景：p001 重建后 P2 里残留 19 个尾端离群点（距主面 147mm），
+// minAreaRect 走凸包，19 个点就能把矩形拉成 248×112@134°，行方向随之歪掉。
+// 只剔除“同时满足”两个条件的小簇：
+//   1) 点数 < P2 的 smallFrac（默认 1%）——大碎片/真实小面不动；
+//   2) 到主连通域的最近距离 > farGap（默认 3×重建间隙=36mm）——贴着主面的
+//      缺口/小舌不动。
+// 这样 p001 的 19 点（0.5%、147mm）会被清掉，而真实碎片面、窄条上的小分叉保留。
+static void filterP2Outliers(std::vector<Vec2>& pts, double link, double farGap,
+                             double smallFrac, double maxDropFrac, size_t faceIdx)
+{
+    const int n = (int)pts.size();
+    if(n < 40) return;
+    // 1) 按 link 连通，标记所有连通域
+    std::vector<int> par(n);
+    std::iota(par.begin(), par.end(), 0);
+    std::function<int(int)> find = [&](int x){
+        while(par[x] != x){ par[x] = par[par[x]]; x = par[x]; }
+        return x;
+    };
+    auto uni = [&](int a, int b){
+        a = find(a); b = find(b);
+        if(a != b) par[a] = b;
+    };
+    const double cell = std::max(1e-6, link);
+    std::map<std::pair<int,int>, std::vector<int>> grid;
+    std::vector<int> ix(n), iy(n);
+    for(int i=0;i<n;++i){
+        ix[i] = (int)std::floor(pts[i].x / cell);
+        iy[i] = (int)std::floor(pts[i].y / cell);
+        grid[{ix[i], iy[i]}].push_back(i);
+    }
+    const double l2 = link * link;
+    for(int i=0;i<n;++i){
+        for(int dx=-1; dx<=1; ++dx)
+        for(int dy=-1; dy<=1; ++dy){
+            auto it = grid.find({ix[i]+dx, iy[i]+dy});
+            if(it == grid.end()) continue;
+            for(int j : it->second){
+                if(j <= i) continue;
+                const double ddx = pts[i].x - pts[j].x;
+                const double ddy = pts[i].y - pts[j].y;
+                if(ddx*ddx + ddy*ddy <= l2) uni(i, j);
+            }
+        }
+    }
+    // 2) 按根分组，找主连通域
+    std::map<int, std::vector<int>> comps;
+    for(int i=0;i<n;++i) comps[find(i)].push_back(i);
+    if(comps.size() <= 1) return;
+    int mainRoot = -1; size_t mainCnt = 0;
+    for(auto& kv : comps)
+        if(kv.second.size() > mainCnt){ mainCnt = kv.second.size(); mainRoot = kv.first; }
+
+    // 3) 主域点建 farGap 网格，用于近似最近距离
+    const double fg = std::max(1e-6, farGap);
+    std::map<std::pair<int,int>, std::vector<int>> mainGrid;
+    for(int i : comps[mainRoot]){
+        int cx = (int)std::floor(pts[i].x / fg);
+        int cy = (int)std::floor(pts[i].y / fg);
+        mainGrid[{cx, cy}].push_back(i);
+    }
+    std::vector<char> drop(n, 0);
+    size_t dropComps = 0, dropPts = 0;
+    const double fg2 = fg * fg;
+    for(auto& kv : comps){
+        if(kv.first == mainRoot) continue;
+        const std::vector<int>& c = kv.second;
+        const bool small = (double)c.size() < smallFrac * (double)n;
+        if(!small) continue;
+        bool nearMain = false;
+        for(int i : c){
+            int cx = (int)std::floor(pts[i].x / fg);
+            int cy = (int)std::floor(pts[i].y / fg);
+            for(int dx=-1; dx<=1 && !nearMain; ++dx)
+            for(int dy=-1; dy<=1 && !nearMain; ++dy){
+                auto it = mainGrid.find({cx+dx, cy+dy});
+                if(it == mainGrid.end()) continue;
+                for(int j : it->second){
+                    const double ddx = pts[i].x - pts[j].x;
+                    const double ddy = pts[i].y - pts[j].y;
+                    if(ddx*ddx + ddy*ddy <= fg2){ nearMain = true; break; }
+                }
+            }
+            if(nearMain) break;
+        }
+        if(!nearMain){
+            for(int i : c) drop[i] = 1;
+            ++dropComps; dropPts += c.size();
+        }
+    }
+    if(dropPts == 0) return;
+    // 总剔除量上限：一个面里如果“小簇”加起来已经占了不少（例如无边框件
+    // 边缘碎成很多小片），说明这是真实碎片/欠采样，不是孤立脏点；整面保留，
+    // 交给 planeFrag / 轮廓切段。p001 只删 19/3726=0.5%，不受影响。
+    if((double)dropPts > maxDropFrac * (double)n){
+        fprintf(stderr, "[traj] 面%zu: P2 离群小簇合计 %zu 点（%.1f%% > %.0f%%），保留原 P2\n",
+                faceIdx, dropPts, 100.0 * (double)dropPts / (double)n,
+                maxDropFrac * 100.0);
+        return;
+    }
+
+    std::vector<Vec2> kept; kept.reserve((size_t)n - dropPts);
+    for(int i=0;i<n;++i) if(!drop[i]) kept.push_back(pts[i]);
+    fprintf(stderr, "[traj] 面%zu: P2 剔除离群小簇 %zu 个 / %zu 点"
+                    "（单簇<%0.1f%%、距主面 >%.0fmm）  %zu -> %zu\n",
+            faceIdx, dropComps, dropPts, smallFrac * 100.0, fg,
+            (size_t)n, kept.size());
+    pts.swap(kept);
+}
+
 static void spray_traj_core(
     const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out)
 {
@@ -4187,25 +4315,129 @@ static void spray_traj_core(
     // "阈值放大反而面更多"，与用户"阈值越大越能合并"的语义正好相反。
     // 判据修正：与主面夹角 > 40°（陡壁/翻边/裙边）视为独立结构，只要求绝对点数下限，
     // 不参与占比竞赛。近共面（<40°）的碎片仍然按 3% 丢弃——那才是区域生长产生的碎屑。
+    // ⚠ 而"独立朝向"豁免本身又会放过另一类东西：**两个面的交棱处的过渡带**。
+    // 现场实测（p006 tray 件）：0.1° 主面 + 51°/67° 两个侧壁的交角附近，区域生长切出
+    // 一条 379 点的窄带，拟合法向夹在主面与侧壁之间（51° 偏差），因此命中"独立朝向"
+    // 豁免被保留。但这条带子的真实几何是 165.8 × 5.5 mm —— 宽只有 5.5mm，
+    // 比重建栅格（kReconGap=12mm）还窄，重建时整条带被压成一个 10×10 的方格
+    // （重建面积 100mm²，而按点密度本该 ~900mm²），随后在这个方格上布 1 行、
+    // 并为此多出 2 处面间过渡（额外抬枪空移）。视觉上就是"大面上贴着一小块垃圾"。
+    //
+    // 判据（两条同时成立才丢，缺一不可）：
+    //   ① 面内**窄向宽度** < 重建栅格 kReconGap。不是调参数字，而是"这套重建分辨率
+    //      能不能表达该面"的硬下限：窄向跨度不足一个栅格时该面必然退化成单个 cell
+    //      方块（本例重建面积 10×10=100mm²，而按点密度本该 ~900mm²），轮廓与布行
+    //      都已失去几何意义。
+    //   ② 它是**冗余**的：该面绝大多数点落在另一个更大面的平面附近（中位距离很小），
+    //      且法向与那个面只差十几度 —— 即它本来就是那个面的一部分，只是被区域生长
+    //      沿条带切了出来（本例：与面1法向仅差 16.2°，点到面1中位距离 1.6mm）。
+    //   加②的理由：只按宽度会误杀**真实窄结构**——窄筋/窄翻边同样比栅格窄，
+    //   但它们立在工件本体上（离邻近平面十几到几十毫米）、法向与邻面近乎垂直，
+    //   ②不成立，于是被保住。两条 AND 起来，误删面只会来自"与邻面共面且窄于栅格"，
+    //   这种面本来就喷不出独立内容。
+    //   仍然只对靠 distinct 豁免才活下来的面（!big）生效：占比 ≥3% 的窄面可能是
+    //   工件本体或主面，误删会整件漏喷，不放行这条。
+    auto inPlaneExtents = [](const std::vector<Vec3>& P, const std::vector<int>& idx,
+                             Vec3 n, double& wNarrow, double& wLong)->bool{
+        if(idx.size() < 12) return false;
+        n = norm(n);
+        Vec3 ax = std::fabs(n.z) < 0.9 ? Vec3{0,0,1} : Vec3{1,0,0};
+        Vec3 u = norm(cross(n, ax));
+        if(len(u) < 0.5) return false;
+        Vec3 v = cross(n, u);
+        double mu=0, mv=0;
+        for(int k : idx){ mu += dot(P[k],u); mv += dot(P[k],v); }
+        mu /= (double)idx.size(); mv /= (double)idx.size();
+        double suu=0, suv=0, svv=0;
+        for(int k : idx){
+            double a = dot(P[k],u)-mu, b = dot(P[k],v)-mv;
+            suu += a*a; suv += a*b; svv += b*b;
+        }
+        const double th = 0.5*std::atan2(2.0*suv, suu-svv);
+        const double c = std::cos(th), sn = std::sin(th);
+        std::vector<double> pa, pb;
+        pa.reserve(idx.size()); pb.reserve(idx.size());
+        for(int k : idx){
+            double a = dot(P[k],u)-mu, b = dot(P[k],v)-mv;
+            pa.push_back( a*c + b*sn);   // 面内主轴
+            pb.push_back(-a*sn + b*c);   // 面内次轴
+        }
+        // 2%~98% 分位跨度：抗端点毛刺（掠射边缘会甩出几个孤立点把极值带飞）
+        auto spread=[](std::vector<double>& z)->double{
+            const size_t lo = (size_t)(z.size()*0.02);
+            const size_t hi = std::min(z.size()-1, (size_t)(z.size()*0.98));
+            std::nth_element(z.begin(), z.begin()+lo, z.end());
+            const double a0 = z[lo];
+            std::nth_element(z.begin()+lo, z.begin()+hi, z.end());
+            return z[hi]-a0;
+        };
+        const double a1 = spread(pa), b1 = spread(pb);
+        wLong   = std::max(a1,b1);
+        wNarrow = std::min(a1,b1);
+        return true;
+    };
+
     if(segs.size() > 1){
         size_t maxIdx=0; for(size_t i=1;i<segs.size();++i)
             if(segs[i].inl.size() > segs[maxIdx].inl.size()) maxIdx=i;
         double total = (double)Pf.size();
         const Plane& mainPl = segs[maxIdx].pl;
         const size_t absFloor = std::max<size_t>(80, (size_t)(total*0.005));
+        // 元数据快照：下面的 keep.push_back(std::move(s)) 会把已判定的面的 inl 搬空，
+        // 之后再回头查 segs[j].inl.size() 全是 0 —— "找宿主面"就永远找不到。
+        struct SegMeta { size_t n; Plane pl; };
+        std::vector<SegMeta> meta(segs.size());
+        for(size_t i=0;i<segs.size();++i){ meta[i].n = segs[i].inl.size(); meta[i].pl = segs[i].pl; }
         std::vector<PlaneSeg> keep;
-        for(auto& s : segs){
-            double ratio = (double)s.inl.size()/total;
-            double angMain = std::acos(std::min(1.0, std::fabs(dot(s.pl.n, mainPl.n))))*180.0/3.141592653589793;
+        for(size_t i=0;i<segs.size();++i){
+            PlaneSeg& s = segs[i];
+            double ratio = (double)meta[i].n/total;
+            double angMain = std::acos(std::min(1.0, std::fabs(dot(meta[i].pl.n, mainPl.n))))*180.0/3.141592653589793;
             bool big      = ratio >= 0.03;
-            bool distinct = (angMain > 40.0) && (s.inl.size() >= absFloor);
+            bool distinct = (angMain > 40.0) && (meta[i].n >= absFloor);
+            if(!big && distinct){
+                double wN=0, wL=0;
+                if(inPlaneExtents(Pf, s.inl, meta[i].pl.n, wN, wL) && wN < kReconGap){
+                    // 找"更宽的同向邻面"：与 s 法向夹角 <25° 且点数更多。
+                    // 命中即说明 s 是那个面被切出来的一条冗余带（见上方 ② 的解释）。
+                    size_t hostIdx = meta.size();
+                    double hostAng = 0.0;
+                    for(size_t j=0;j<meta.size();++j){
+                        if(j==i || meta[j].n <= meta[i].n) continue;
+                        double a = std::acos(std::min(1.0, std::fabs(dot(meta[j].pl.n, meta[i].pl.n))))*180.0/3.141592653589793;
+                        if(a < 25.0){ hostIdx=j; hostAng=a; break; }
+                    }
+                    double dMed = 1e18;
+                    if(hostIdx < meta.size()){
+                        const Plane& hp = meta[hostIdx].pl;
+                        std::vector<double> dd; dd.reserve(s.inl.size());
+                        for(int k : s.inl) dd.push_back(std::fabs(dot(Pf[k], hp.n) + hp.d));
+                        std::nth_element(dd.begin(), dd.begin()+dd.size()/2, dd.end());
+                        dMed = dd[dd.size()/2];
+                        // 贴住主机面：结合重建栅格（=点云有效分辨率）做门限。
+                        // 5mm 约为典型线扫噪声 + 半个体素，小区间内不区分结构。
+                        if(dMed > 5.0) hostIdx = meta.size();
+                    }
+                    if(hostIdx < meta.size()){
+                        fprintf(stderr, "[split] 丢弃窄带面: 点数=%zu (占比%.1f%%, 与主面夹角%.1f°) "
+                                        "面内宽=%.1fmm < 重建栅格%.0fmm（长=%.1fmm）；"
+                                        "且与面%zu 近同向(%.1f°)、点到该面中位距离仅 %.1fmm → 冗余切块，非独立结构\n",
+                                meta[i].n, ratio*100.0, angMain, wN, kReconGap, wL,
+                                hostIdx, hostAng, dMed);
+                        continue;
+                    }
+                    fprintf(stderr, "[split] 保留窄面: 点数=%zu 面内宽=%.1fmm < 栅格%.0fmm，"
+                                    "但不存在共面宿主面 → 真实窄结构（窄筋/翻边），不丢\n",
+                            meta[i].n, wN, kReconGap);
+                }
+            }
             if(big || distinct){
                 if(!big) fprintf(stderr, "[split] 保留独立朝向小面: 点数=%zu (占比%.1f%%, 与主面夹角%.1f° > 40°)\n",
-                                 s.inl.size(), ratio*100.0, angMain);
+                                 meta[i].n, ratio*100.0, angMain);
                 keep.push_back(std::move(s));
             }
             else fprintf(stderr, "[split] 丢弃碎面: 点数=%zu (占比%.1f%% < 3%%, 与主面夹角%.1f°)\n",
-                          s.inl.size(), ratio*100.0, angMain);
+                          meta[i].n, ratio*100.0, angMain);
         }
         if(!keep.empty()) segs = std::move(keep);
     }
@@ -4782,6 +5014,24 @@ static void spray_traj_core(
             }
             res.planes[wi].polyVertCount = 0;
             res.planes[wi].polyTriCount  = 0;
+            // 最小可喷宽度：曲面块也按投影到面内 (uf,vf) 的最小外接矩形短边判。
+            // 线状/退化点云即使被拟合成"曲面"，在面内也只是一条细带，必须拒掉。
+            double faceW = -1.0, faceL = -1.0;
+            if(okMesh){
+                std::vector<Vec2> wv; wv.reserve(verts3.size());
+                for(const auto& p3 : verts3){
+                    Vec3 d = p3 - P.c;
+                    wv.push_back(Vec2{ dot(d, uf), dot(d, vf) });
+                }
+                faceW = minRectShortSide(wv, &faceL);
+            }
+            if(okMesh && params->minFaceWidth > 1e-9 &&
+               (faceW < 0.0 || faceW < params->minFaceWidth)){
+                fprintf(stderr,
+                        "[重建] 面片%zu: 曲面宽度 %.1fmm < 最小可喷宽度 %.1fmm，判为线状/退化面，不输出该面\n",
+                        i, faceW, params->minFaceWidth);
+                continue;
+            }
             if(okMesh){
                 int nv = std::min((int)verts3.size(), SPRAYTRAJ_PLANE_MAX_POLY_VERTS);
                 for(int v=0; v<nv; ++v){
@@ -4797,8 +5047,8 @@ static void spray_traj_core(
                 }
                 res.planes[wi].polyVertCount=nv;
                 res.planes[wi].polyTriCount=nt;
-                fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（曲面块）内点=%zu\n",
-                        wi, nv, nt, segs[i].inl.size());
+                fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（曲面块）宽度=%.1fmm 内点=%zu\n",
+                        wi, nv, nt, faceW, segs[i].inl.size());
                 meshOk[i] = 1;
                 planeSeg.push_back((int)i);
                 ++wi;
@@ -4874,6 +5124,18 @@ static void spray_traj_core(
             planeBaseC[i] = P.c; planeBaseU[i] = uf; planeBaseV[i] = vf;
             res.planes[wi].polyVertCount = 0;
             res.planes[wi].polyTriCount  = 0;
+            // 最小可喷宽度：用重建轮廓的最小外接矩形短边，而不是点云包围盒。
+            // 重建轮廓已经过开运算/孔洞填补/直边规整，能代表真正要显示和布行的面；
+            // 线状退化面在这里表现为一条细带（短边≈重建格距或点距）。
+            double faceW = -1.0, faceL = -1.0;
+            if(okMesh) faceW = minRectShortSide(verts, &faceL);
+            if(okMesh && params->minFaceWidth > 1e-9 &&
+               (faceW < 0.0 || faceW < params->minFaceWidth)){
+                fprintf(stderr,
+                        "[重建] 面片%zu: 宽度 %.1fmm < 最小可喷宽度 %.1fmm，判为线状/退化面，不输出该面\n",
+                        i, faceW, params->minFaceWidth);
+                continue;
+            }
             // ---- 内点回筛（去掉"面外散点"）----
             // 语义：重建出来的多边形是"这个面到底覆盖哪里"的唯一权威。
             //
@@ -4925,8 +5187,8 @@ static void spray_traj_core(
                     int nc=0; double lf=0, ar=0;
                     mesh_connect_stats(verts, tris, nc, lf, ar);
                     planeFrag[i] = (nc > 1 && lf <= 0.50) ? 1 : 0;
-                    fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（规则轮廓）连通块=%d 最大块占比=%.0f%% 面积=%.0fmm2 内点=%zu%s\n",
-                            wi, nv, nt, nc, lf*100.0, ar, segs[i].inl.size(),
+                    fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（规则轮廓）连通块=%d 最大块占比=%.0f%% 面积=%.0fmm2 宽度=%.1fmm 内点=%zu%s\n",
+                            wi, nv, nt, nc, lf*100.0, ar, faceW, segs[i].inl.size(),
                             planeFrag[i] ? "  ← 碎片化，轨迹按轮廓切段" : "");
                 }
                 // 诊断：非主面内点到主面平面的垂直距离分布。
@@ -5032,6 +5294,10 @@ static void spray_traj_core(
         }
         double mnx=quant(rx,0.005), mxx=quant(rx,0.995);
         double mny=quant(ry,0.005), mxy=quant(ry,0.995);
+        // 小面（长向本身 < 行距）允许一条“全长行”通过：41×132 的板在
+        // rowSpacing=150 时，132mm 的行会被下面的 ">= L" 当碎段丢掉，
+        // 整面直接输出“没有可用行”。大面仍用 L，碎片过滤不变。
+        const double minSeg = std::min(L, std::max(1.0, 0.5*std::max(mxx-mnx, mxy-mny)));
         std::vector<Row> rs;
         // 支撑点阈值自适应：小平面（如窄侧边）点数少，用相对阈值；
         // 大平面用绝对阈值防噪声孤点。
@@ -5106,7 +5372,7 @@ static void spray_traj_core(
             int segCnt=1, segIdx=0;
             auto flushSeg=[&](){
                 // 段长 < 行距 的碎段丢弃：喷涂价值小、且会形成梳齿状碎轨迹
-                if(segCnt>=supMin && (segPrev-segStart) >= L)
+                if(segCnt>=supMin && (segPrev-segStart) >= minSeg)
                     raw.push_back({segStart, segPrev, yc, segIdx});
                 segIdx++;
             };
@@ -5173,6 +5439,11 @@ static void spray_traj_core(
     };
 
     std::vector<SprayTrajPoint> allPts;
+    // 每个面的"面内轨迹"在 allPts 里的区间，供最后的重排阶段使用。
+    // 只记区间、不改任何生成逻辑：区间内是该面自己的点（喷涂点 + 面内换行空移），
+    // 区间外是面间过渡点。重排时会丢掉旧的过渡点、按新顺序重建（见"5.面顺序重排"）。
+    struct FaceSpan { size_t beg, end, si; };
+    std::vector<FaceSpan> faceSpan;
     int totalRows = 0;
     int nDownSkip = 0;      // 朝下超出角度窗口、不喷的面数
     int nGunReject = 0;     // 枪位验收未通过（两侧都伸不进枪）、不布行的面数
@@ -5552,6 +5823,13 @@ static void spray_traj_core(
         return mn;
     };
 
+    // ---- 面顺序：生成阶段不动 ----
+    // 逐面生成仍按 split_planes 的发现顺序（内点数 / 面积降序），面间过渡也照旧就地接上。
+    // 真正的顺序优化放在**最后的重排阶段**（见"5.面顺序重排"）：到那时每个面的真实
+    // 首末枪位已经躺在轨迹里了，用真实端点去算真实过渡代价才可靠 —— 而过渡的固定开销
+    // （退枪 → 抬到安全面 → 平移 → 落枪）远大于两端点的直线距离，用面心/包围盒角点
+    // 这类几何代理估，实测在 box_traj 上空移反而 +34%。
+
     for(size_t si=0; si<segs.size(); ++si){
         if(!meshOk[si]) continue;          // 轮廓都重建不出来的面，不喷
         auto& seg = segs[si];
@@ -5741,11 +6019,41 @@ static void spray_traj_core(
                 }
             };
 
+            // ---- 端点选择（同平面口径）：首行首点 / 末行末点，取离上一面终点更近、且出得来的那端 ----
+            // 反走 = 行序倒过来 + 每行点序倒过来，行间连接段（emitGap）的起止端点随之取反；
+            // 走的是同一批线段，净空/穿面结论不变。出口那一端还要过一遍"退枪→抬到安全面"
+            // 的净空判据（与平面路径同口径）：反走会把出口换到另一端，换成腔里就出不去了。
+            bool revSurf = false;
+            {
+                const int lastK = surf.rowBeg[nr] - 1;
+                if(!allPts.empty() && lastK > 0){
+                    const Vec3 pe{allPts.back().x, allPts.back().y, allPts.back().z};
+                    const int k0 = surf.rowBeg[0];
+                    const Vec3 pF = surf.rowP[k0] + surf.rowN[k0]*params->standoff;
+                    const Vec3 pL = surf.rowP[lastK] + surf.rowN[lastK]*params->standoff;
+                    auto exitOK=[&](const Vec3& e, const Vec3& nn)->bool{
+                        auto leg=[&](const Vec3& W)->double{
+                            const Vec3 Wtop = liftTo(W, sSafe);
+                            return std::min(segMinClear(e, W), segMinClear(W, Wtop));
+                        };
+                        double best = leg(e);
+                        for(double f : {0.25, 0.5, 0.75, 1.0}) best = std::max(best, leg(e + nn*(clear*f)));
+                        return best >= 0.9*gunClearEff;
+                    };
+                    // 正走以 pL 为出口；反走以 pF 为出口
+                    const bool fOK = exitOK(pL, surf.rowN[lastK]);
+                    const bool bOK = exitOK(pF, surf.rowN[k0]);
+                    if(fOK && bOK)   revSurf = (len(pL - pe) < len(pF - pe) - 1.0);
+                    else if(bOK)     revSurf = true;
+                }
+            }
+            const int kEntry = revSurf ? (surf.rowBeg[nr]-1) : surf.rowBeg[0];
+            Vec3 firstX = surf.rowP[kEntry];
+            Vec3 firstN = surf.rowN[kEntry];
+            Vec3 firstPos = firstX + firstN*params->standoff;
+
             // 面间过渡：从上一面终点抬枪绕行到曲面块首点（与平面路径同一套）
             {
-                Vec3 firstX = surf.rowP[surf.rowBeg[0]];
-                Vec3 firstN = surf.rowN[surf.rowBeg[0]];
-                Vec3 firstPos = firstX + firstN*params->standoff;
                 if(!allPts.empty()){
                     Vec3 pEnd{allPts.back().x, allPts.back().y, allPts.back().z};
                     if(segClearOK(pEnd, firstPos) && !segCrossFace(pEnd, firstPos)){
@@ -5789,16 +6097,26 @@ static void spray_traj_core(
                     }
                     ++transCount;
                 }
-                for(int r=0; r<nr; ++r){
-                    int b = surf.rowBeg[r], e = surf.rowBeg[r+1];
+                const size_t faceBeg = allPts.size();     // 本块面内轨迹的起点（供最后重排）
+                Vec3 lastP{0,0,0}, lastN{0,0,1}; bool hasLast = false;
+                for(int rr=0; rr<nr; ++rr){
+                    const int r = revSurf ? (nr-1-rr) : rr;
+                    const int b = surf.rowBeg[r], e = surf.rowBeg[r+1];
                     if(e-b < 2) continue;
-                    if(r > 0){
-                        emitGap(surf.rowP[b-1], surf.rowN[b-1], surf.rowP[b], surf.rowN[b]);
+                    const int k0 = revSurf ? (e-1) : b;
+                    const int kstep = revSurf ? -1 : 1;
+                    if(hasLast) emitGap(lastP, lastN, surf.rowP[k0], surf.rowN[k0]);
+                    for(int k=k0;; k+=kstep){
+                        emitPt(surf.rowP[k], surf.rowN[k], 1);
+                        if(revSurf ? (k <= b) : (k+1 >= e)) break;
                     }
-                    for(int k=b;k<e;++k) emitPt(surf.rowP[k], surf.rowN[k], 1);
+                    const int kEnd = revSurf ? b : (e-1);
+                    lastP = surf.rowP[kEnd]; lastN = surf.rowN[kEnd];
+                    hasLast = true;
                     totalRows++;
                 }
-                prevNormal = surf.rowN[surf.rowBeg[nr]-1];
+                if(hasLast) prevNormal = lastN;
+                if(allPts.size() > faceBeg) faceSpan.push_back({faceBeg, allPts.size(), si});
             }
             {
                 double angN = std::acos(std::min(1.0,std::fabs(dot(surf.n0,Vec3{0,0,1}))))*180.0/3.141592653589793;
@@ -5872,6 +6190,12 @@ static void spray_traj_core(
         // 投影到 2D
         std::vector<Vec2> P2; P2.reserve(inl.size());
         for(int i:inl){ Vec3 q=Pf[i]-pl.c; P2.push_back({dot(q,u), dot(q,v)}); }
+        // P2 是布行的唯一输入。重建后的 keepMask 只按“栅格是否被占用”筛点，
+        // 尾端孤立小簇仍可能留在 P2 里（p001 残留 19 点，距主面 147mm）：
+        // minAreaRect 走凸包，19 个点就能把矩形拉成 248×112@134°。
+        // 只剔“极小且远离主面”的簇；真实碎片/小分叉（点数>=1% 或距主面<=36mm）保留，
+        // 继续交给 planeFrag / 轮廓切段处理。
+        filterP2Outliers(P2, kReconGap, 3.0 * kReconGap, 0.01, 0.02, si);
 
         // 补全面：把补全矩形作为"虚拟支撑点"并入点集，让 genRows 在补全区也布行。
         // 否则会出现"面补齐了、轨迹还是只走有数据的那一段"。
@@ -6566,6 +6890,52 @@ static void spray_traj_core(
         // 转 3D（用该平面自己的法向抬升，避免撞击凸起/侧壁）
         Vec3 gun = pl.n*(-1.0);
 
+        // ---- 端点选择（空移最短）：首/末两端，取"进得去、也出得来"的那端作起点 ----
+        // 蛇形路线的两头都是合法起点：反走等于"行序与行向一起反过来"，走的是同一批
+        // 线段（只是方向相反），所以净空/穿面检查的结论完全不变，不需要重算。
+        // 原来固定从"第 0 行的 xs 端"进枪，上一面若正好停在另一端，就得先横穿整个
+        // 面再开始喷 —— 实测 nc_complex 面3 因此凭空多走 273mm（空移 536mm）。
+        //
+        // ⚠ 但"入口近"不能单独决定方向：反走会把**出口**换到另一端，而出口未必走得掉。
+        // 喷完本面后要"沿本面法向退 → 抬到安全面"，这一步只取决于出口那一端的几何，
+        // 与下一面是谁无关，所以可以在这里先算。腔里的面尤其危险：box_traj 的两个
+        // 内半环，1→0 这个方向出得去、反向出不去，只按"离上一面近"反走会让后面的
+        // 面被判"无可行退出路径"整面丢掉（实测丢 2305 点）。
+        // 规则：两端都出得去 → 选入口近的；只有一端出得去 → 必须让那一端当出口；
+        //       两端都出不去 → 保持原方向（无论怎么反都会丢下一个面，不动更省事）。
+        if(!allPts.empty() && traj2.size() > 1){
+            const Vec3 pe{allPts.back().x, allPts.back().y, allPts.back().z};
+            auto gunOfT=[&](const T2& t)->Vec3{
+                Vec2 w = rotInv(t.p);
+                Vec3 X = pl.c + u*w.x + v*w.y;
+                return X + pl.n*(params->standoff + t.lift);
+            };
+            // 出口能力评分：与面间过渡"退出腿"同口径（法向退 + 抬到安全面的最小净空）
+            auto exitScore=[&](const Vec3& e)->double{
+                auto leg=[&](const Vec3& W)->double{
+                    const Vec3 Wtop = liftTo(W, sSafe);
+                    return std::min(segMinClear(e, W), segMinClear(W, Wtop));
+                };
+                double best = leg(e);
+                for(double f : {0.25, 0.5, 0.75, 1.0}) best = std::max(best, leg(e + pl.n*(clear*f)));
+                return best;
+            };
+            const Vec3 gF = gunOfT(traj2.front()), gB = gunOfT(traj2.back());
+            const double dF = len(gF - pe), dB = len(gB - pe);
+            const double need = 0.9*gunClearEff;
+            const bool fOK = exitScore(gB) >= need;     // 正走：从末端出
+            const bool bOK = exitScore(gF) >= need;     // 反走：从首端出
+            bool rev = false;
+            if(fOK && bOK) rev = (dB < dF - 1.0);
+            else if(bOK)   rev = true;
+            if(rev){
+                std::reverse(traj2.begin(), traj2.end());
+                if(std::getenv("SPRAYTRAJ_TRANS_DBG"))
+                    fprintf(stderr, "[trans] 面%zu 反走：首端 %.0fmm/末端 %.0fmm（出口 fOK=%d bOK=%d）\n",
+                            si, dF, dB, (int)fOK, (int)bOK);
+            }
+        }
+
         // 面间过渡：从上一面终点出发，抬枪绕行到本面首点。
         // 全部为 spray=0 空移点，WPF 与上位机据此断开喷涂段。
         const size_t nPtsBefore = allPts.size();   // 无可行进入路径时用来越界回滚整面
@@ -6695,12 +7065,14 @@ static void spray_traj_core(
         }
         prevNormal = pl.n;
 
+        const size_t faceBeg = allPts.size();          // 本面面内轨迹的起点（供最后重排）
         for(auto& t2 : traj2){
             Vec2 q = rotInv(t2.p);
             Vec3 X = pl.c + u*q.x + v*q.y;
             Vec3 pos = X + pl.n*(params->standoff + t2.lift);
             allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, t2.spray});
         }
+        if(allPts.size() > faceBeg) faceSpan.push_back({faceBeg, allPts.size(), si});
     }
     if(nGapSafe)
         fprintf(stderr, "[traj] 曲面行间安全空移: %d 处（直线会穿件，spray=0）\n", nGapSafe);
@@ -6712,6 +7084,292 @@ static void spray_traj_core(
     if(nDropFace)
         fprintf(stderr, "，%d 面因无可行进入路径整面不喷", nDropFace);
     if(transCount || nDropFace) fprintf(stderr, "\n");
+
+    // 面间过渡：从 (pEnd,nEnd) 退枪、抬到安全面、绕到 (pStart,nStart) 上方落下。
+    // 姿态必须跟着"腿"走：退出腿仍是上一面姿态，进入腿才是本面姿态 —— 原来所有过渡点
+    // 一律用本面姿态，开口盒子实测退枪段 0~100mm 内枪轴翻 90°~180°（位置不动、姿态翻
+    // 180°），真机上等于原地猛拧手腕。空移是关枪过渡，姿态应在安全高度上空慢慢转。
+    // 返回值：0=可行，1=退出腿不可行，2=进入腿不可行（后两者按"整面不喷"处理）。
+    // nFixOut 只在真正落盘时累加，预估代价时传 nullptr。
+    auto buildTrans = [&](const Vec3& pEnd, const Vec3& nEnd,
+                          const Vec3& pStart, const Vec3& nStart,
+                          std::vector<SprayTrajPoint>& out, int* nFixOut)->int{
+        out.clear();
+        int code = 0;
+        auto pushMove=[&](const Vec3& p, const Vec3& nrm){
+            out.push_back({p.x,p.y,p.z, -nrm.x,-nrm.y,-nrm.z, params->speed, 0});
+        };
+        // ① 直线可达就直接连（见 segClearOK 的说明）。spray 是"段属性"（两端都为 1
+        //    才是喷涂段），所以必须在中间插一个 spray=0 把线断开；插中点而非端点：
+        //    三点共线、物理路径仍是这条直线，也不会在落点产生一个零长段。
+        //    除点云净空外还要查**穿面**：点云稀疏/被去噪删掉的壁上 segClearOK 只看
+        //    最近点会一路放行（complex 实测一段 204mm 直线穿过凸台，最差 0.38mm）。
+        if(segClearOK(pEnd, pStart) && !segCrossFace(pEnd, pStart)){
+            pushMove(pEnd + (pStart - pEnd)*0.5, nEnd);
+            return 0;
+        }
+        const Vec3 Top = liftTo(pStart, sSafe);
+        auto legOK=[&](const Vec3& w0, const Vec3& w1){
+            return !segCrossFace(w0, w1) && segClearOK(w0, w1);
+        };
+        // ② 沿上一面法向退出（离开该面，不擦面）
+        Vec3 L1 = pEnd + nEnd*clear;
+        const Vec3 L1top = liftTo(L1, sSafe);
+        if(!legOK(pEnd, L1) || !legOK(L1, L1top)){
+            // 出口两条腿也必须查：腔宽与退出距离相当时，沿法向退 100mm 恰好顶到
+            // 对面内壁，再抬枪就贴着壁顶擦上去（bin 实测 0.06mm）。
+            // 先试"原地抬枪"，再试缩短法向退出；取两腿最小净空最大者。
+            double exitScore = std::min(segMinClear(pEnd, L1), segMinClear(L1, L1top));
+            Vec3 exitW = L1;
+            auto considerExit=[&](const Vec3& W){
+                const Vec3 Wtop = liftTo(W, sSafe);
+                double s = std::min(segMinClear(pEnd, W), segMinClear(W, Wtop));
+                if(s > exitScore){ exitScore = s; exitW = W; }
+            };
+            considerExit(pEnd);
+            for(double f : {0.75, 0.5, 0.25}) considerExit(pEnd + nEnd*(clear*f));
+            considerExit(pEnd + nEnd*gunClearEff);
+            L1 = exitW;
+            if(exitScore < 0.9*gunClearEff) code = 1;
+        }
+        pushMove(L1, nEnd);                        // ② 退出腿：保持上一面姿态
+        pushMove(liftTo(L1, sSafe), nEnd);         // ③ 让到安全面
+        // ④ 在安全高度上平移到本面首点正上方，再降落。
+        //    垂直降落会穿件的情形：首点正上方有凸台、或首点在腔内/凸台下
+        //    （complex 实测 204mm 直降穿过工件，最差 0.38mm，且这一段
+        //    spray=0→1，正是"落枪第一下就撞"）。改沿本面法向 n 偏移后降落，
+        //    再沿法向进到首点。**两条腿都要查**：下降腿 Top→Side 和进入腿
+        //    Side→pStart —— 原来只查了下降腿，complex 上进入腿沿法向走 100mm
+        //    中途擦过一个凸台（最差 0.35mm，12 个点 <20mm），因为没人查。
+        if(legOK(Top, pStart)){
+            pushMove(Top, nStart);                 // ④ 到顶空才转到本面姿态
+        } else {
+            // 候选落点：沿法向由近到远 3 档 + 面内 8 个横向方位，逐条两腿验。
+            // 都不干净时取"最小净空最大"的那个 —— 宁可绕远，也不留一段 0.2mm
+            // 的擦壁直降（那是"落枪第一下就撞"）。
+            const double base = std::max(clear, gunClearEff);
+            Vec3 bestW = Top; double bestScore = -1.0;
+            auto consider=[&](const Vec3& W){
+                const Vec3 Wtop = liftTo(W, sSafe);
+                double s = std::min(segMinClear(Wtop, W), segMinClear(W, pStart));
+                if(s > bestScore){ bestScore = s; bestW = W; }
+            };
+            consider(Top);
+            for(double f : {0.25, 0.5, 1.0}) consider(pStart + nStart*(base*f));
+            // 横向方位基：要和抬升轴正交，否则"面内 8 方位"里有两个方向
+            // 其实是沿 liftU 的 —— 抬上去再原地下降，白走一个来回。
+            // 退化保护：liftU ∥ nStart 时 cross 为零，此时任取面内方向都行，
+            // 但必须**真的在面内**（与 nStart 垂直）。原来这里回退到固定
+            // {1,0,0}，若 nStart 恰好也是 ±X，inPlane 与法向平行、inPlane2
+            // 归零，8 个方位退化成同一个点，落点搜索直接失效。
+            Vec3 inPlane = cross(liftU, nStart);
+            if(len(inPlane) < 1e-6) inPlane = cross(Vec3{0,0,1}, nStart);
+            if(len(inPlane) < 1e-6) inPlane = cross(Vec3{1,0,0}, nStart);
+            if(len(inPlane) < 1e-6) inPlane = Vec3{1,0,0};   // nStart 不会是零向量，仅作兜底
+            inPlane = norm(inPlane);
+            const Vec3 inPlane2 = cross(nStart, inPlane);
+            for(int a=0;a<8;++a){
+                const double th = a*3.141592653589793/4.0;
+                consider(pStart + (inPlane*std::cos(th) + inPlane2*std::sin(th))*base);
+            }
+            const Vec3 Wtop = liftTo(bestW, sSafe);
+            pushMove(Wtop, nStart);
+            if(len(bestW - pStart) > 1e-6) pushMove(bestW, nStart);
+            if(nFixOut) ++(*nFixOut);
+            // 连"最好的"落法都撑不到安全半径 → 这个面根本进不去（窄缝/深腔）。
+            // 与其生成一段 1.3mm 的擦壁进入（落枪就撞），不如整面不喷，
+            // 与"gunClear 是生成期硬约束"一致；日志里明说，便于工艺端补喷。
+            if(bestScore < 0.9*gunClearEff) code = 2;
+        }
+        return code;
+    };
+
+    // 过渡折线的实际长度（含最后一段"最后一个航点 → 面首点"）。
+    auto transLen=[&](const Vec3& pEnd, const Vec3& pStart,
+                      const std::vector<SprayTrajPoint>& out)->double{
+        double s = 0.0; Vec3 c = pEnd;
+        for(const auto& p : out){
+            Vec3 q{p.x,p.y,p.z};
+            s += len(q - c); c = q;
+        }
+        return s + len(pStart - c);
+    };
+
+    // ================= 5.面顺序重排 + 面间空移重建（最后处理） =================
+    // 到这里所有面都已经按自己的几何生成完了，allPts 里躺着的是"面内轨迹 + 面间过渡"。
+    // 生成阶段的面间过渡是按 split_planes 的发现顺序接的：面按点数/面积降序排下来，
+    // 与空间邻接无关，于是空移在工件两头来回穿梭（实测 nc_complex 面0(-63)→面2(+101)
+    // →面3(-212)→面4(-121)，X 方向折三趟）。
+    //
+    // 这一阶段只做一件事：把这批面按"真实过渡代价"重新排序、按新顺序重建过渡。
+    // 为什么必须等到这里：过渡的代价不是一个距离，而是"退枪 → 抬到安全面 → 平移 → 落枪"，
+    // 里面还含"这一头出不出得去、那一头进不进得来"。用面心 / 包围盒角点这类几何代理去估，
+    // 实测在 box_traj 上空移反而 +34%（5171→6921）—— 代理估错一次就是横穿工件的一趟。
+    // 现在每个面的真实首末枪位就在 allPts 里（faceSpan 记的区间），用 buildTrans 生成
+    // **真实过渡折线**量长度，代价就是同一量纲、可以直接比。
+    //
+    // 顺序的求法：开放式路径（起点、终点都自由），每个面还有两个朝向（正走 / 反走）。
+    // 反走 = 整块点序取反：每个点的姿态是它所在位置的局部法向，取反后仍然正确；行间
+    // 安全空移的航点一起取反，走的仍是同一批线段（方向相反），净空/穿面结论不变。
+    // 面数 ≤ 13 时按 (mask, 面, 朝向) 做精确 DP；更多时退化为多起点最近邻。
+    {
+        const int N = (int)faceSpan.size();
+        if(N >= 2 && !std::getenv("SPRAYTRAJ_NO_REORDER")){
+            auto PT=[&](size_t k){ const auto& p = allPts[k]; return Vec3{p.x,p.y,p.z}; };
+            auto NR=[&](size_t k){ const auto& p = allPts[k]; return Vec3{-p.i,-p.j,-p.k}; };
+            auto P0=[&](int i){ return PT(faceSpan[(size_t)i].beg); };
+            auto N0=[&](int i){ return NR(faceSpan[(size_t)i].beg); };
+            auto P1=[&](int i){ return PT(faceSpan[(size_t)i].end-1); };
+            auto N1=[&](int i){ return NR(faceSpan[(size_t)i].end-1); };
+
+            // ---- 代价矩阵：状态 = 面 × 朝向（2N 个），边权 = 真实过渡折线长度 ----
+            // 不可行的过渡（退出/进入腿撑不到枪体安全半径）记 BIG，于是"腔里的面出不来"
+            // 这类硬约束会被排到末尾（放在末尾就不需要退出），不必再手写"腔面收尾"。
+            const int S2 = 2*N;
+            const float BIGC = 1e5f;
+            std::vector<float> C((size_t)S2*(size_t)S2, BIGC);
+            std::vector<SprayTrajPoint> tmp;
+            for(int i=0;i<N;++i) for(int oi=0;oi<2;++oi){
+                const Vec3 pe = oi ? P0(i) : P1(i);
+                const Vec3 ne = oi ? N0(i) : N1(i);
+                for(int j=0;j<N;++j){
+                    if(j==i) continue;
+                    for(int oj=0;oj<2;++oj){
+                        const Vec3 ps = oj ? P1(j) : P0(j);
+                        const Vec3 ns = oj ? N1(j) : N0(j);
+                        const int code = buildTrans(pe, ne, ps, ns, tmp, nullptr);
+                        C[(size_t)(2*i+oi)*(size_t)S2 + (size_t)(2*j+oj)] =
+                            (code==0) ? (float)std::min(transLen(pe, ps, tmp), 9e4) : BIGC;
+                    }
+                }
+            }
+
+            std::vector<int> ord; std::vector<char> ordRev;
+            if(N <= 13){
+                const int FULL = 1<<N;
+                std::vector<float> f((size_t)FULL*(size_t)S2, 1e9f);
+                std::vector<int>   pre((size_t)FULL*(size_t)S2, -1);
+                for(int i=0;i<N;++i){
+                    f[(size_t)(1<<i)*(size_t)S2 + 2*i]     = 0.0f;   // 起点自由
+                    f[(size_t)(1<<i)*(size_t)S2 + 2*i + 1] = 0.0f;
+                }
+                for(int m=1;m<FULL;++m){
+                    for(int st=0;st<S2;++st){
+                        const float cur = f[(size_t)m*(size_t)S2 + (size_t)st];
+                        if(cur >= 1e9f) continue;
+                        for(int j=0;j<N;++j){
+                            if(m & (1<<j)) continue;
+                            const float* row = &C[(size_t)st*(size_t)S2];
+                            for(int oj=0;oj<2;++oj){
+                                const int t = 2*j+oj, nm = m | (1<<j);
+                                const float nc = cur + row[t];
+                                float& d = f[(size_t)nm*(size_t)S2 + (size_t)t];
+                                if(nc < d){ d = nc; pre[(size_t)nm*(size_t)S2 + (size_t)t] = st; }
+                            }
+                        }
+                    }
+                }
+                int bs = -1; float bv = 1e9f;
+                for(int st=0;st<S2;++st){
+                    const float v = f[(size_t)(FULL-1)*(size_t)S2 + (size_t)st];
+                    if(v < bv){ bv = v; bs = st; }
+                }
+                int m = FULL-1, st = bs;
+                while(st >= 0){
+                    ord.push_back(st>>1); ordRev.push_back((char)(st & 1));
+                    const int pst = pre[(size_t)m*(size_t)S2 + (size_t)st];
+                    m ^= (1<<(st>>1));
+                    st = pst;
+                }
+                std::reverse(ord.begin(), ord.end());
+                std::reverse(ordRev.begin(), ordRev.end());
+            } else {
+                // 极端面数：多起点最近邻（边权已是真实代价），取最好的那条
+                double bv = 1e30;
+                for(int s0=0; s0<S2; ++s0){
+                    std::vector<char> used((size_t)N, 0);
+                    std::vector<int> t; std::vector<char> r;
+                    int st = s0; double tot = 0.0;
+                    t.push_back(st>>1); r.push_back((char)(st&1)); used[(size_t)(st>>1)] = 1;
+                    for(int k=1;k<N;++k){
+                        int bj = -1, bo = 0; float bc = 1e9f;
+                        for(int j=0;j<N;++j){
+                            if(used[(size_t)j]) continue;
+                            for(int oj=0;oj<2;++oj){
+                                const float c = C[(size_t)st*(size_t)S2 + (size_t)(2*j+oj)];
+                                if(c < bc){ bc = c; bj = j; bo = oj; }
+                            }
+                        }
+                        if(bj < 0) break;
+                        tot += bc; st = 2*bj+bo;
+                        t.push_back(bj); r.push_back((char)bo); used[(size_t)bj] = 1;
+                    }
+                    if(tot < bv){ bv = tot; ord = t; ordRev = r; }
+                }
+            }
+            // 兜底：求解没覆盖全部面（理论上不会发生）就退回原顺序，绝不能让面凭空消失
+            if((int)ord.size() != N){
+                ord.clear(); ordRev.clear();
+                for(int i=0;i<N;++i){ ord.push_back(i); ordRev.push_back(0); }
+            }
+
+            // ---- 旧顺序的面间空移：相邻两块之间那些过渡点的折线长 ----
+            double airOld = 0.0;
+            for(int i=1;i<N;++i){
+                Vec3 c = P1(i-1);
+                for(size_t k=faceSpan[(size_t)i-1].end; k<faceSpan[(size_t)i].beg; ++k){
+                    const Vec3 q = PT(k);
+                    airOld += len(q - c); c = q;
+                }
+                airOld += len(P0(i) - c);
+            }
+
+            // ---- 重建：按新顺序 [过渡] + [面内轨迹]，反走时连区间一起倒序 ----
+            std::vector<SprayTrajPoint> rebuilt;
+            rebuilt.reserve(allPts.size());
+            std::vector<SprayTrajPoint> buf;
+            Vec3 pe{0,0,0}, ne{0,0,1}; bool hasPrev = false;
+            double airNew = 0.0; int nFix = 0, nBad = 0;
+            for(size_t k=0;k<ord.size();++k){
+                const int i = ord[k], o = ordRev[k];
+                const size_t b = faceSpan[(size_t)i].beg, e = faceSpan[(size_t)i].end;
+                const Vec3 eP = o ? P1(i) : P0(i);
+                const Vec3 eN = o ? N1(i) : N0(i);
+                if(hasPrev){
+                    const int code = buildTrans(pe, ne, eP, eN, buf, &nFix);
+                    airNew += transLen(pe, eP, buf);
+                    if(code != 0){
+                        // 代价表里已经尽量避开了；真避不开时按"最优落法"照走，
+                        // 但要报出来（工艺端据此加过渡/改夹持），不静默丢面。
+                        ++nBad;
+                        fprintf(stderr, "[warn] 面%zu 过渡净空不足（%s），已按最佳落法生成\n",
+                                faceSpan[(size_t)i].si, code==1 ? "上一面退不出来" : "本面进不去");
+                    }
+                    rebuilt.insert(rebuilt.end(), buf.begin(), buf.end());
+                }
+                if(o) rebuilt.insert(rebuilt.end(), allPts.rbegin() + (long)(allPts.size()-e),
+                                     allPts.rbegin() + (long)(allPts.size()-b));
+                else  rebuilt.insert(rebuilt.end(), allPts.begin() + (long)b, allPts.begin() + (long)e);
+                pe = o ? P0(i) : P1(i);
+                ne = o ? N0(i) : N1(i);
+                hasPrev = true;
+            }
+            allPts.swap(rebuilt);
+
+            std::string s;
+            char b2[48];
+            for(size_t k=0;k<ord.size();++k){
+                std::snprintf(b2, sizeof(b2), k ? "→%zu%s" : "%zu%s",
+                              faceSpan[(size_t)ord[k]].si, ordRev[k] ? "(反)" : "");
+                s += b2;
+            }
+            fprintf(stderr, "[traj] 面顺序重排（真实过渡代价）: %s   面间空移 %.0f → %.0fmm",
+                    s.c_str(), airOld, airNew);
+            if(nFix) fprintf(stderr, "，%d 处降落改道", nFix);
+            if(nBad) fprintf(stderr, "，%d 处净空不足", nBad);
+            fprintf(stderr, "\n");
+        }
+    }
 
     // ================= 转角平滑 + 零长段清理（第十八轮） =================
     // 病灶（实测 bin.ply）：喷涂段内 >60° 的转角 56 处、>120° 的 23 处、最大 165°。

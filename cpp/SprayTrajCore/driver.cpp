@@ -135,8 +135,11 @@ int main(int argc, char** argv){
     //           -ea <跨行外扩mm>（首末行位置；-1=自动 0.25×行距，0=压点云边界）
     //           -st <薄壳双面壁厚mm>（0=关闭；>0 时对"射线两侧都够伸枪"的单层面
     //                补一个反向面，代表这张板的另一面）
+    //           -minw <最小可喷宽度mm>（重建面片最小外接矩形短边 < 此值即判为
+    //                线状/退化面，不输出；0=关闭，默认18）
     for(int i=4;i+1<argc;++i){
         if(!strcmp(argv[i],"-flat"))  p.flatnessTol  = atof(argv[i+1]);
+        if(!strcmp(argv[i],"-minw"))  p.minFaceWidth = atof(argv[i+1]);
         if(!strcmp(argv[i],"-curve")) p.curvatureTol = atof(argv[i+1]);
         if(!strcmp(argv[i],"-fill"))  p.fillHoleSize = atof(argv[i+1]);
         if(!strcmp(argv[i],"-dir"))   p.scanDirMode  = atoi(argv[i+1]);
@@ -174,13 +177,13 @@ int main(int argc, char** argv){
             }
         }
     }
-    printf("参数: flatnessTol=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f lift=(%.2f,%.2f,%.2f)\n",
-        p.flatnessTol, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
+    printf("参数: flatnessTol=%.1f minFaceWidth=%.1f curvatureTol=%.1f fillHoleSize=%.1f scanDirMode=%d row=%.1f pt=%.1f so=%.1f sp=%.1f gc=%.1f ee=%.1f ea=%.1f st=%.1f lift=(%.2f,%.2f,%.2f)\n",
+        p.flatnessTol, p.minFaceWidth, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
         p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross, p.shellThick,
         p.liftDirX, p.liftDirY, p.liftDirZ);
     // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
-    printf("[abi] sizeof Plane=%zu Point=%zu Result=%zu\n",
-        sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
+    printf("[abi] sizeof Params=%zu Plane=%zu Point=%zu Result=%zu\n",
+        sizeof(SprayTrajParams), sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
     SprayTrajResult r = spray_traj_generate(xyz.data(), n, &p);
     if(r.error){ printf("失败: %s\n", r.error); spray_traj_free(&r); return 1; }
     printf("OK: rows=%d points=%d rms=%.3f seg_mean=%.3f seg_max=%.3f\n",

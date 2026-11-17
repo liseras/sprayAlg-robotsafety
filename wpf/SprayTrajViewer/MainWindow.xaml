@@ -143,6 +143,11 @@
                                     <TextBox x:Name="TxtFlatness" Text="40" Padding="4"/>
                                 </DockPanel>
                                 <DockPanel Margin="0,4">
+                                    <TextBlock Text="最小可喷宽度 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="重建面片最小外接矩形的短边小于此值时，判为线状/退化面：不出重建面，也不生成轨迹。&#x0a;0=关闭。默认18。&#x0a;注意：p001 的窄长板面短边约40.5mm，阈值设到40.5以上会把这块真实板面也过滤掉。"/>
+                                    <TextBox x:Name="TxtMinFaceWidth" Text="18" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
                                     <TextBlock Text="曲面升级阈值 (mm)" Width="150" VerticalAlignment="Center"/>
                                     <TextBox x:Name="TxtCurvature" Text="5" Padding="4"/>
                                 </DockPanel>
