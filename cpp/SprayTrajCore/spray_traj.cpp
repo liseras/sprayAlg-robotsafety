@@ -5350,6 +5350,11 @@ static void spray_traj_core(
                 nRow  = 1;
                 stepA = L;
             }else{
+                // ---- 首末行必须落在边界上（不要改成"内移 L/2"）----
+                // 试过内移半步（喷幅边缘正好压边沿，理论上更省一条行），实测覆盖率
+                // 反而掉：norim 300×300 侧壁 97%→91%（缺口 max 29→67mm）、cao 面2
+                // 100%→69%。原因是这些面靠"末行压在边沿"来盖住最后一条窄带，
+                // 内移后那一条带没人喷。省行程不能拿漏喷换，故恢复为边界对齐。
                 nIv = (int)std::floor((y1-y0)/L + 0.5);
                 if((y1-y0)/(double)nIv > 1.2*L) ++nIv;
                 nRow  = nIv + 1;
@@ -6334,20 +6339,38 @@ static void spray_traj_core(
         }
         else if(haveRectAng){
             // mode1/0 = 沿长边；mode2 = 沿短边（长边方向转 90°）
+            // ---- 候选 A：矩形长边（几何基准，先算出来）----
             theta = normAng((params->scanDirMode == 2) ? thLong + 1.5707963267948966 : thLong);
-            // ---- 竖直面：行方向一律取"水平"----
-            // 病灶：方形侧壁（300×300）的最小外接矩形两条边等长，minAreaRect 的边序
-            // 由凸包起点决定 —— 同一工件上 x=0/x=400 两个侧壁排到了**竖直**行（沿 z），
-            // y=0/y=300 两个侧壁排到了**水平**行（沿 x）。3D 视图里就是一横一竖
-            // 交叉的乱麻，用户反馈"就不能是规则的轨迹嘛"。
-            // 工艺上侧壁本来就是水平往复：喷枪沿水平走，靠升降换行，重力方向的重叠
-            // 更均匀。所以只要面法向接近水平（竖直面），行方向就锁到面内水平方向
-            // （= Z × n），与面的长短边无关；scanDirMode=2 时再转 90°（竖直往复）。
+            double e1=0,e2=0; extentAlong(theta,e1,e2);
+            bool wantShort = (params->scanDirMode == 2);
+            if((!wantShort && e1 < e2) || (wantShort && e1 > e2)){
+                theta = normAng(theta + 1.5707963267948966);
+                std::swap(e1,e2);
+            }
+            const std::vector<Row> rowsLong = genRows(P2, theta, L, params->fillHoleSize, acrossExt);
+
+            // ---- 候选 B：竖直面取面内水平 ----
+            // 这条规则治的是"同一工件上方形侧壁(300×300)一横一竖交叉成乱麻"：
+            // minAreaRect 的两条边等长时，边序由凸包起点决定，x=0/x=400 壁排成沿 z、
+            // y=0/y=300 壁排成沿 x，用户反馈"就不能是规则的轨迹嘛"。工艺上侧壁也
+            // 确实是水平往复（枪沿水平走、靠升降换行，重力方向重叠更均匀）。
             //
-            // **只对真·竖直面生效**（|n.z| < 0.3，即与竖直方向夹角 >72°）。斜面
-            // （曲型板工件那个 52° 斜面，n.z=0.61）的长边本来沿坡向，硬锁"水平"会
-            // 把行切成一小段一小段：实测该面 4 行 300mm 的长行变成 13 行 ~90mm 的
-            // 短行，总行数 18→27，轨迹反而更碎。斜面仍按最小外接矩形长边走。
+            // **但水平只是打破平局的手段，不能无条件覆盖几何最优方向。** 对非等边的
+            // 面，水平方向并不等价：242×40 的立板长边在面内 88.5°、水平在 20°，锁水平
+            // 等于沿 40mm 短边布行，行与重建轮廓斜交 68.5°，clipRowByLoops 把这类斜行
+            // 整条判为面外丢掉（行距 60 时 3 行丢 2 行，只剩一条 91mm 斜线，两侧各出界
+            // 22mm）。同理 400×150 若被锁到偏 30° 的水平向，行数也会翻两三倍。
+            //
+            // 因此判据改为"**两个候选排出来的行布局比较**"，取水平的前提是它与长边
+            // 方向基本等价：行数可差 1（行数是取整量）、行均长不低于 85%。超出这个
+            // 等价带宽就说明水平方向明显更碎（换行更多、行更短），坚持它等于拿
+            // "方向一致"换"越喷越碎"。
+            // 判据只读两个候选自身的行布局，与面的绝对尺寸、长宽比、行距、坐标系
+            // 都无关 —— 不是"长宽比 >= N"这类按尺寸拍的阈值。
+            //
+            // **只对真·竖直面生效**（|n.z| < 0.3，即与竖直夹角 >72°）：斜面（曲型板
+            // 那个 52° 面，n.z=0.61）长边本来沿坡向，取水平会把 4 行 300mm 切成 13 行
+            // ~90mm（实测总行数 18→27），本就不在候选范围内。
             bool forcedHoriz = false;
             if(std::fabs(pl.n.z) < 0.3){
                 Vec3 hz = cross(Vec3{0.0,0.0,1.0}, pl.n);
@@ -6355,20 +6378,34 @@ static void spray_traj_core(
                 if(hl > 1e-9){
                     hz = hz * (1.0/hl);
                     double thH = std::atan2(dot(hz,v), dot(hz,u));
-                    theta = normAng((params->scanDirMode == 2)
-                                    ? thH + 1.5707963267948966 : thH);
-                    forcedHoriz = true;
+                    thH = normAng((params->scanDirMode == 2)
+                                  ? thH + 1.5707963267948966 : thH);
+                    const std::vector<Row> rowsH = genRows(P2, thH, L, params->fillHoleSize, acrossExt);
+                    if(!rowsH.empty() && !rowsLong.empty()){
+                        auto meanLen = [](const std::vector<Row>& rs){
+                            double s = 0.0;
+                            for(const Row& r : rs) s += (r.xe - r.xs);
+                            return rs.empty() ? 0.0 : s/(double)rs.size();
+                        };
+                        const double mL = meanLen(rowsLong), mH = meanLen(rowsH);
+                        // 行数容差取"1 行"与"10%"的较大者：行数是取整量，等长的两个
+                        // 方向因行端裁剪/边界吸附会差 1~2 行（box.ply 的 300×300 侧壁
+                        // 实测 22 行 vs 24 行，差 9%），用固定 ±1 会把等边面误判成"更碎"，
+                        // 又退回一横一竖。
+                        const double rl = (double)rowsLong.size();
+                        const double tolRows = std::max(1.0, std::ceil(0.10*rl));
+                        const bool sameRows = ((double)rowsH.size() <= rl + tolRows);
+                        const bool sameLen  = (mL <= 1e-9) || (mH >= 0.85*mL);
+                        if(sameRows && sameLen){
+                            theta   = thH;
+                            bestRows = rowsH;
+                            forcedHoriz = true;
+                        }
+                    }
                 }
             }
-            double e1=0,e2=0; extentAlong(theta,e1,e2);
-            bool wantShort = (params->scanDirMode == 2);
-            // 水平锁定后不再按"哪一维更长"翻转：窄高侧壁（100 宽 × 500 高）的下场
-            // 就是被翻成竖直往复，又回到一横一竖的乱麻里。
-            if(!forcedHoriz && ((!wantShort && e1 < e2) || (wantShort && e1 > e2))){
-                theta = normAng(theta + 1.5707963267948966);
-                std::swap(e1,e2);
-            }
-            bestRows = genRows(P2, theta, L, params->fillHoleSize, acrossExt);
+            if(!forcedHoriz) bestRows = rowsLong;
+            extentAlong(theta, e1, e2);
             // 只有"面足够宽、却只排出不到 3 行"才说明方向选错了、需要重选；
             // 窄面（垂直行向的宽度撑不满 3 行）本来就只能铺 1~2 行，必须保留，
             // 否则会掉进下面的穷举搜索，选到沿窄边的方向 → 上百条 20mm 的碎行。
@@ -6379,12 +6416,27 @@ static void spray_traj_core(
             for(int deg=0; deg<180; deg+=5){
                 double ang=deg*3.141592653589793/180.0;
                 auto rs=genRows(P2,ang,L,params->fillHoleSize, acrossExt);
-                if(rs.size()<2) continue;
-                double jag=0;
-                for(size_t i=1;i<rs.size();++i)
-                    jag += std::fabs(rs[i].xs-rs[i-1].xs) + std::fabs(rs[i].xe-rs[i-1].xe);
-                jag /= (rs.size()-1);
+                if(rs.empty()) continue;
+                // 单行候选的合法条件：这个方向**跨行跨度本来就放不下第二行**
+                // （<= 1.2 倍行距）。跨度明明够两行以上、却只排出 1 行，说明多行被
+                // 支撑点/碎段过滤吃掉了，属退化，不能当最优方向。
+                // 旧写法是 size()<2 一刀切淘汰——恰好把"面确实窄、只该有一行"的
+                // 正确方向（行距 >= 面宽时沿长边那条）直接扔掉，于是被迫选斜向多行，
+                // 再被轮廓裁剪砍成一条出界斜线。判定用跨度比 L，与具体尺寸无关。
+                double s1=0.0, s2=0.0; extentAlong(ang, s1, s2);
+                const bool oneRow = (rs.size() < 2);
+                if(oneRow && s2 > 1.2*L) continue;
+                double jag=0, rowLen=0.0;
+                for(size_t i=0;i<rs.size();++i){
+                    rowLen += std::max(0.0, rs[i].xe - rs[i].xs);
+                    if(i) jag += std::fabs(rs[i].xs-rs[i-1].xs) + std::fabs(rs[i].xe-rs[i-1].xe);
+                }
+                if(rs.size() > 1) jag /= (double)(rs.size()-1);
                 double cost = jag + rs.size()*L*0.02;
+                // 单行候选之间比行长：只能走一行时，工艺上就该沿面最长方向走，
+                // 行越长覆盖面越大、空走越少。系数取 0.02（行数代价同一量级），
+                // 不会把多行候选的整体排序带偏。
+                if(oneRow) cost -= rowLen*0.02;
                 if(cost<bestCost){ bestCost=cost; theta=ang; bestRows=rs; }
             }
         }
@@ -6467,9 +6519,29 @@ static void spray_traj_core(
                 bool fragmented = planeFrag[si];
                 if(fragmented && std::getenv("SPRAYTRAJ_ROWCLIP_DBG"))
                     fprintf(stderr, "[traj] 面%zu: 重建网格碎片化 → 行按轮廓切段\n", si);
+                // ---- 首末行豁免"缩水"判据 ----
+                // 首末行按设计就压在点云边沿上，行带 |Δy|<=L/2 天生只有一半有料：
+                // 它的行长是"边沿那排点"给出的，本来就比中间行短，被 40% 缩水判据
+                // 一夹就断成半截（残白 242×40 立板 row=12：末行 179→58mm，接着蛇形
+                // 过渡斜跨 117mm，3D 里就是一条孤零零的斜线——用户读成"轨迹歪了"）。
+                // 首末行不做压缩水夹取：轮廓在这里缩进是常态（形态学开运算），
+                // 夹它只会制造空洞。整行落在轮廓外的丢弃判断也不适用于它们
+                // （行端最远只超出 extRow，且 extRow 已被面尺度夹过）。
+                double ycLo=1e18, ycHi=-1e18;
+                for(const Row& q : bestRows){ ycLo=std::min(ycLo,q.yc); ycHi=std::max(ycHi,q.yc); }
+                const bool multiRow = bestRows.size() > 1;
                 for(const Row& r : bestRows){
+                    const bool edgeRow = multiRow &&
+                        (std::fabs(r.yc - ycLo) < 1e-6 || std::fabs(r.yc - ycHi) < 1e-6);
+                    if(edgeRow && !fragmented){ kept.push_back(r); continue; }
                     auto iv = clipRowByLoops(r.yc, r.xs, r.xe, loops);
                     const double rowLen = std::max(1e-9, r.xe - r.xs);
+                    if(std::getenv("SPRAYTRAJ_ROWCLIP_DBG")){
+                        fprintf(stderr, "[clip] yc=%8.1f row=[%8.1f,%8.1f] len=%7.1f iv=%zu",
+                                r.yc, r.xs, r.xe, rowLen, iv.size());
+                        for(auto& s : iv) fprintf(stderr, " [%.1f,%.1f]", s.first, s.second);
+                        fprintf(stderr, "\n");
+                    }
                     if(iv.empty()){
                         // 整行落在轮廓外：只有"行本身很短"才认为它是噪声（长行整条在面外
                         // 往往说明轮廓被开运算削掉了，删了就是漏喷）
@@ -6582,7 +6654,20 @@ static void spray_traj_core(
         // 自动值原来取 1×行距（80mm）：行端点整整多喷一个行距到空处，既浪费涂料，
         // 3D 视图里又是一圈"出框"的线，看着不像长在工件上的轨迹。半条喷幅以内
         // 就足够把边沿那一条带盖住（喷幅本身有 20~30% 搭接）。
-        const double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : 0.25*params->scanRowSpacing;
+        double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : 0.25*params->scanRowSpacing;
+        // ---- 盲扩量还要受"面自身尺度"约束 ----
+        // 行距是工艺参数（喷幅/搭接），与这块面有多大无关；拿它决定"往面外伸多长"
+        // 在大行距下会离谱：242×40 的板用 rowSpacing=150，extRow=37.5mm，两端各伸
+        // 37mm，行总长 242→304 —— 3D 里就是两条悬在空处的线，用户直接看成"轨迹偏了"。
+        // 而遮挡缺口本身只有一个扫线间距的量级（现场薄壁盒顶部实测 9mm）。所以再加一道
+        // 与面尺度挂钩的上限：每端盲扩 <= 面内行向跨度的 4%（下限 3mm 保证小面也有补边能力）。
+        // 判据只依赖 P2 在行向的跨度，与零件尺寸、坐标系、行距都无关。
+        {
+            double gxLo=1e18, gxHi=-1e18;
+            for(const auto& q : P2){ const double t=ca*q.x+sa*q.y; gxLo=std::min(gxLo,t); gxHi=std::max(gxHi,t); }
+            const double spanRow = gxHi - gxLo;
+            if(spanRow > 1e-6) extRow = std::min(extRow, std::max(3.0, 0.04*spanRow));
+        }
         const bool extDbg = std::getenv("SPRAYTRAJ_CONN_DBG") != nullptr;
         if(!ringMode && extRow > 1e-9 && !bestRows.empty()){
             int nExt=0, nBlk=0; double extSum=0.0, extMax=0.0;
