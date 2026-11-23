@@ -77,6 +77,14 @@ struct Prof {
     const char* const kIdxNames[kIdxBucketN] = {"1-2", "3-4", "5-8",
                                                 "9-14", "15-20", "21-27"};
     std::atomic<long long> overHitIdx[kIdxBucketN] = {};
+    // 「几何不收敛」这条路径（= 目标点本身解不出来）的预算计量。
+    // 这条路上当前**没有任何预算**：种子几何失败后会一路跑满 28 组种子，
+    // 而每组都是 30 次迭代的 DLS —— 低可达率件上这就是 10~30 倍耗时的来源。
+    // 要回答的问题：解析种子全灭之后，那 12 组固定种子还有没有救回过的记录？
+    //   anaZero   = analyticSeeds 返回 0 组的次数（闭式解判定该点不在两连杆环带里）
+    //   geoAllFail= 扫完仍未出现任何几何收敛解的 ik() 次数
+    //   fixedRescue = 上面那种情况下，固定种子段（下标 >= 解析段末）救回合法解的次数
+    std::atomic<long long> anaZero{0}, geoAllFail{0}, fixedRescue{0}, fixedValid{0};
     long long lastEvals = 0;    // mark() 用：本阶段新增的 eval 次数
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last = t0;
@@ -90,6 +98,7 @@ struct Prof {
         sweepSeeds = 0; sweepDup = 0;
         for (int i = 0; i < kOverBucketN; ++i) { overCnt[i] = 0; overHitB[i] = 0; }
         for (int i = 0; i < kIdxBucketN; ++i) overHitIdx[i] = 0;
+        anaZero = 0; geoAllFail = 0; fixedRescue = 0; fixedValid = 0;
         lastEvals = 0;
     }
 
@@ -708,6 +717,22 @@ constexpr double kCacheContinuityTrigDeg = 5.0;
 // 代价：极少数"要多试十几组才够得着"的点退回违规（背板 5/9687，其中 4 点还变好了）。
 // 要完全恢复旧行为就把这里改成 27。
 constexpr int kOverSweepMax = 8;
+// 解析种子段全灭之后，还给多少组固定种子。
+//
+// 解析种子是**两连杆闭式解 + ZYZ 腕分解**：两连杆定理已经穷举了"目标腕心落在
+// 手臂环带内"的全部关节组合（肩前/后 × 肘上/下 × 腕翻/正，最多 16 组）。
+// 如果这 16 组**一个都几何不收敛**，说明目标的腕心根本不在手臂可达的环带里，
+// 或者腕部姿态反解不出 —— 那是**几何**不可达，换任何初始猜测都救不回来：
+// DLS 只保证"收敛到种子附近的解"，种子改变的是解支，不是可达域。
+//
+// 实测（2026-11-20）：
+//   相机系 p047 用错基座（全部点不可达）—— 整轮零几何收敛 147294 次（= 全部 ik()），
+//   固定种子段救回合法解 **0 次（0.00%）**，而这段白跑了 180 万次 ikOnce / 29.5 次迭代，
+//   占掉 34.1s 里的绝大部分。
+//   四个正常件（p016/p031/p037/p045）—— 整轮零几何收敛 **0 次**，从不触发本剪枝。
+// 所以定为 0：解析段全灭就直接返回失败，一组固定种子都不跑。
+// 真遇到"闭式解漏了、固定种子能捞回来"的件，把它调大即可（0 → 12 = 旧行为）。
+constexpr int kFixedSeedAfterAnaFail = 0;
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
     if (g_prof.on) ++g_prof.ik;   // 仅诊断计数：常开时 8 线程抢同一条缓存行，实测有 2~3% 开销
     double seeds[1 + 16 + 12][6];
@@ -717,6 +742,8 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         ++ns;
     }
     ns += analyticSeeds(pTarget, RTarget, toolLen, seeds + ns);
+    // 解析种子段的右边界。用来判断"闭式解已经全试完了吗"，见下面 anyGeo 预算。
+    const int anaEnd = ns;
     for (int i = 0; i < 12; ++i) {
         for (int k = 0; k < 6; ++k) seeds[ns][k] = kSeeds[i][k];
         ++ns;
@@ -735,6 +762,10 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
     bool seedOver = false;
     double seedMargin = 0.0;
     int nOnce = 0;
+    bool anyGeo = false;      // 目前是否**任何一个**种子拿到了几何收敛解（sol.ok）
+    // 这个标志必须严格等价于「存在某个种子使 sol.ok==true」，因为剪枝判据靠它。
+    // 注意 sol.ok 是**几何收敛**（残差够小），比 valid() 宽松：valid() 还要关节不超限。
+    // 所以三个分支都要单独记账，漏任何一个都会让剪枝在"其实解得出来"的点上误触发。
 
     // 先跑上一点种子：连续且合法就直接返回，保持主路径速度。
     if (seed) {
@@ -743,6 +774,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         ++nOnce;
         best = sol;
         hasBest = true;
+        if (sol.ok) anyGeo = true;      // ← 必须在分支之前：valid() 蕴含 sol.ok
         if (valid(sol)) {
             if (maxJointDelta(sol.theta, seed) <= kBranchContinuityTrigDeg) {
                 if (g_prof.on) ++g_prof.ikFast;
@@ -768,6 +800,10 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         // 超限分支只给前 kOverSweepMax 组预算（见常量处实测数据）。
         // 注意只对 seedOver 生效：没有 seed（每行首点）时照旧跑完，那条路没有连续性可依。
         if (seedOver && i > kOverSweepMax) break;
+        // 「解析段全灭 → 砍掉固定种子段」：解析种子已经穷举了闭式解的全部解支，
+        // 它们一个都不收敛就是几何不可达，固定种子改变解支也救不回来（见常量处实测）。
+        // 判据放在解析段末尾那一步：i 走到固定种子段起点时，anyGeo 已经反映了解析段结果。
+        if (i >= anaEnd && !anyGeo && (i - anaEnd) >= kFixedSeedAfterAnaFail) break;
         // 诊断：这组种子是否与前面某组逐位相同（相同则结果必然相同，跑它也白跑）
         if (g_prof.on) {
             ++g_prof.sweepSeeds;
@@ -781,6 +817,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
         IkSol sol = ikOnce(pTarget, RTarget, toolLen, seeds[i]);
         if (g_prof.on) ++g_prof.ikOnceN;
         ++nOnce;
+        if (sol.ok) anyGeo = true;
         if (valid(sol)) {
             if (!seed) { if (g_prof.on) ++g_prof.ikFast; return sol; }
             double dist = jointDist2(sol.theta, seed);
@@ -809,6 +846,14 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
             g_prof.bucketOver(seedMargin, hasValid);
         }
     }
+    // 「几何全灭」路径的计量：扫完一遍都没有任何一个种子几何收敛 = 目标点解不出来。
+    // 同时记录这种情况下固定种子段有没有救回过合法解（这才是能不能砍掉它的依据）。
+    // anaMiss 记的是"解析段（含 seed 位）跑完仍无任何几何收敛"的次数 —— 正是本剪枝的触发条件。
+    if (g_prof.on && !anyGeo && anaEnd > 0) {
+        ++g_prof.anaZero;
+        if (hasValid) ++g_prof.fixedRescue;
+    }
+    if (g_prof.on && !anyGeo) ++g_prof.geoAllFail;
     if (hasValid) return bestValid;
     return best;
 }
@@ -1153,6 +1198,9 @@ struct TrajIn {
     std::vector<V3> gun;    // 枪轴朝向（指向工件 = -n）
     std::vector<unsigned char> spray;
     std::vector<double> speed;
+    // 过渡标记（0=布行本体；1=换行/短换面过渡，枪没关）。安全层完全不用它做判据，
+    // 只是原样带到输出的 RobotSafetyPoint.kind，供查看器把修正层的"橙"和"红"分开。
+    std::vector<unsigned char> kind;
     int n() const { return (int)pos.size(); }
     V3 normal(int i) const { return -gun[i]; }
 };
@@ -2004,7 +2052,11 @@ bool rayStandoff(const CloudIndex& cloud, const V3& p, const V3& gun, double tub
 
 // ================================================================ C ABI
 
-const char* robot_safety_build_stamp(void) { return __DATE__ " " __TIME__; }
+// 编译戳放在 stamp.cpp：那个文件每次都重编，增量构建下也不会落后于实际链接。
+extern "C" const char* spraystamp_build_time(void);
+const char* robot_safety_build_stamp(void) {
+    return spraystamp_build_time();
+}
 
 RobotSafetyParams robot_safety_default_params(void) {
     RobotSafetyParams p;
@@ -2186,6 +2238,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     t.gun.resize(n);
     t.spray.resize(n);
     t.speed.resize(n);
+    t.kind.resize(n);
     for (int i = 0; i < n; ++i) {
         t.pos[i] = V3(pts[i].x, pts[i].y, pts[i].z);
         V3 g(pts[i].i, pts[i].j, pts[i].k);
@@ -2194,6 +2247,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         t.gun[i] = g * (1.0 / gl);
         t.spray[i] = pts[i].spray ? 1 : 0;
         t.speed[i] = pts[i].speed;
+        // kind 原样透传：1=换面不关枪（橙）。换行是 0（正常连续喷涂，不标色）。
+        // 别压成 bool 以外的语义 —— 只要保证非零就是"换面过渡"即可。
+        t.kind[i] = (unsigned char)(pts[i].kind ? 1 : 0);
     }
     std::vector<std::pair<int, int>> rows;
     computeRows(t, rows);
@@ -3124,18 +3180,69 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     }
     g_prof.mark("阶段2.5 连续性收尾");
 
+    // ---- 位置锁定：救援只改姿态，把 TCP 钉死在本点的轨迹位置上
+    //
+    // 救援 / 段统一 / 斜坡改的都是枪轴 d。按"落点固定"的老口径 pC = face + d·standoff，
+    // 枪轴转 Δ 就会让 TCP 沿半径 standoff 的球面滑 2·standoff·sin(Δ/2)：
+    // 离面 150mm 时一个 5° 档就是 13.1mm，而相邻点只走 4mm —— 那正是尖刺、也是斜坡的
+    // 全部几何来源。**喷涂真正要保住的是喷嘴位置（轨迹是否规整）**：落点沿表面滑几毫米
+    // 只影响膜厚边缘（13mm 相对 200mm 喷幅是 6.5%），而 TCP 横跳 13mm 是实打实的
+    // 不可插补突跳、也是用户看到的那根刺。
+    //
+    // 所以偏离面级姿态不大时，把 TCP 钉死在**本点的面级姿态 TCP**上（也就是主求解
+    // 给这一行铺出来的那条壳），只让落点沿表面滑：
+    //     pCbase = face + dBase·standoff        （dBase = 面级倾角/方位，行内一致）
+    //     face'  = pCbase − d·standoff          ⇒   pC = pCbase（不动）
+    // 钉在"输入轨迹位置"上是错的：面级姿态与输入 gun 不同，两者本来就差十几毫米，
+    // 一钉就把行尾钉回输入壳，反而又造一个 14mm 台阶（p004 实测正是这样）。
+    //
+    // 偏离超过 posLockMaxDeg **不是"不锁"**，而是"这个姿态不许采纳"：门限只用于
+    // 准入判定（lockAccept），位置永远锁死。曾经的做法是超门限就退回"落点固定"，
+    // 那等于让 IK 去拽轨迹 —— TCP 沿 150mm 球面滑出去，就是那根刺。
+    //   RS_NO_POSLOCK=1 关闭；RS_POSLOCK_MAX 改阈值（默认 15°）。
+    const bool posLock = (std::getenv("RS_NO_POSLOCK") == nullptr);
+    double posLockMaxDeg = 15.0;
+    if (const char* e = std::getenv("RS_POSLOCK_MAX")) {
+        const double v = std::atof(e);
+        if (v > 0.0) posLockMaxDeg = v;
+    }
+    // 准入：姿态偏离太大时落点会滑出喷幅（15° 时 39mm，已占 200mm 喷幅的两成），
+    // 这种候选不许采纳 —— 宁可报不可达，也不要喷错地方。
+    auto lockAccept = [&](double devDeg) { return devDeg <= posLockMaxDeg + 1e-9; };
+    // 位置锁定的锚点是**上游那个点本身**（t.pos[idx]），不是"面级姿态算出来的喷嘴"。
+    //
+    // 这里踩过一个坑：曾经写成 `faceNominal + dBase·standoff - d·standoff`，
+    // 想表达"喷嘴钉在面级姿态的 TCP 上"。但 eval() 的第一参数是**面点**、TCP 是
+    // 面点 + d·standoff，所以这个写法等价于
+    //     TCP = t.pos + (dBase − d)·standoff
+    // 只要 dBase ≠ d（救援换了枪轴，或者一行跨到另一张面、面级姿态本来就不一样），
+    // TCP 就挪 standoff·sin(Δ)。100mm 枪距上 5° 就是 8.7mm、10° 是 17mm ——
+    // 用户看到的"突刺"就是这个，而且它跟"输入怎么变"无关，是锚点选错了。
+    //
+    // 规则只有一条：**TCP 恒等于上游点 t.pos[idx]，姿态随便选**。这样无论阶段 2 的
+    // 面级姿态、阶段 3 的救援、3.5/3.6/3.7 的整形怎么改姿态，轨迹都不动。
+    auto lockFace = [&](int idx, const V3& d, const V3& faceNominal, double devDeg) -> V3 {
+        (void)devDeg;
+        if (!posLock) return faceNominal;
+        return t.pos[idx] - d * p.standoff;
+    };
+
     // ---- 阶段 3：按 final 重新求解 + 归集违规
     std::vector<PR> results(n);
     std::vector<char> hasResult(n, 0);
     VioCount vc;
     double standoffMaxErr = 0.0;
     int recomputed = 0, reverted = 0;
+    int posFallback = 0;   // 位置锁定无解、退回落点固定的点数（台阶来源）
     int reachable = 0;
 
     // 逐行独立（行内仍需种子连续性，行间互不依赖）→ 可以按行并行。
     // 每行行首没有"上一点解"，用解析种子自启；行首本来就是换行处，姿态本来就会跳。
     struct Acc3 {
         int recomputed = 0, reverted = 0, reachable = 0;
+        // 位置锁定下所有候选都无解、退回落点固定口径的点数（这些点是台阶的唯一来源，
+        // 报出来便于判断"锁定是不是真的够用"）。
+        int posFallback = 0;
         double standoffMaxErr = 0.0;
         // 面级姿态在这些点上「为什么过不了硬约束」的分类。
         // 用来回答一个反复被问的问题：逐点回退到底是「真撞了不得不救」，
@@ -3259,22 +3366,79 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                             mMax = (int)std::floor((tiltHi(tilt) - tilt) / p.tiltStepDeg + 1e-9);
                         else mMax = 3;
                     }
-                    for (int m = 1; m <= mMax && !rescued; ++m) {
-                        for (int sgn = 1; sgn >= -1 && !rescued; sgn -= 2) {
-                            double t2 = tilt + sgn * m * p.tiltStepDeg;
-                            if (t2 < -1e-9 || t2 > tiltHi(tilt) + 1e-9) continue;
-                            V3 d2 = dirOf(nrm, uUp, axis, t2, az);
-                            PR pr2;
-                            if (!ev.eval(face, d2, hasRefX ? &prevX : nullptr,
-                                         hasSeed ? prevTheta : nullptr, t2, az, checkLinks, pr2))
-                                continue;
-                            if (!hardOk(pr2, p)) continue;
-                            pr2.idx = i;
-                            pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
-                            pr2.reverted = true;
-                            pr = pr2;
-                            ++acc.reverted;
-                            rescued = true;
+                    // **只有一趟：位置锁定**。锁定口径下搜不到就如实报不可达，不再退回
+                    // "落点固定" —— 那会让 TCP 沿 150mm 球面滑出去（p001 idx97 的 8.6mm
+                    // 就是这么来的）。用轨迹换逆解，方向是反的：轨迹由几何唯一决定，
+                    // 该被规划的是姿态。
+                    {
+                        const int mMaxPass = mMax;
+                        // 再搜一点方位：单次逆解从"上一点解"出发经常收敛不了，
+                        // 方位偏 ±1/±2 档只让落点沿表面滑几毫米，仍在喷幅内，但解会换一支。
+                        const int azHalf = 2;
+                        // 方位放在最外层：先把标称方位下的各级倾角用尽（与旧行为逐位一致），
+                        // 再退到 ±1 档方位、±2 档。反过来（方位内层）会让"10°方位偏差"
+                        // 排在"5°倾角偏差"前面，白换掉本来更省的解，种子链反而更差。
+                        for (int ai = 0; ai <= 2 * azHalf && !rescued; ++ai) {
+                            const int ka = (ai + 1) / 2;
+                            const double az2 = (ka == 0) ? az
+                                : az + ((ai & 1) ? 1.0 : -1.0) * ka * p.tiltStepDeg;
+                            for (int m = 1; m <= mMaxPass && !rescued; ++m) {
+                                for (int sgn = 1; sgn >= -1 && !rescued; sgn -= 2) {
+                                    double t2 = tilt + sgn * m * p.tiltStepDeg;
+                                    if (t2 < -1e-9 || t2 > tiltHi(tilt) + 1e-9) continue;
+                                    V3 d2 = dirOf(nrm, uUp, axis, t2, az2);
+                                    // 位置锁定：救援只改枪轴，TCP 留在本行几何上 —— 救援不再制造台阶
+                                    const double dev =
+                                        std::fabs(t2 - tilt) + 0.5 * std::fabs(az2 - az);
+                                    // 偏离超过门限的候选不许采纳：落点会滑出喷幅。
+                                    if (!lockAccept(dev)) continue;
+                                    const V3 faceTry = lockFace(i, d2, face, dev);
+                                    // 两档种子：上一点解（保关节连续）→ 冷启（换一支解）。
+                                    // 冷启只在"带种子解不出来"时用，正常点不会多付一次 IK。
+                                    for (int sd = 0; sd < 2 && !rescued; ++sd) {
+                                        if (sd == 1 && !hasSeed) break;
+                                        const double* seedTry = (sd == 0 && hasSeed) ? prevTheta : nullptr;
+                                        PR pr2;
+                                        if (!ev.eval(faceTry, d2, hasRefX ? &prevX : nullptr,
+                                                     seedTry, t2, az2, checkLinks, pr2))
+                                            continue;
+                                        if (!hardOk(pr2, p)) continue;
+                                        pr2.idx = i;
+                                        pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                                        pr2.reverted = true;
+                                        pr = pr2;
+                                        ++acc.reverted;
+                                        rescued = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 第 3 趟：姿态退回轨迹自带的枪轴（不面级化），位置仍钉在基线壳上。
+                    // 只服务"面级姿态在这点不可达、原轨迹姿态却可以"的点：姿态可以不统一，
+                    // 位置才是必须规整的那一头。box 尾部那个 IK_FAIL 就是这一类。
+                    if (!rescued) {
+                        const V3 d0 = -t.gun[i];
+                        V3 ax0, up0;
+                        basisAt(nrm, ax0, up0);
+                        if (norm(up0) > 1e-6) {
+                            const V3 dBase = dirOf(nrm, up0, ax0, tilt, az);
+                            const V3 pCb = face + dBase * p.standoff;
+                            const V3 f0 = pCb - d0 * p.standoff;   // TCP 仍是 pCb
+                            const double dev0 = angleBetweenDeg(d0, dBase);
+                            PR pr3;
+                            // 同理：偏太多就是喷到别处去了，宁可报不可达
+                            if (lockAccept(dev0) &&
+                                ev.eval(f0, d0, hasRefX ? &prevX : nullptr,
+                                        hasSeed ? prevTheta : nullptr, dev0, az, checkLinks, pr3) &&
+                                hardOk(pr3, p)) {
+                                pr3.idx = i;
+                                pr3.sprayAngle = angleBetweenDeg(-pr3.gun, nrm);
+                                pr3.reverted = true;
+                                pr = pr3;
+                                ++acc.reverted;
+                                rescued = true;
+                            }
                         }
                     }
                     if (!rescued) {
@@ -3294,6 +3458,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                         // 写成 t.pos[i] 会与相邻的倾斜点差 2·standoff·sin(tilt/2)（60° 时
                         // 整整 100mm），一条轨迹被拆成「倾斜壳」和「原始壳」两套，画出来
                         // 全是长刺，落盘执行时也是一串不可插补的突跳。
+                        // 位置锁定生效时，这里 d 就是面级姿态方向，face + d·standoff
+                        // 正好等于相邻点的基线壳位置，两条口径一致，不需要分支。
                         bad.pos = face + d * p.standoff;
                         bad.gun = -d;
                         bad.viol = RS_VIOL_IK_FAIL;
@@ -3496,6 +3662,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         recomputed = acc.recomputed;
         reverted = acc.reverted;
         reachable = acc.reachable;
+        posFallback = acc.posFallback;
         standoffMaxErr = acc.standoffMaxErr;
     } else {
         // 任务 = 每行一个区间；再补上没被任何行覆盖的孤立点（正常轨迹没有，防御性处理）
@@ -3533,6 +3700,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             recomputed += a.recomputed;
             reverted += a.reverted;
             reachable += a.reachable;
+            posFallback += a.posFallback;
             standoffMaxErr = std::max(standoffMaxErr, a.standoffMaxErr);
             ffPierce += a.ffPierce; ffSelf += a.ffSelf; ffClr += a.ffClr;
             ffJoint += a.ffJoint;   ffIk += a.ffIk;
@@ -3557,6 +3725,104 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             std::fprintf(stderr, "  [fb] 面级姿态过不了硬约束 %d 点：穿透 %d · 自碰撞 %d · 间隙不足 %d · 关节 %d · IK %d\n",
                          ffPierce + ffSelf + ffClr + ffJoint + ffIk,
                          ffPierce, ffSelf, ffClr, ffJoint, ffIk);
+    }
+
+    // 位置锁定的兜底账：这些点是"锁定口径下真无解、只能让 TCP 跟着姿态走"的，
+    // 每一处都可能是一个台阶。数字为 0 才说明整条轨迹没有因救援而变形。
+    if (g_prof.on && posFallback > 0)
+        std::fprintf(stderr, "  [lock] 位置锁定无解回退 %d 点（这些点仍按落点固定，可能有台阶）\n",
+                     posFallback);
+
+    // ---- 阶段 3.4：中间孤岛的**姿态**重规划（位置一步不动）
+    //
+    // 现场判据：一行里「两边都解得出来、中间解不出来」，错的不是轨迹 —— 轨迹点由几何
+    // （点云 → 行 → 间距）唯一决定，它没有自由度可调；错的是姿态规划：面级常量 + 逐点
+    // 抬升在这一小段给出的枪轴落到了可达域外。
+    //
+    // 所以这里只在姿态空间重做一次局部规划：
+    //   · 以左右两个**已解**点的倾角/方位为边界条件（这就是"两边够得着"的信息）；
+    //   · 岛内取「边界插值 + 最小抬升」，让姿态从左边连续走到右边；
+    //   · 位置全程锁在 pCb（轨迹壳）上，一个微米都不许动；
+    //   · 姿态也救不回来 → 如实报不可达，交给面级姿态/站位解决，绝不滑轨迹。
+    // 行首/行尾够不着不算孤岛（那是边界条件问题，不是"中间够不着"），不动它们。
+    int islandFixed = 0, islandLeft = 0, islandSegs = 0;
+    {
+        auto okAt = [&](int k) { return hasResult[k] != 0 && results[k].ikOk; };
+        int i = 0;
+        while (i < n) {
+            if (okAt(i) || !t.spray[i]) { ++i; continue; }
+            const int ri = rowOf[i];
+            const int a = i;
+            int b = i;
+            while (b + 1 < n && !okAt(b + 1) && t.spray[b + 1] && rowOf[b + 1] == ri) ++b;
+            i = b + 1;
+            if (a == 0 || b + 1 >= n || !okAt(a - 1) || !okAt(b + 1) ||
+                rowOf[a - 1] != ri || rowOf[b + 1] != ri) {
+                islandLeft += b - a + 1;
+                continue;
+            }
+            ++islandSegs;
+
+            const double tL = results[a - 1].tiltDeg, tR = results[b + 1].tiltDeg;
+            const double zL = results[a - 1].azDeg,   zR = results[b + 1].azDeg;
+            const int ni = b - a + 1;
+            std::vector<PR> cand((size_t)ni);
+            bool done = false;
+            // 候选两维：①边界插值（最连续，优先）；②在插值上整体加 k 档抬升（左右同高
+            // 而中间过不了时，插值等于原姿态，必须靠抬升）。只抬不压：压低会削减避障余量。
+            for (int lift = 0; lift <= 4 && !done; ++lift) {
+                const double dT = lift * p.tiltStepDeg;
+                bool all = true;
+                for (int k = a; k <= b && all; ++k) {
+                    const double s = double(k - a + 1) / double(ni + 1);
+                    const double t2 = tL + (tR - tL) * s + dT;
+                    const double z2 = zL + (zR - zL) * s;
+                    if (t2 < -1e-9 || t2 > tiltHi(finalTilt[k]) + 1e-9) { all = false; break; }
+                    if (!lockAccept(std::fabs(t2 - finalTilt[k]))) { all = false; break; }
+                    V3 nrm = t.normal(k);
+                    V3 face = t.pos[k] + t.gun[k] * p.standoff;
+                    V3 ax, up;
+                    basisAt(nrm, ax, up);
+                    if (norm(up) < 1e-6) { all = false; break; }
+                    const V3 d2 = dirOf(nrm, up, ax, t2, z2);
+                    const V3 f2 = lockFace(k, d2, face, std::fabs(t2 - finalTilt[k]));
+                    const bool checkLinks = (k % std::max(1, p.linkStride) == 0);
+                    // 种子链：岛内用前一点刚解出的解，岛首用左边界点的解
+                    const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta
+                                                                   : results[a - 1].theta;
+                    PR pr2;
+                    if (!ev.eval(f2, d2, nullptr, seed, t2, z2, checkLinks, pr2) ||
+                        !hardOk(pr2, p)) { all = false; break; }
+                    pr2.idx = k;
+                    pr2.sprayAngle = angleBetweenDeg(-pr2.gun, nrm);
+                    pr2.reverted = true;
+                    cand[(size_t)(k - a)] = pr2;
+                }
+                if (!all) continue;
+                for (int k = a; k <= b; ++k) {
+                    PR q = cand[(size_t)(k - a)];
+                    setViolBits(q, true);
+                    results[k] = q;
+                    hasResult[k] = 1;
+                }
+                islandFixed += ni;
+                done = true;
+            }
+            if (!done) islandLeft += ni;
+        }
+        if (g_prof.on && (islandSegs > 0))
+            std::fprintf(stderr,
+                         "  [isl] 中间孤岛 %d 段：姿态重规划救回 %d 点 · 仍不可达 %d 点"
+                         "（两侧可解 ⇒ 属姿态规划，不动轨迹）\n",
+                         islandSegs, islandFixed, islandLeft);
+        // 这一段改的是位姿，计数必须重数（后面 3.5/3.7 还会再改，各自也会重数）
+        reverted = 0;
+        reachable = 0;
+        for (int k = 0; k < n; ++k) {
+            if (!hasResult[k]) continue;
+            if (results[k].reverted) ++reverted;
+            if (results[k].ikOk) ++reachable;
+        }
     }
 
     // ---- 阶段 3.5：回退段统一姿态（把「阶梯」压成「平台」）
@@ -3615,8 +3881,12 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     V3 d2 = dirOf(nrm, up, ax, cands[ci].first, cands[ci].second);
                     bool checkLinks = (k % std::max(1, p.linkStride) == 0);
                     const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta : nullptr;
+                    // 段统一同样只改姿态：TCP 留在本行几何上，段内不出现横向台阶
+                    if (!lockAccept(std::fabs(cands[ci].first - finalTilt[k]) +
+                                    0.5 * std::fabs(cands[ci].second - azAt(k)))) { ++fail; continue; }
+                    const V3 fptU = lockFace(k, d2, fpt, std::fabs(cands[ci].first - finalTilt[k]));
                     PR tmp;
-                    if (!ev.eval(fpt, d2, nullptr, seed, cands[ci].first, cands[ci].second,
+                    if (!ev.eval(fptU, d2, nullptr, seed, cands[ci].first, cands[ci].second,
                                  checkLinks, tmp) ||
                         !hardOk(tmp, p))
                         ++fail;
@@ -3648,8 +3918,10 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 V3 d2 = dirOf(nrm, up, ax, bTilt, bAz);
                 bool checkLinks = (k % std::max(1, p.linkStride) == 0);
                 const double* seed = (k > a && hasResult[k - 1]) ? results[k - 1].theta : nullptr;
+                if (!lockAccept(std::fabs(bTilt - finalTilt[k]) + 0.5 * std::fabs(bAz - azAt(k)))) continue;
+                const V3 fptU = lockFace(k, d2, fpt, std::fabs(bTilt - finalTilt[k]));
                 PR tmp;
-                if (!ev.eval(fpt, d2, nullptr, seed, bTilt, bAz, checkLinks, tmp) ||
+                if (!ev.eval(fptU, d2, nullptr, seed, bTilt, bAz, checkLinks, tmp) ||
                     !hardOk(tmp, p)) {
                     continue;   // 这一点在本段姿态下过不了硬约束：原样保留，不动它
                 }
@@ -3694,6 +3966,297 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         }
         azStanceRows = 0;
         for (char c : applied) if (c) ++azStanceRows;
+    }
+
+    // ---- 阶段 3.7a：整行统一姿态 —— "宁可整行低 5°，也不要行内拐一下 13mm"
+    //
+    // 背景：阶段 3 的倾角救援是**逐点**的。一行里只有末尾 3 点被压低时，行内就出现 5° 的
+    // 台阶：枪轴绕面点转 Δ，TCP 沿半径 standoff 的球面挪 2·standoff·sin(Δ/2)，离面 150mm
+    // 时 5° 就是 13.1mm，而点距只有 4mm —— 画出来是尖刺。
+    // 阶段 3.7b 的斜坡能把尖刺摊平，但那 13mm 的横向偏移仍然在，只是从"一步"变成"一段"。
+    //
+    // 用户口径（2026-11-19）：**面级姿态可以不一致，但轨迹必须完好 —— 不许尖刺，也不许斜坡。**
+    // 那就不该在行内补，而是把这一行**整体**降到行内最低的那个可行倾角：
+    //   · 倾角沿行恒定 ⇒ 平面行上 TCP 严格共线，既没有台阶也没有斜坡；
+    //   · 喷点与喷距不变：TCP = 面点 + standoff·(−枪轴)，枪轴仍指向同一个面点，只是整行
+    //     姿态低 5°，喷幅椭圆随之略转，覆盖中心不动；
+    //   · 行与行各自决策 ⇒ 相邻行姿态可以不同（用户明确允许「面级姿态可以不一致」）。
+    // 只在"整行硬约束全过"时接受；有一点过不了就整行放弃，退回 3.7b 的逐点斜坡。
+    //
+    // 交换机：RS_RAMP_MODE=ramp 只走旧斜坡；RS_NO_RAMP=1 两者都不做。
+    bool rampOnly = false;
+    if (const char* m = std::getenv("RS_RAMP_MODE")) rampOnly = (std::strcmp(m, "ramp") == 0);
+    // ⚠ 整行统一姿态已降级为**可选实验**，默认关闭。
+    // 用户口径（2026-11-19）："姿态可以不统一，我需要的是轨迹好、没有斜坡没有突刺"。
+    // 整行统一是拿"整行姿态一起降 5°"去换轨迹直线 —— 那是改喷距与喷幅覆盖去凑几何，
+    // 方向反了。位置锁定（见阶段 3 之前）已经把"救援改姿态"与"TCP 位移"解耦，
+    // 整行统一因此不再必要；留 RS_ROW_UNIFORM=1 只用于 A/B 复现历史数据。
+    const bool rowUniOn = (std::getenv("RS_ROW_UNIFORM") != nullptr);
+    int rowUniRows = 0, rowUniPts = 0, rowUniRej = 0;
+    if (rowUniOn && std::getenv("RS_NO_RAMP") == nullptr && !rampOnly) {
+        for (size_t ri = 0; ri < rows.size(); ++ri) {
+            const int a = std::max(0, rows[ri].first);
+            const int b = std::min(n - 1, rows[ri].second);
+            if (b <= a) continue;
+            // 本行被救援压低的点里，最低的那个倾角就是整行要统一到的目标
+            double Trow = 1e9;
+            int nResc = 0;
+            for (int i = a; i <= b; ++i) {
+                if (!t.spray[i] || !hasResult[i]) continue;
+                const double d = results[i].tiltDeg - finalTilt[i];
+                if (d < -0.01) { Trow = std::min(Trow, results[i].tiltDeg); ++nResc; }
+            }
+            if (nResc == 0) continue;   // 本行没有救援，姿态本来就是常量
+
+            // 整行按 Trow 重解：先全部试算，全过才落地（不许半行改半行不改）
+            const int m = b - a + 1;
+            std::vector<PR> trial((size_t)m);
+            std::vector<char> tried((size_t)m, 0);
+            bool ok = true;
+            for (int i = a; i <= b && ok; ++i) {
+                if (!t.spray[i] || !hasResult[i]) continue;
+                V3 nrm = t.normal(i);
+                V3 fpt = t.pos[i] + t.gun[i] * p.standoff;
+                V3 ax, up;
+                basisAt(nrm, ax, up);
+                if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+                V3 d2 = dirOf(nrm, up, ax, Trow, results[i].azDeg);
+                bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+                const double* seed = (i > 0 && hasResult[i - 1]) ? results[i - 1].theta : nullptr;
+                if (!lockAccept(std::fabs(Trow - finalTilt[i]) +
+                                0.5 * std::fabs(results[i].azDeg - azAt(i)))) { ok = false; break; }
+                const V3 fptU = lockFace(i, d2, fpt, std::fabs(Trow - finalTilt[i]));
+                PR tmp;
+                if (!ev.eval(fptU, d2, nullptr, seed, Trow, results[i].azDeg, checkLinks, tmp) ||
+                    !hardOk(tmp, p)) { ok = false; break; }
+                tmp.idx = i;
+                tmp.sprayAngle = angleBetweenDeg(-tmp.gun, nrm);
+                trial[(size_t)(i - a)] = tmp;
+                tried[(size_t)(i - a)] = 1;
+            }
+            if (!ok) { ++rowUniRej; continue; }
+
+            for (int i = a; i <= b; ++i) {
+                const int q = i - a;
+                if (!tried[(size_t)q]) continue;
+                PR tmp = trial[(size_t)q];
+                tmp.reverted = (std::fabs(Trow - finalTilt[i]) > 1e-6);
+                setViolBits(tmp, true);
+                results[i] = tmp;
+                ++rowUniPts;
+            }
+            ++rowUniRows;
+        }
+        if (rowUniRows && g_prof.on)
+            std::fprintf(stderr, "  [row] 整行统一姿态 %d 行 %d 点 · 整行解不出放弃 %d 行\n",
+                         rowUniRows, rowUniPts, rowUniRej);
+        reverted = 0;
+        reachable = 0;
+        for (int k = 0; k < n; ++k) {
+            if (!hasResult[k]) continue;
+            if (results[k].reverted) ++reverted;
+            if (results[k].ikOk) ++reachable;
+        }
+    }
+
+    // ---- 阶段 3.7b：姿态阶跃 → 斜坡（兜底；"一条轨迹上不许出现突然突出的折角"）
+    //
+    // 阶段 3 的逐点救援改的是**枪轴**：枪轴绕面点转 Δ，TCP 就沿半径 standoff 的球面
+    // 挪 2·standoff·sin(Δ/2)。离面 150mm 时一个 5° 的倾角档就是 13.1mm —— 而相邻点
+    // 只走 4mm，等于一步之内横跳 13mm：画出来是尖刺，落盘是不可插补的突跳。
+    // 阶段 3.5 只能把"连成串的回退点"归成一个姿态，管不了孤立点簇：簇的两端仍是台阶。
+    // 实测 p004（531×110 折带、行距 150、离面 150）：行末 3 点被救援降了 5°，
+    // 140→141 一步 12.95mm、转角 83°，界面上就是那个"突然拐出去又折回"的尖角。
+    //
+    // 做法：把台阶摊成斜坡。只对**相对面级姿态的偏差**做 Lipschitz 下包络 ——
+    //     dev[k] = results[k].tiltDeg − finalTilt[k]
+    //     lo[k]  = min_j ( dev[j] + cap·|k−j| ),  cap = 2·asin(budget/(2·standoff))
+    // 等价于"把偏差向两侧摊开"，每步倾角变化 ≤ cap ⇒ 每步 TCP 位移 ≤ budget。
+    // 偏差为 0 的地方（纯面级姿态、含阶段 2.5 的边界斜坡）lo 逐位等于 dev，一个字不动，
+    // 所以边界斜坡不会被当成台阶再削一遍；长期平台也只被削平两个端头，平台本体不动。
+    // 逐点重解，过不了硬约束的点保持原样（宁可留台阶，不牺牲硬约束），留下的台阶照实计数。
+    //
+    // 为什么只做下包络（只往低倾角摊）：倾角救援的主方向是压低（枪更贴法向、更好解），
+    // 抬高多半是为了让开枪体，而阶段 2.5 的边界斜坡已经把段首尾的抬高处理过了。
+    // 把必要的抬高硬压回去等于用碰撞换平滑；抬高的孤立点仍由下面的跳变判据如实报出来。
+    if (std::getenv("RS_NO_RAMP") == nullptr) {
+        const double Sw = p.standoff > 1e-6 ? p.standoff : 100.0;
+        // 每步允许的额外 TCP 位移。默认 1mm ≈ 1/4 个点距：斜坡每走一步只横挪 1mm，
+        // 画出来是一条弧而不是折角（实测 p004 尖刺：预算 4mm 转角还有 50.6°，
+        // 1mm 降到 14.5°，步长回落到名义点距 3.98mm）。可用 RS_RAMP_BUDGET 覆盖。
+        double budget0 = 1.0;
+        if (const char* e = std::getenv("RS_RAMP_BUDGET")) {
+            double v = std::atof(e);
+            if (v > 0.0) budget0 = v;
+        }
+        auto capOf = [&](double b) {
+            return (b < 2.0 * Sw) ? 2.0 * std::asin(0.5 * b / Sw) * kRad : 90.0;
+        };
+        int rampSegs = 0, rampPts = 0, rampRej = 0, rampSkip = 0, rampUndo = 0;
+        double budgetUsed = budget0;
+        for (int s = 0; s < n;) {
+            while (s < n && !(t.spray[s] && hasResult[s])) ++s;
+            if (s >= n) break;
+            const int a = s;
+            int b = a;
+            while (b + 1 < n && t.spray[b + 1] && hasResult[b + 1]) ++b;
+            const int m = b - a + 1;
+            s = b + 1;
+            if (m < 3) continue;
+
+            std::vector<double> dev((size_t)m), lo((size_t)m);
+            for (int k = 0; k < m; ++k) {
+                // 只处理"降低"的偏差（dev<0）。抬高的救援不在这一刻度里：
+                // 抬高是为了让开枪体/躲关节，把它摊开等于让一大片点跟着贴过去，
+                // 而摊不开时又只能回退成碰撞 —— 两头都不划算，抬高留给跳变判据如实上报。
+                const double d0 = results[a + k].tiltDeg - finalTilt[a + k];
+                dev[(size_t)k] = std::min(0.0, d0);
+            }
+
+            // 原始救援岛（dev≠0 的极大连续段）的左右端，供下面的撤销判据用：
+            // 只有"孤立点簇"（短于 4 点、两侧都回到面级姿态）才允许撤销。
+            std::vector<int> islL((size_t)m), islR((size_t)m);
+            for (int k = 0; k < m;) {
+                if (std::fabs(dev[(size_t)k]) <= 0.01) {
+                    islL[(size_t)k] = islR[(size_t)k] = k;
+                    ++k;
+                    continue;
+                }
+                int e = k;
+                while (e + 1 < m && std::fabs(dev[(size_t)(e + 1)]) > 0.01) ++e;
+                for (int q = k; q <= e; ++q) { islL[(size_t)q] = k; islR[(size_t)q] = e; }
+                k = e + 1;
+            }
+
+            // 预算阶梯：短行装不下 1mm 的坡，就逐档翻倍 —— 宁可坡陡一点，也不要留台阶。
+            // 摊开的点数超过段长六成还装不下，说明这不是"局部台阶"而是整套姿态都偏了，
+            // 那种情况该回阶段 2 重选面级姿态，不在这里用斜坡遮掩。
+            bool fitted = false;
+            int touched = 0;
+            double bud = budget0, capT = capOf(budget0);
+            for (int attempt = 0; attempt < 5 && !fitted; ++attempt) {
+                capT = capOf(bud);
+                lo = dev;
+                for (int k = 1; k < m; ++k)
+                    lo[(size_t)k] = std::min(lo[(size_t)k], lo[(size_t)(k - 1)] + capT);
+                for (int k = m - 2; k >= 0; --k)
+                    lo[(size_t)k] = std::min(lo[(size_t)k], lo[(size_t)(k + 1)] + capT);
+                touched = 0;
+                for (int k = 0; k < m; ++k)
+                    if (std::fabs(lo[(size_t)k] - dev[(size_t)k]) > 0.01) ++touched;
+                if (touched <= (m * 3) / 5) fitted = true;
+                else bud *= 2.0;
+            }
+            if (!fitted) { ++rampSkip; continue; }
+            if (touched == 0) continue;   // 本段没有台阶
+            budgetUsed = std::max(budgetUsed, bud);
+
+            ++rampSegs;
+            for (int k = 0; k < m; ++k) {
+                if (std::fabs(lo[(size_t)k] - dev[(size_t)k]) <= 0.01) continue;
+                const int i = a + k;
+                const double nt = finalTilt[i] + lo[(size_t)k];
+                V3 nrm = t.normal(i);
+                V3 fpt = t.pos[i] + t.gun[i] * p.standoff;
+                V3 ax, up;
+                basisAt(nrm, ax, up);
+                if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+                V3 d2 = dirOf(nrm, up, ax, nt, results[i].azDeg);
+                bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+                const double* seed = (i > 0 && hasResult[i - 1]) ? results[i - 1].theta : nullptr;
+                // 位置锁定：斜坡只是把"姿态阶跃"摊成连续姿态，TCP 一步都不许动 ——
+                // 否则摊出来的就是用户看到的那段斜线（位置意义上的斜坡）。
+                // 摊到偏离基线超过门限就打住：再抬下去喷点就出喷幅了，宁可留台阶如实上报。
+                if (!lockAccept(std::fabs(nt - finalTilt[i]))) { ++rampRej; continue; }
+                const V3 fptU = lockFace(i, d2, fpt, std::fabs(nt - finalTilt[i]));
+                PR tmp;
+                if (!ev.eval(fptU, d2, nullptr, seed, nt, results[i].azDeg, checkLinks, tmp) ||
+                    !hardOk(tmp, p)) {
+                    ++rampRej;
+                    continue;   // 这一档过不了硬约束：保留原姿态，台阶留给下面的判据如实上报
+                }
+                tmp.idx = i;
+                tmp.sprayAngle = angleBetweenDeg(-tmp.gun, nrm);
+                tmp.reverted = true;
+                setViolBits(tmp, true);
+                results[i] = tmp;
+                ++rampPts;
+            }
+
+            // ---- 兜底：坡摊不下去的地方，撤销那个救援
+            //
+            // 斜坡点过不了硬约束（关节超限/贴件），坡就摊不开，台阶会原地留下。
+            // 但只对**孤立点簇**（长度 ≤3、两侧都回到面级姿态）执行撤销：
+            //   孤立点簇 = "拐出去又拐回来"的尖刺，画面上就是那个尖角，必须消掉；
+            //   成片的平台 = 一长段料都必须多倾几度（宽板中间、深腔里），它的端头是
+            //   "肩膀"不是尖刺，机器人走的是"进去—一直走—出来"，硬撤会把几十个
+            //   可达点变成不可达（实测 longwide 100%→97.1%，全是这类端头）。
+            // 撤销后姿态回到面级常量，位置自然回到那条直线上；解不出来就按"不可达"
+            // 落一条记录（位置仍在直线上）。绝不用"看起来平滑、实际一步急拐"换个假 PASS。
+            for (int pass = 0; pass < 3; ++pass) {
+                bool fixedAny = false;
+                for (int k = a + 1; k <= b; ++k) {
+                    const double dT = results[k].tiltDeg - results[k - 1].tiltDeg;
+                    if (std::fabs(dT) <= 2.0 * capT + 1e-9) continue;
+                    // 谁偏离面级姿态更远，谁是被救援的那个点
+                    const double dA = std::fabs(results[k].tiltDeg - finalTilt[k]);
+                    const double dB = std::fabs(results[k - 1].tiltDeg - finalTilt[k - 1]);
+                    const int i = (dA >= dB) ? k : (k - 1);
+                    if (std::fabs(results[i].tiltDeg - finalTilt[i]) < 1e-6) continue;
+                    if (results[i].tiltDeg >= finalTilt[i] - 1e-6) continue;   // 只撤销"降低"的救援
+                    const int q = i - a;
+                    if (islR[(size_t)q] - islL[(size_t)q] + 1 > 3) continue;
+                    V3 nrm = t.normal(i);
+                    V3 fpt = t.pos[i] + t.gun[i] * p.standoff;
+                    V3 ax, up;
+                    basisAt(nrm, ax, up);
+                    if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+                    V3 d2 = dirOf(nrm, up, ax, finalTilt[i], results[i].azDeg);
+                    bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+                    const double* seed = (i > 0 && hasResult[i - 1]) ? results[i - 1].theta : nullptr;
+                    PR tmp;
+                    if (ev.eval(fpt, d2, nullptr, seed, finalTilt[i], results[i].azDeg, checkLinks, tmp) &&
+                        hardOk(tmp, p)) {
+                        tmp.idx = i;
+                        tmp.sprayAngle = angleBetweenDeg(-tmp.gun, nrm);
+                        tmp.reverted = false;
+                        setViolBits(tmp, true);
+                        ++rampUndo;
+                    } else {
+                        // 面级姿态也解不出来：照"不可达"的口径落一条记录，位置仍在直线上。
+                        tmp = PR();
+                        tmp.idx = i;
+                        tmp.tiltDeg = finalTilt[i];
+                        tmp.azDeg = results[i].azDeg;
+                        tmp.sprayAngle = finalTilt[i];
+                        tmp.clearance = -std::numeric_limits<double>::infinity();
+                        tmp.selfGap = std::numeric_limits<double>::quiet_NaN();
+                        tmp.ikOk = false;
+                        tmp.pos = fpt + d2 * p.standoff;
+                        tmp.gun = -d2;
+                        tmp.viol = RS_VIOL_IK_FAIL;
+                        ++rampUndo;
+                    }
+                    results[i] = tmp;
+                    fixedAny = true;
+                }
+                if (!fixedAny) break;
+            }
+        }
+        // 斜坡点也改位姿（reverted/reachable 都会变），计数必须重数一遍再报。
+        reverted = 0;
+        reachable = 0;
+        for (int k = 0; k < n; ++k) {
+            if (!hasResult[k]) continue;
+            if (results[k].reverted) ++reverted;
+            if (results[k].ikOk) ++reachable;
+        }
+        if (g_prof.on)
+            std::fprintf(stderr,
+                         "  [ramp] 阶跃→斜坡 %d 段 %d 点 · 过不了硬约束留台阶 %d 点 · 摊不下跳过 %d 段"
+                         " · 撤销救援 %d 点（每步预算 %.1fmm ⇒ 倾角档 %.2f°）\n",
+                         rampSegs, rampPts, rampRej, rampSkip, rampUndo,
+                         budgetUsed, capOf(budgetUsed));
     }
 
     // ---- 阶段 3.6：逐点解析救 J5（RS_POSE_TILT_J5）—— **叠加层**
@@ -3823,7 +4386,14 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 const double* seed = (idx > 0 && hasResult[idx - 1]) ? results[idx - 1].theta : nullptr;
                 const bool checkLinks = (idx % std::max(1, p.linkStride) == 0);
                 PR pr;
-                if (!ev.eval(face, dirOf(nrm, uUp, axis, tilt, az), nullptr, seed, tilt, az,
+                // 位置锁定：救 J5 改的是枪轴，TCP 必须留在轨迹上（否则又是一根刺）
+                const double devJ5 = std::fabs(tilt - finalTilt[idx]) +
+                                     0.5 * std::fabs(az - azAt(idx));
+                // 偏太多就不是"救 J5"了，是把喷点甩到别处 —— 按硬约束拒绝
+                if (!lockAccept(devJ5)) return 2;
+                const V3 d5 = dirOf(nrm, uUp, axis, tilt, az);
+                const V3 faceL = lockFace(idx, d5, face, devJ5);
+                if (!ev.eval(faceL, d5, nullptr, seed, tilt, az,
                              checkLinks, pr))
                     return 1;                                // IK 失败
                 if (!hardOk(pr, p)) return 2;                // 硬约束
@@ -3976,6 +4546,193 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         }
     }
 
+    // ---- 阶段 3.8：喷涂段几何矫正 —— "宁可少一个可达点，也不许出一个刺"
+    //
+    // 位置锁定是首选，但个别点在锁定口径下解不出逆解（种子链在换支处分叉），救援的兜底
+    // 那一趟会退回"落点固定"，TCP 就沿半径 standoff 的球面滑出去 8~13mm。p001 实测
+    // idx97 凸出 8.6mm、前后两点都在行内，画面上就是一根刺（转角 130.9°）。
+    //
+    // 这一层只看几何，不看姿态：三点 p[i-1]、p[i]、p[i+1] 都是喷涂点，p[i] 到弦线的
+    // 距离超过阈值 ⇒ 判为凸点。阈值 = max(1.2mm, 0.30×本件点距)：点距 4mm 的件 1.2mm
+    // 已是 30% 点距的偏离；正常曲率（R≥20mm、步长 4mm）弦高只有 0.1mm，不会误伤。
+    //
+    // 矫正方式：把 TCP 沿弦投影拉回线上（保留沿行位置），只改面点、枪轴原样不动，
+    // 再按同一枪轴重解一次 IK（先用前一点解，再冷启）。两支都不成才把位置钉在弦上
+    // 并如实标 IK_FAIL —— 位置必须规整，这是"轨迹要完好"的硬要求；可达性照实报。
+    int geoFixed = 0, geoPinned = 0;
+    if (p.requireReach) {
+        std::vector<double> sg;
+        sg.reserve(n);
+        for (int i = 1; i < n; ++i)
+            if (t.spray[i] && t.spray[i - 1] && hasResult[i] && hasResult[i - 1])
+                sg.push_back(norm(results[i].pos - results[i - 1].pos));
+        double medPitch = 0.0;
+        if (!sg.empty()) {
+            std::nth_element(sg.begin(), sg.begin() + sg.size() / 2, sg.end());
+            medPitch = sg[sg.size() / 2];
+        }
+        const double devThr = std::max(1.2, 0.30 * medPitch);
+        for (int pass = 0; pass < 2; ++pass) {
+            int fixedThis = 0;
+            for (int i = 2; i + 2 < n; ++i) {
+                if (!(t.spray[i] && t.spray[i - 1] && t.spray[i + 1] &&
+                      t.spray[i - 2] && t.spray[i + 2]))
+                    continue;                       // 段端/换行处不整形，那是折返不是凸点
+                if (!(hasResult[i] && hasResult[i - 1] && hasResult[i + 1])) continue;
+                const V3 p0 = results[i - 1].pos;
+                const V3 p1 = results[i + 1].pos;
+                const V3 u = p1 - p0;
+                const double L = norm(u);
+                if (L < 1e-9) continue;
+                const V3 ud = unit(u);
+                const double tl = std::max(0.0, std::min(L, dot(results[i].pos - p0, ud)));
+                const V3 tgt = p0 + ud * tl;
+                if (norm(results[i].pos - tgt) <= devThr) continue;
+
+                const V3 nrm = t.normal(i);
+                const V3 gun = results[i].gun;             // 枪轴（枪→面），原样保留
+                const V3 d = -gun;                          // 喷涂方向（面→枪）
+                const V3 faceNew = tgt - d * p.standoff;    // face' + d·standoff = tgt
+                const double tiltK = results[i].tiltDeg;
+                const double azK = results[i].azDeg;
+                const bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+                const double* sd0 = results[i - 1].theta;
+                PR nr;
+                bool ok = ev.eval(faceNew, d, nullptr, sd0, tiltK, azK, checkLinks, nr) &&
+                          hardOk(nr, p);
+                if (!ok)
+                    ok = ev.eval(faceNew, d, nullptr, nullptr, tiltK, azK, checkLinks, nr) &&
+                         hardOk(nr, p);
+                if (ok) {
+                    nr.idx = i;
+                    nr.sprayAngle = angleBetweenDeg(-nr.gun, nrm);
+                    nr.reverted = results[i].reverted;     // 救援标记跟着点走，别丢
+                    setViolBits(nr, t.spray[i] != 0);
+                    results[i] = nr;
+                    ++geoFixed;
+                    ++fixedThis;
+                } else {
+                    // 解不出逆解：位置照样钉在弦上（轨迹必须规整），如实报不可达。
+                    PR& pr = results[i];
+                    pr.pos = tgt;
+                    pr.ikOk = false;
+                    pr.viol |= RS_VIOL_IK_FAIL;
+                    ++geoPinned;
+                    ++fixedThis;
+                }
+            }
+            if (fixedThis == 0) break;
+        }
+        if (g_prof.on && (geoFixed || geoPinned))
+            std::fprintf(stderr, "  [geo] 喷涂段弦线矫正 %d 点（重解成功 %d / 钉住报不可达 %d）\n",
+                         geoFixed + geoPinned, geoFixed, geoPinned);
+    }
+
+    // ---- 阶段 3.9：轨迹契约（**与上游怎么给无关**）
+    //
+    // 前面所有阶段（面级姿态、逐点救援、段统一、J5、斜坡、弦线矫正）都在"改姿态换
+    // 可涂性"，任何一个阶段只要把位置带歪一点、把姿态跳一下，用户看到的就是刺。
+    // 与其逐个阶段去堵，不如在最后立一条不依赖来源的规则，逐点核对：
+    //
+    //   ① TCP 必须等于上游给的点 t.pos[i]（位置不许被任何姿态选择改动）；
+    //   ② 相邻两点的枪轴夹角 ≤ 每步预算 capC（姿态必须连续，不许跳）。
+    //
+    // 违反就地重解：位置按①钉死，姿态按②以上一点为基准夹紧（先夹 1 档、再夹 2 档，
+    // 最后只修位置、姿态原样）。三档都过不了硬约束就保留原样并计数——绝不静默输出
+    // 一个突跳而不报。这条规则对"一行跨两张面""救援在相邻点换档"同样生效，
+    // 因为它看的是**输出序列**，不看是谁造成的。
+    int ctrPinned = 0, ctrTilt = 0, ctrGive = 0;
+    // 诊断：契约修正这段的投入产出。attempt 里每次最多 10 组 (倾角, 方位) 组合，
+    // 而全不可达件上这些组合**注定全部失败**——它仍然老老实实试满 10 组，
+    // 每组 1~2 次 eval。ceCalls 就是"白跑了多少次 eval"的直接证据。
+    long long ctrCalls = 0, ctrEval = 0;
+    if (p.requireReach) {
+        const double Sw = p.standoff > 1e-6 ? p.standoff : 100.0;
+        // 每步允许的额外横向位移（mm）→ 折算成倾角档。默认 2mm：
+        // 100mm 枪距上 ≈1.15°，10° 的面间差要摊 9 个点，肉眼是一条顺坡。
+        double budC = 2.0;
+        if (const char* e = std::getenv("RS_CTR_BUDGET")) {
+            const double v = std::atof(e);
+            if (v > 0.0) budC = v;
+        }
+        const double capC =
+            (budC < 2.0 * Sw) ? 2.0 * std::asin(0.5 * budC / Sw) * kRad : 90.0;
+        for (int i = 0; i < n; ++i) {
+            if (!hasResult[i] || !t.spray[i]) continue;
+            const bool pinBad = norm(results[i].pos - t.pos[i]) > 0.6;
+            const bool tiltBad = (i > 0 && hasResult[i - 1] && t.spray[i - 1] &&
+                                  angleBetweenDeg(results[i].gun, results[i - 1].gun) > capC);
+            if (!pinBad && !tiltBad) continue;
+
+            const V3 nrm = t.normal(i);
+            V3 ax, up;
+            basisAt(nrm, ax, up);
+            if (norm(up) < 1e-6) { ax = V3(0, 0, 0); up = V3(0, 0, 0); }
+            const double az0 = results[i].azDeg;
+            const double tOrig = results[i].tiltDeg;
+            const double tPrev = (i > 0 && hasResult[i - 1]) ? results[i - 1].tiltDeg : tOrig;
+            const bool checkLinks = (i % std::max(1, p.linkStride) == 0);
+            const double* seed0 = (i > 0 && hasResult[i - 1]) ? results[i - 1].theta : nullptr;
+            auto clampTo = [&](double lim) {
+                return std::max(tPrev - lim, std::min(tPrev + lim, tOrig));
+            };
+            auto attempt = [&](double tt, double az) -> bool {
+                ++ctrCalls;
+                const V3 d = dirOf(nrm, up, ax, tt, az);
+                const V3 pin = t.pos[i] - d * Sw;          // ⇒ TCP 恒为 t.pos[i]
+                PR q;
+                ++ctrEval;
+                if (!((ev.eval(pin, d, nullptr, seed0, tt, az, checkLinks, q) ||
+                       ev.eval(pin, d, nullptr, nullptr, tt, az, checkLinks, q)) &&
+                      hardOk(q, p)))
+                    return false;
+                q.idx = i;
+                q.sprayAngle = angleBetweenDeg(-q.gun, nrm);
+                q.reverted = results[i].reverted;   // 救援标记跟着点走
+                setViolBits(q, true);
+                results[i] = q;
+                return true;
+            };
+            // 顺序即优先级：先保姿态连续（只动倾角、方位不动），再放宽到原倾角
+            // （只修位置），最后才允许换方位 ±10°/±20° —— 换方位是唯一会改变喷幅
+            // 覆盖方向的手段，放在最后。
+            const double tClamp = clampTo(capC);
+            bool done = attempt(tClamp, az0);
+            if (!done && std::fabs(tClamp - tOrig) > 1e-9) done = attempt(tOrig, az0);
+            for (int ai = 1; ai <= 2 && !done; ++ai) {
+                for (int sg = -1; sg <= 1 && !done; sg += 2) {
+                    const double az = az0 + sg * 10.0 * ai;
+                    done = attempt(tClamp, az);
+                    if (!done && std::fabs(tClamp - tOrig) > 1e-9) done = attempt(tOrig, az);
+                }
+            }
+            if (done) {
+                if (pinBad) ++ctrPinned;
+                if (tiltBad) ++ctrTilt;
+            } else {
+                // 位置钉在上游点、姿态保持原样，如实报不可达。
+                // 绝不为了"凑一个可达"把轨迹挪走 —— 那是把姿态规划的问题伪装成轨迹问题，
+                // 而且挪出来的正是用户看到的那根刺。
+                PR& pr = results[i];
+                const V3 d0 = dirOf(nrm, up, ax, tOrig, az0);
+                pr.pos = t.pos[i];
+                pr.gun = -d0;
+                pr.tiltDeg = tOrig;
+                pr.azDeg = az0;
+                pr.ikOk = false;
+                pr.viol |= RS_VIOL_IK_FAIL;
+                ++ctrGive;
+            }
+        }
+        if (g_prof.on && (ctrPinned || ctrTilt || ctrGive))
+            std::fprintf(stderr,
+                         "  [ctr] 契约修正：位置拉回 %d 点 · 姿态夹紧 %d 点 · 过不了硬约束保留 %d 点"
+                         "（每步预算 %.1fmm ⇒ 倾角档 %.2f°）· 尝试 %lld 次 / eval %lld"
+                         "（成功 %d / 失败 %d）\n",
+                         ctrPinned, ctrTilt, ctrGive, budC, capC,
+                         ctrCalls, ctrEval, ctrPinned + ctrTilt, ctrGive);
+    }
+
     // ---- 姿态跳变 / 位置跳变：都是"平滑性"的代价，必须报出来（P2，速度/加速度风险）
     //
     // 两条都**不再限制在行内**。原来只在 `r.first+1..r.second` 里比，恰好漏掉了最容易
@@ -4020,6 +4777,27 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             // 位置：直线步长。换段处不抬枪、不补偿，是这条判据的主战场。
             if (norm(results[i].pos - results[i - 1].pos) > thrStep)
                 results[i].viol |= RS_VIOL_STEP_JUMP;
+        }
+
+        // ---- 折角（尖刺）：步子不大，但方向猛地折出去又折回来
+        //
+        // thrStep 抓的是"一步走太远"，抓不到"步子不大但方向突变"：p004 的尖刺
+        // 一步 12.95mm、转角 83°，step 判据（15mm）全程没响，界面上却是一个尖角。
+        // 这里按**偏离弦线**判：三点 p[i-1]、p[i]、p[i+1]，p[i] 到弦的距离超过
+        // 大半个点距，就说明它不在前后两点的连线上 —— 那是折出去的点，不是弧。
+        //
+        // 行首末两点不看：换行折返本来就是 180°，报出来全是噪声；
+        // 阶段 3.7 已经尽量把这类台阶摊成斜坡，这里只兜底"摊不下去"的那些。
+        if (!gaps.empty()) {
+            const double devThr = std::max(2.5, 0.75 * medGap);
+            for (int i = 2; i + 2 < n; ++i) {
+                if (!(hasResult[i] && hasResult[i - 1] && hasResult[i + 1])) continue;
+                if (!(t.spray[i] && t.spray[i - 1] && t.spray[i + 1])) continue;
+                if (!(t.spray[i - 2] && t.spray[i + 2])) continue;   // 离段端太近，跳过
+                const V3 mid = (results[i - 1].pos + results[i + 1].pos) * 0.5;
+                if (norm(results[i].pos - mid) > devThr)
+                    results[i].viol |= RS_VIOL_STEP_JUMP;
+            }
         }
     }
 
@@ -4074,7 +4852,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     emit.reserve((size_t)n + 64);
     emitSrc.reserve((size_t)n + 64);
     emitSpray.reserve((size_t)n + 64);
-    int insertedPts = 0, densifiedSegs = 0, densifyGiveUp = 0;
+    int insertedPts = 0, densifiedSegs = 0, densifyGiveUp = 0, dupDropped = 0;
     {
         const double SwD = p.standoff > 1e-6 ? p.standoff : 100.0;
         auto toolClrOf = [&](const V3& pos, const V3& gunDir) {
@@ -4156,16 +4934,23 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     }
                 }
             }
+            // 零长度点不是轨迹：与上一点重合的直接丢。同一位置出现两种姿态＝原地转身，
+            // 落盘执行时会是一句"不可插补"。契约阶段已经把 TCP 钉回上游点，正常不该再出现；
+            // 这里是最后一道兜底，不依赖任何阶段的行为。
+            if (!emit.empty() && norm(results[i].pos - emit.back().pos) < 0.05) {
+                ++dupDropped;
+                continue;
+            }
             emit.push_back(results[i]);
             emitSrc.push_back(i);
             emitSpray.push_back(t.spray[i] ? 1 : 0);
         }
     }
     const int nOut = (int)emit.size();
-    if (g_prof.on && (densifiedSegs || densifyGiveUp)) {
+    if (g_prof.on && (densifiedSegs || densifyGiveUp || dupDropped)) {
         std::fprintf(stderr,
-                     "  [dens] 超步长(>%.1fmm)切段=%d 插点=%d 放弃=%d 段 · 输出 %d 点（原 %d）\n",
-                     thrStep, densifiedSegs, insertedPts, densifyGiveUp, nOut, n);
+                     "  [dens] 超步长(>%.1fmm)切段=%d 插点=%d 放弃=%d 段 · 零长度点丢弃=%d · 输出 %d 点（原 %d）\n",
+                     thrStep, densifiedSegs, insertedPts, densifyGiveUp, dupDropped, nOut, n);
     }
 
     // ---- 输出
@@ -4199,6 +4984,10 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         q.k = pr.gun.z;
         q.speed = t.speed[src];
         q.spray = emitSpray[r];
+        // kind 原样透传（1=换面不关枪）。插补点落在 (src-1, src) 之间，取两端的**较大者**：
+        // 只要有一端是换面过渡，这段就不是覆盖行，标橙色才对。
+        // 只取 src 单端会在过渡段的最后一个插补点上提前变回"布行"，色带边界会错一格。
+        q.kind = (unsigned char)std::max(t.kind[src], t.kind[src > 0 ? src - 1 : src]);
         q.tiltDeg = pr.sprayAngle;
         q.clearanceMm = pr.clearance;
         q.selfGapMm = pr.selfGap;
@@ -4326,7 +5115,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (g_prof.sweepSeeds > 0)
             std::fprintf(stderr, "  [prof] 全种子搜 %lld 组 · 其中与前组逐位重复 %lld（%.1f%%）\n",
                          (long long)g_prof.sweepSeeds, (long long)g_prof.sweepDup,
-                         100.0 * (double)g_prof.sweepDup / (double)g_prof.sweepSeeds);
+                         g_prof.sweepSeeds ? 100.0 * (double)g_prof.sweepDup / (double)g_prof.sweepSeeds : 0.0);
         {
             // 救回发生在第几组种子（第一次命中的下标）。累积列用来判断"砍到第 N 组漏多少"。
             long long tot = 0, cum = 0;
@@ -4347,6 +5136,17 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (g_prof.ikOnceN > 0)
             std::fprintf(stderr, "  [prof] ikOnce 平均迭代 %.1f 次（上限 90）\n",
                          (double)g_prof.ikIters / (double)g_prof.ikOnceN);
+        // 「几何全灭」路径的投入产出：解析种子全灭之后，那 12 组固定种子到底救回过什么。
+        // 这里是唯一能证明"砍掉固定种子段不影响任何输出"的实测依据。
+        {
+            long long az = g_prof.anaZero.load();
+            long long af = g_prof.geoAllFail.load();
+            long long fr = g_prof.fixedRescue.load();
+            std::fprintf(stderr,
+                         "  [prof] 几何全灭路径：解析种子段全灭 %lld 次 · 整轮零几何收敛 %lld 次"
+                         " · 其中仍拿到合法解（固定种子救回）%lld 次（%.2f%%）\n",
+                         az, af, fr, af ? 100.0 * (double)fr / (double)af : 0.0);
+        }
     }
     return R;
 }

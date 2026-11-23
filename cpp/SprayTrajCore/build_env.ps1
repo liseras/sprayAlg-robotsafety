@@ -8,10 +8,10 @@ $env:LIB = "$msvc\lib\x64;$sdk\Lib\$sdkv\ucrt\x64;$sdk\Lib\$sdkv\um\x64"
 Set-Location $PSScriptRoot
 New-Item -ItemType Directory -Force build_obj | Out-Null
 
-& cl.exe /nologo /c /O2 /std:c++17 /utf-8 /MD /EHsc /DSPRAYTRAJ_EXPORTS /D_CRT_SECURE_NO_WARNINGS /I. /Fo:build_obj\ /Fd:build_obj\ spray_traj.cpp robot_safety.cpp
+& cl.exe /nologo /c /O2 /std:c++17 /utf-8 /MD /EHsc /DSPRAYTRAJ_EXPORTS /D_CRT_SECURE_NO_WARNINGS /I. /Fo:build_obj\ /Fd:build_obj\ spray_traj.cpp robot_safety.cpp stamp.cpp
 if ($LASTEXITCODE -ne 0) { Write-Output "CL_CORE_FAIL=$LASTEXITCODE"; exit 1 }
 
-& link.exe /nologo /DLL /OUT:build_obj\SprayTraj.dll build_obj\spray_traj.obj build_obj\robot_safety.obj
+& link.exe /nologo /DLL /OUT:build_obj\SprayTraj.dll build_obj\spray_traj.obj build_obj\robot_safety.obj build_obj\stamp.obj
 if ($LASTEXITCODE -ne 0) { Write-Output "LINK_DLL_FAIL=$LASTEXITCODE"; exit 2 }
 
 & cl.exe /nologo /c /O2 /std:c++17 /utf-8 /MD /EHsc /D_CRT_SECURE_NO_WARNINGS /I. /Fo:build_obj\ /Fd:build_obj\ driver.cpp

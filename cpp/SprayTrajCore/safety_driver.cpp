@@ -536,18 +536,32 @@ int main(int argc, char** argv) {
         return 2;
     }
     int nCols = (int)traj.header.size();
-    fprintf(fc, "X,Y,Z,I,J,K,speed,spray");
-    for (int c = 8; c < nCols; ++c) fprintf(fc, ",%s", traj.header[c].c_str());
+    // kind 显式写在 spray 后面：它是"过渡段但枪没关"的标记（换行/短换面），
+    // 修正层要靠它画橙色。输入若已带 kind 列，就不要再从 c>=8 里重复带一遍。
+    fprintf(fc, "X,Y,Z,I,J,K,speed,spray,kind");
+    for (int c = 8; c < nCols; ++c) {
+        std::string h = traj.header[c];
+        for (auto& ch : h) ch = (char)tolower((unsigned char)ch);
+        if (h == "kind") continue;
+        fprintf(fc, ",%s", traj.header[c].c_str());
+    }
     fprintf(fc, ",tilt_deg,clearance_mm,clearance_tool_mm,clearance_link_mm,worst_part,link_part,"
                 "self_gap_mm,margin_deg,standoff_err_mm,lifted_mm,cond,reverted,"
                 "J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation\n");
     std::string vbuf;
+    const int nRaw = (int)traj.rawRows.size();
     for (int i = 0; i < r.count; ++i) {
         const RobotSafetyPoint& q = r.points[i];
         fprintf(fc, "%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d", q.x, q.y, q.z, q.i, q.j, q.k, q.speed, q.spray);
+        // ⚠ 越界防护是必须的，不是保险：安全层会**插补点**（步长硬上限那段把大步切成
+        // 小步），输出点数 r.count 因此常常大于输入行数 nRaw。这里原来直接写
+        // traj.rawRows[i] —— 插补一发生就越界读，实测 p047 界面口径
+        // （1212 点 → 输出 1217 点）8 次里崩 7 次（SIGSEGV），
+        // 而且崩之前读到的是随机内存，会让"输出行数"在多次运行间抖动，
+        // 对拍时被误判成算法不稳定。插补点没有对应的输入行，额外列留空。
+        const std::vector<std::string>* tok = (i < nRaw) ? &traj.rawRows[i] : nullptr;
         for (int c = 8; c < nCols; ++c) {
-            const std::vector<std::string>& tok = traj.rawRows[i];
-            fprintf(fc, ",%s", c < (int)tok.size() ? tok[c].c_str() : "");
+            fprintf(fc, ",%s", (tok && c < (int)tok->size()) ? (*tok)[c].c_str() : "");
         }
         // MSVC 的 %f 遇到 inf 会打出 "-1.#INF00"，CSV 直接不可解析；
         // 不可达点的 clearance 就是 -inf，这里必须显式写成 nan。

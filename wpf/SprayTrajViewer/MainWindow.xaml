@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:hx="http://helix-toolkit.org/wpf"
         Title="喷涂轨迹生成器 - SprayTrajViewer" Height="820" Width="1280"
-        WindowStartupLocation="CenterScreen">
+        WindowStartupLocation="CenterScreen" KeyDown="Window_KeyDown">
     <Grid>
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="380"/>
@@ -139,13 +139,34 @@
                                     <TextBox x:Name="TxtTurnFactor" Text="0.5" Padding="4"/>
                                 </DockPanel>
                                 <DockPanel Margin="0,4">
-                                    <TextBlock Text="平面拟合阈值 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBlock Text="面吸收阈值 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="离一张面多远以内的点，仍算这张面覆盖到（进轮廓/覆盖率），但不参与解平面方程。&#x0a;调大 = 小突起、小侧面算进主面，不单独成面；调小 = 更容易分离成独立面。&#x0a;生效值 = min(此值, 0.6×离面距离)：吸收的点最高 h，则该处真实净空是 离面距离−h，&#x0a;超过 0.6×离面距离 枪就会顶进材料，所以会被自动截断并在日志里提示。&#x0a;拟合精度另由点云噪声 3σ 自动决定，不再受此值影响。"/>
                                     <TextBox x:Name="TxtFlatness" Text="40" Padding="4"/>
                                 </DockPanel>
                                 <DockPanel Margin="0,4">
                                     <TextBlock Text="最小可喷宽度 (mm)" Width="150" VerticalAlignment="Center"
                                                ToolTip="重建面片最小外接矩形的短边小于此值时，判为线状/退化面：不出重建面，也不生成轨迹。&#x0a;0=关闭。默认18。&#x0a;注意：p001 的窄长板面短边约40.5mm，阈值设到40.5以上会把这块真实板面也过滤掉。"/>
                                     <TextBox x:Name="TxtMinFaceWidth" Text="18" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="换面不关枪长度 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="两个面之间的枪位直线距离短于此值时，直接连过去、**不停枪**（轨迹画橙色）；&#x0a;更长的换面仍然关枪、抬枪绕行（画蓝色）。&#x0a;0 = 关闭：换面一律关枪（旧行为）。&#x0a;另外还要求：枪轴转角 &lt; 下面那个上限、直线不擦件也不穿面。"/>
+                                    <TextBox x:Name="TxtCrossFaceGunOn" Text="80" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="换面转角上限 (°)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="换面短接时两端枪轴的夹角上限，默认 60。&#x0a;距离门放行了却还是关枪，九成是这里拦的 —— 折角件两块面夹角常见 70~90°，&#x0a;把这里调到 90 就能让它不停枪连过去（枪轴按球面插值匀速转，不是猛拧腕）。&#x0a;0 = 不判夹角（只看距离、净空、穿面）。&#x0a;无论填多少，夹角 &gt;150°（形同翻到反面喷）一律关枪。"/>
+                                    <TextBox x:Name="TxtCrossFaceTurn" Text="60" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="喷幅宽度 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="喷枪实际喷幅宽度 W（出粉量/雾化气压/喷距决定），**不是行距推出来的**。&#x0a;行距是为覆盖选出来的：L = W × (1−搭接率)。要改覆盖调行距，不要改这里。&#x0a;0 = 未提供 → 退回旧口径（由行距反推喷幅，行距 120 会推出 171mm，物理上不成立）。"/>
+                                    <TextBox x:Name="TxtFanWidth" Text="60" Padding="4"/>
+                                </DockPanel>
+                                <DockPanel Margin="0,4">
+                                    <TextBlock Text="有效喷距 (mm)" Width="150" VerticalAlignment="Center"
+                                               ToolTip="喷距上限：喷距 = 离面距离 + 点沿枪轴的弧高，超过它就喷不到（雾滴干涸、锥面扩散）。&#x0a;判覆盖时横向用喷幅半径、轴向用这个上限，**两个方向分开判**。&#x0a;0 = 不判轴向（旧口径：只按横向判，凸起 150mm 的凸台也会被判成喷得到）。"/>
+                                    <TextBox x:Name="TxtMaxSprayDist" Text="150" Padding="4"/>
                                 </DockPanel>
                                 <DockPanel Margin="0,4">
                                     <TextBlock Text="曲面升级阈值 (mm)" Width="150" VerticalAlignment="Center"/>
@@ -205,7 +226,7 @@
                                           Checked="ChkShowFixed_Changed" Unchecked="ChkShowFixed_Changed"/>
                                 <CheckBox x:Name="ChkShowMove" Content="显示空移段（蓝，枪关）"
                                           Margin="0,4,0,0" VerticalContentAlignment="Center" IsChecked="True"
-                                          ToolTip="spray=0 的过渡段：抬枪、跨面、下枪。用亮蓝色和红色喷涂段分开画（修正层里对应紫色）。&#x0a;关掉后只留喷涂段，方便检查行距/覆盖。"
+                                          ToolTip="spray=0 的过渡段：抬枪、跨面、下枪。用亮蓝色和红色喷涂段分开画（修正层里对应紫色）。&#x0a;**换行/换面但没关枪**的那几段画橙色，属于喷涂侧，不受本开关影响。&#x0a;关掉后只留喷涂段，方便检查行距/覆盖。"
                                           Checked="ChkShowMove_Changed" Unchecked="ChkShowMove_Changed"/>
 
                                 <CheckBox x:Name="ChkShowAxis" Content="显示坐标系（场景内三色轴 + 左上角指示器）"
@@ -552,6 +573,21 @@
 
             <!-- 提示条 + 图例：用 StackPanel 竖排，提示条行数变化时图例自动往下让位，不会压在一起 -->
             <StackPanel VerticalAlignment="Top" HorizontalAlignment="Left" Margin="12">
+                <!-- 视野控制：常驻按钮，不放右键菜单 —— "点云找不到/放大后不见了"是
+                     最高频的求助，按钮必须一眼看见、闭着眼睛能点。
+                     「复位视野」保持当前观察方向只把镜头拉回来（消失时点它最自然）；
+                     「等轴视角」切到固定方向，用来回到一个"每次一样"的基准视角。 -->
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,0,0,6">
+                    <Button x:Name="BtnResetView" Content="复位视野" Click="BtnResetView_Click"
+                            Padding="12,4" FontSize="12" FontWeight="SemiBold"
+                            Background="#FF2563EB" Foreground="White" BorderThickness="0"
+                            ToolTip="把镜头拉回到能看全整个场景的距离，保持当前观察方向不变。&#x0a;点云不见了、放大钻进工件里、只剩半个点云时，点这个就回来。&#x0a;快捷键：F 或 Home"/>
+                    <Button x:Name="BtnIsoView" Content="等轴视角" Click="BtnIsoView_Click"
+                            Margin="6,0,0,0" Padding="12,4" FontSize="12"
+                            Background="#FF374151" Foreground="White" BorderThickness="0"
+                            ToolTip="切回固定的等轴方向（每次看到同一面），并按场景包围盒重新取景。&#x0a;快捷键：I"/>
+                </StackPanel>
+
                 <Border Background="#66000000" Padding="10" CornerRadius="6" HorizontalAlignment="Left">
                     <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
                 </Border>
@@ -574,13 +610,17 @@
                     <StackPanel>
                         <StackPanel Orientation="Horizontal">
                             <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#FF3020" VerticalAlignment="Center"/>
-                            <TextBlock Text="喷涂（枪开）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,14,0" VerticalAlignment="Center"/>
+                            <TextBlock Text="喷涂（枪开）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,12,0" VerticalAlignment="Center"/>
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#FFA028" VerticalAlignment="Center"/>
+                            <TextBlock Text="换行/换面（枪没关）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,12,0" VerticalAlignment="Center"/>
                             <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#40B0F0" VerticalAlignment="Center"/>
-                            <TextBlock Text="空移（枪关，抬枪/跨面/下枪）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,0,0" VerticalAlignment="Center"/>
+                            <TextBlock Text="空移（枪关）" Foreground="#E5E7EB" FontSize="11" Margin="6,0,0,0" VerticalAlignment="Center"/>
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
                             <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#4ADE80" VerticalAlignment="Center"/>
-                            <TextBlock Text="修正后喷涂" Foreground="#9CA3AF" FontSize="11" Margin="6,0,14,0" VerticalAlignment="Center"/>
+                            <TextBlock Text="修正后喷涂" Foreground="#9CA3AF" FontSize="11" Margin="6,0,12,0" VerticalAlignment="Center"/>
+                            <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#FFA028" VerticalAlignment="Center"/>
+                            <TextBlock Text="修正后过渡（枪没关）" Foreground="#9CA3AF" FontSize="11" Margin="6,0,12,0" VerticalAlignment="Center"/>
                             <Rectangle Width="20" Height="4" RadiusX="2" RadiusY="2" Fill="#C084FC" VerticalAlignment="Center"/>
                             <TextBlock Text="修正后空移" Foreground="#9CA3AF" FontSize="11" Margin="6,0,0,0" VerticalAlignment="Center"/>
                         </StackPanel>

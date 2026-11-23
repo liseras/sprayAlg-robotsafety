@@ -34,6 +34,21 @@ namespace SprayTrajViewer
         // 最小可喷面宽度 mm：重建面片最小外接矩形短边 < 此值 → 判为线状/退化面，
         // 不输出重建面、不生成轨迹。<=0 关闭。默认 18。
         public double minFaceWidth;
+        // 换面不关枪的长度上限 mm（枪位直线距离）。<=0 = 关闭（换面一律关枪，旧行为）。
+        // 短于它、且两端姿态夹角 <60°、直线不擦件/不穿面 → 直接连过去不停枪，
+        // 轨迹点的 kind=1（查看器画橙色）；更长的换面仍旧关枪（蓝）。
+        public double crossFaceGunOnLen;
+        // 换面不关枪的枪轴转角上限（度）。默认 60。
+        // 距离门放行了却仍关枪时，九成是这里拦的 —— 折角件两块面夹角常见 70~90°。
+        // <=0 = 不判夹角。
+        public double crossFaceMaxTurnDeg;
+        // 喷幅宽度 mm —— **独立工艺量，不由行距反推**。
+        // 喷幅由出粉量/雾化气压/喷距决定；行距是为覆盖效果选出来的（L = W(1-搭接率)）。
+        // <=0 = 未提供 → 退回旧的"由行距反推"口径（保持既有行为）。
+        public double fanWidth;
+        // 有效喷距上限 mm —— 喷距 = standoff + 点沿枪轴的弧高，超过就喷不到
+        // （雾滴干涸、锥面扩散）。<=0 = 不判轴向（旧口径，只按横向喷幅判覆盖）。
+        public double maxSprayDist;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -43,6 +58,11 @@ namespace SprayTrajViewer
         public double i, j, k;
         public double speed;
         public int spray;
+        // 换面标记：0=普通点（**换行也算 0** —— 行末掉头是正常连续喷涂，不标色）；
+        // 1=**换面**短接（spray=1 但不算布行，查看器画橙色）。
+        // 换面才有关枪/不关枪这个需要区分的语义，关枪的那种走 spray=0 画蓝色。
+        // 占的是结构体末尾对齐填充，sizeof 仍是 64，与 C++ 侧一致。
+        public int kind;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -193,6 +213,9 @@ namespace SprayTrajViewer
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
         public double[] theta;       // 关节角（度）
         public int    spray;
+        // 过渡标记（0=布行本体；1=换行/短换面过渡，枪没关），由 C++ 原样透传。
+        // 只影响配色，不参与任何安全判据或开关枪语义。
+        public int    kind;
         public int    ikOk;
         public int    reverted;
         public uint   violation;

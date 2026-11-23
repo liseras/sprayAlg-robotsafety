@@ -38,7 +38,7 @@ REM string literals. Without it MSVC decodes them as GBK and emits C4819.
 set CFLAGS=/nologo /std:c++17 /EHsc /O2 /MD /utf-8 /DNDEBUG /DSPRAYTRAJ_EXPORTS /I"%SRC%"
 
 echo [1/3] SprayTraj.dll
-"%BIN%\cl.exe" %CFLAGS% /LD /Fe:"%OUT%\SprayTraj.dll" /Fo:"%OUT%\\" "%SRC%\spray_traj.cpp" "%SRC%\robot_safety.cpp" /link /IMPLIB:"%OUT%\SprayTraj.lib"
+"%BIN%\cl.exe" %CFLAGS% /LD /Fe:"%OUT%\SprayTraj.dll" /Fo:"%OUT%\\" "%SRC%\spray_traj.cpp" "%SRC%\robot_safety.cpp" "%SRC%\stamp.cpp" /link /IMPLIB:"%OUT%\SprayTraj.lib"
 if errorlevel 1 goto fail
 
 echo [2/3] spray_safety.exe

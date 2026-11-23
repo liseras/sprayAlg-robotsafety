@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -36,6 +36,16 @@ namespace SprayTrajViewer
         private readonly List<Visual3D> _axisVisuals = new();
         // 场景内三色轴的臂长（mm）：按工件尺寸自适应，见 RenderAxes()
         private double _axisLen = 100.0;
+
+        // ── 视野（取景 / 复位 / 裁剪面）──────────────────────────────────
+        // 场景包围盒缓存。CameraChanged 在拖拽时每帧都触发，不能每次都遍历几十万点。
+        // 数据一变（点云/面片/轨迹重画）由 InvalidateSceneBounds() 作废。
+        private Rect3D? _sceneBb;
+        private bool _sceneBbDirty = true;
+        // 防止在 CameraChanged 里改相机 → 又触发 CameraChanged → 无限递归
+        private bool _inCameraFix;
+        // 视野维护出错只记一次日志（它跑在每帧回调里，刷屏会盖住别的诊断信息）
+        private bool _viewFixWarned;
         // X/Y/Z 三色约定，场景轴与 HUD 共用一套，避免两处颜色对不上
         static readonly Color AxisColorX = Color.FromRgb(0xF2, 0x5B, 0x52);
         static readonly Color AxisColorY = Color.FromRgb(0x4A, 0xD0, 0x6A);
@@ -46,11 +56,20 @@ namespace SprayTrajViewer
         // 空移段是"过渡动作"，和有效喷涂混在一起看，根本分不清机器人到底在哪儿喷，
         // 也不方便只看空移路径判断它绕得对不对。
         private readonly List<TubeVisual3D> _moveVisuals = new();
-        // 配色统一放这里：喷涂红 / 空移亮蓝。
+        // 换面不关枪的短接段（spray=1 且 kind=1，枪**没关**）：橙色。
+        // 和红色布行分开的理由：这一段不是覆盖行 —— 它是从一个面直接挪到另一张面，
+        // 枪一直开着，但把它当"喷涂行"看会误判覆盖率（尤其横穿空中的那截直线，
+        // 看着像"喷到工件外面去了"）。
+        // ⚠ 只有**换面**才有这个色。换行（同一张面内行末掉头）是正常连续喷涂，
+        // kind=0、画红色 —— 用户 2026-11-20 明确「换面才需要换颜色，换行不需要」。
+        private readonly List<TubeVisual3D> _transVisuals = new();
+        // 配色统一放这里：喷涂红 / 空移亮蓝 / 过渡橙。
         // 空移不能用灰色 —— 点云本身是灰的，灰管子在深色背景上跟点云糊成一片，
         // 等于没标。亮蓝和点云灰、修正轨迹青（#22D3EE）、风险点红橙黄都不撞。
         static readonly Color SprayColor = Color.FromRgb(255, 48, 32);
         static readonly Color MoveColor = Color.FromRgb(64, 176, 240);
+        // 换面不关枪：橙。**只有换面**用这个色，换行画红（见 _transVisuals 注释）。
+        static readonly Color TransColor = Color.FromRgb(255, 160, 40);
         // 命令行 --keep-cloud：生成后不自动收起点云，用于"点云抽样是否正确"的验收截图
         private bool _keepCloudOnGenerate;
         // 自动导出目录的解析结果：点云目录不可写（安全软件拦桌面、只读盘）时回退到程序目录，
@@ -70,9 +89,12 @@ namespace SprayTrajViewer
             // 左上角坐标轴指示器随视角转：相机一动就重投影三个世界轴。
             // 订阅 CameraChanged 而不是每帧渲染回调 —— 后者在拖拽时每帧都触发，
             // 会把 WPF 布局线程拖住（这个 Canvas 每帧重建几十个 Shape）。
-            Viewport.CameraChanged += (_, _) => UpdateAxisHud();
+            //
+            // 同一个回调里还要维护视野：近/远裁剪面按相机当前位置重算，
+            // 相机钻到工件内部时顶回表面。详见「视野：自动取景 / 复位」那段。
+            Viewport.CameraChanged += (_, _) => OnCameraChanged();
             // ABI 自检：与 C++ `spray_safety.exe --abi` 打印的 sizeof 对齐
-            // （Plane=18664 Point=64 Result=298744 Params=160；SafetyParams=160 SafetyPoint=216 SafetyResult=304）
+            // （Plane=18664 Point=64 Result=298744 Params=168；SafetyParams=160 SafetyPoint=224 SafetyResult=304）
             try
             {
                 App.Log("ABI", null,
@@ -306,6 +328,7 @@ namespace SprayTrajViewer
             if (o.TryGetValue("ee", out v)) TxtEdgeExtend.Text = v;
             if (o.TryGetValue("ea", out v)) TxtEdgeExtendAcross.Text = v;
             if (o.TryGetValue("st", out v)) TxtShellThick.Text = v;
+            if (o.TryGetValue("xface", out v)) TxtCrossFaceGunOn.Text = v;
             if (o.TryGetValue("speed", out v)) TxtSpeed.Text = v;
             if (o.TryGetValue("turn", out v)) TxtTurnFactor.Text = v;
             if (o.TryGetValue("flat", out v)) TxtFlatness.Text = v;
@@ -1415,8 +1438,10 @@ namespace SprayTrajViewer
 
             foreach (var t in _trajVisuals) Viewport.Children.Remove(t);
             foreach (var t in _moveVisuals) Viewport.Children.Remove(t);
+            foreach (var t in _transVisuals) Viewport.Children.Remove(t);
             _trajVisuals.Clear();
             _moveVisuals.Clear();
+            _transVisuals.Clear();
 
             // 风险点与修正层也是按**上一次的坐标系**烘死进 Viewport 的，
             // 只清轨迹会留下一团红点/绿线停在旧位置 —— 换坐标系时尤其明显
@@ -1426,9 +1451,11 @@ namespace SprayTrajViewer
             if (_fixedSprayVisual != null) { Viewport.Children.Remove(_fixedSprayVisual); _fixedSprayVisual = null; }
             if (_fixedMoveVisual != null) { Viewport.Children.Remove(_fixedMoveVisual); _fixedMoveVisual = null; }
             if (_fixedDroppedVisual != null) { Viewport.Children.Remove(_fixedDroppedVisual); _fixedDroppedVisual = null; }
+            if (_fixedTransVisual != null) { Viewport.Children.Remove(_fixedTransVisual); _fixedTransVisual = null; }
 
             TxtResult.Text = "";
             TxtSafetyInline.Text = "尚未评估（" + reason + "，请重新生成轨迹）";
+            InvalidateSceneBounds();   // 轨迹没了，包围盒要收缩回点云/面片
             App.Log("INVALIDATE", null, reason + " → 已清除旧轨迹与评估结果");
         }
 
@@ -1465,7 +1492,13 @@ namespace SprayTrajViewer
             // 每次重画都重设取景：这个函数只在"点云换了"或"坐标系换了"时被调用，
             // 两种情况下旧镜头都不再适用（换坐标系时工件整体平移约 1.5 米并转 90° 级，
             // 保住旧镜头会让人看到一片空白，以为程序挂了）。
-            Viewport.ZoomExtents(200);
+            //
+            // 这里**不能**用 Viewport.ZoomExtents()：它只遍历 Visual3D.Bounds，
+            // 而点云是 PointsVisual3D（ScreenSpaceVisual3D，内容画在 DrawingVisual 里），
+            // 拿不到 Bounds —— 场景里唯一被它看见的是 600×600 网格线，
+            // 取景自然对不上点云，加载完经常一片空白。改成按真实几何取景。
+            InvalidateSceneBounds();
+            FitSceneView(keepDirection: false);
             // 坐标轴要在 ZoomExtents **之后**画：轴本身伸出工件包围盒 22%，
             // 若先加进去，ZoomExtents 会把轴也算进范围，画面被无谓地拉远一圈。
             RenderAxes();
@@ -1502,6 +1535,18 @@ namespace SprayTrajViewer
                 edgeExtend     = ParseDouble(TxtEdgeExtend.Text, -1),
                 edgeExtendAcross = ParseDouble(TxtEdgeExtendAcross.Text, -1),
                 shellThick     = ParseDouble(TxtShellThick.Text, 0),
+                // 换面不关枪长度：短于它的换面直接连过去、枪不停（橙色过渡）；
+                // 更长的换面仍按老口径关枪抬枪（蓝色）。0 = 关闭，换面一律关枪。
+                crossFaceGunOnLen = ParseDouble(TxtCrossFaceGunOn.Text, 80),
+                // 换面枪轴转角上限：距离门放行了却仍关枪，九成是这里拦的
+                // （折角件两面夹角常见 70~90°）。0 = 不判夹角。
+                crossFaceMaxTurnDeg = ParseDouble(TxtCrossFaceTurn.Text, 60),
+                // 喷幅：独立工艺量，由出粉量/雾化/喷距定，**不由行距反推**。
+                // 0 = 未提供 → 退回旧的"由行距反推"口径。
+                fanWidth       = ParseDouble(TxtFanWidth.Text, 0),
+                // 有效喷距上限：喷距超过它就喷不到（雾滴干涸/锥面扩散）。
+                // 0 = 不判轴向（旧口径，只按横向喷幅判覆盖）。
+                maxSprayDist   = ParseDouble(TxtMaxSprayDist.Text, 0),
             };
 
             // ---------- 步骤 2：填"空移让开方向" ----------
@@ -1658,17 +1703,22 @@ namespace SprayTrajViewer
             // 移除旧轨迹（保留点云与平面）
             foreach (var t in _trajVisuals) Viewport.Children.Remove(t);
             foreach (var t in _moveVisuals) Viewport.Children.Remove(t);
+            foreach (var t in _transVisuals) Viewport.Children.Remove(t);
             _trajVisuals.Clear();
             _moveVisuals.Clear();
+            _transVisuals.Clear();
+            InvalidateSceneBounds();   // 轨迹变了，包围盒要重算
 
             // 按"段"分类，而不是按"点"分类：
-            //   只有【两端都是 spray=1】的段才算喷涂段（红色）；
-            //   只要有一端是 spray=0，这一段就是空移（灰色）。
+            //   两端都 spray=1 且都 kind=0 → 喷涂行（红）。换行也算这里 ——
+            //     同一张面内行末掉头是正常连续喷涂，不该标色。
+            //   两端都 spray=1 且有 kind=1 → **换面**过渡，枪没关（橙）
+            //   只要有一端 spray=0 → 空移（蓝，枪关）
             // 为什么：关枪/开枪发生在点上，枪在 A→B 这一段上的状态是"关"。
             // 早先按点分类，会把"抬枪上升"和"下降到首喷点"这两段染成红色，看着像喷着飞过去。
             const double breakDist = 15.0;   // 相邻点距约 4mm，超过 15mm 视为断开（不应出现）
 
-            var runCls = new List<int>();                 // 1=喷涂 0=空移
+            var runCls = new List<int>();                 // 0=空移 1=喷涂行 2=换面(枪开)
             var runPts = new List<List<Point3D>>();
             List<Point3D> acc = null;
             int accCls = -1;
@@ -1684,7 +1734,10 @@ namespace SprayTrajViewer
                 double d = (b - a).Length;
                 if (d < 1e-6) continue;                    // 重复点
 
-                int cls = (traj[i].spray == 1 && traj[i - 1].spray == 1) ? 1 : 0;
+                int cls;
+                if (traj[i].spray == 0 || traj[i - 1].spray == 0) cls = 0;
+                // 两端取较大的 kind：接缝处一端是本体、一端是换面过渡，按过渡画（枪没关）
+                else cls = Math.Max(traj[i].kind, traj[i - 1].kind) != 0 ? 2 : 1;
                 bool jump = d > breakDist;
 
                 if (acc == null || cls != accCls || jump)
@@ -1699,28 +1752,37 @@ namespace SprayTrajViewer
 
             for (int i = 0; i < runPts.Count; i++)
             {
-                bool spraying = runCls[i] == 1;
-                // 空移段也画出来（不能跳点），但配色/粗细和喷涂段分开：
-                //   喷涂：红、粗 2.5 —— 有效动作
-                //   空移：亮蓝、细 1.7 —— 过渡动作（抬枪/跨面/下枪），比原来的灰更容易看见
+                int cls = runCls[i];
+                // 三种段各自的配色/粗细：
+                //   喷涂行：红、粗 2.5 —— 有效动作（含换行掉头，那是正常连续喷涂）
+                //   换面过渡（枪开）：橙、2.2 —— 跨到另一块料，不覆盖但枪没停
+                //   空移（枪关）：亮蓝、1.7 —— 过渡动作（抬枪/跨面/下枪）
                 var tube = new TubeVisual3D
                 {
                     Path = new Point3DCollection(runPts[i]),
-                    Diameter = spraying ? 2.5 : 1.7,
-                    Fill = new SolidColorBrush(spraying ? SprayColor : MoveColor),
-                    ThetaDiv = spraying ? 12 : 10
+                    Diameter = cls == 1 ? 2.5 : (cls == 2 ? 2.2 : 1.7),
+                    Fill = new SolidColorBrush(cls == 1 ? SprayColor : (cls == 2 ? TransColor : MoveColor)),
+                    ThetaDiv = cls == 1 ? 12 : 10
                 };
-                if (spraying) _trajVisuals.Add(tube); else _moveVisuals.Add(tube);
+                if (cls == 1) _trajVisuals.Add(tube);
+                else if (cls == 2) _transVisuals.Add(tube);
+                else _moveVisuals.Add(tube);
             }
             foreach (var t in _trajVisuals) Viewport.Children.Add(t);
+            foreach (var t in _transVisuals) Viewport.Children.Add(t);
             foreach (var t in _moveVisuals) Viewport.Children.Add(t);
 
-            Viewport.ZoomExtents(0);   // 立即取景到全部内容
+            // 立即取景到全部内容。保持当前方向：刚生成完轨迹时用户往往已经
+            // 转到某个面在盯，硬切 iso 会很突兀；只把镜头拉到"能看全"的距离。
+            FitSceneView(keepDirection: true);
             ApplyTrajVisibility();
 
             App.Log("TRAJ", null,
-                $"段数={runPts.Count}（喷涂 {runCls.Count(c => c == 1)} / 空移 {runCls.Count(c => c == 0)}，" +
-                $"空移点 {traj.Count(p => p.spray != 1)}/{traj.Count}）");
+                $"段数={runPts.Count}（喷涂 {runCls.Count(c => c == 1)} / 换面 {runCls.Count(c => c == 2)} / " +
+                $"空移 {runCls.Count(c => c == 0)}，" +
+                $"换面点 {traj.Count(p => p.spray != 0 && p.kind != 0)} / " +
+                $"空移点 {traj.Count(p => p.spray == 0)}" +
+                $"/{traj.Count}）");
         }
 
         // 记录 C++ 侧实际交过来的面片几何：用于区分"算法分错了"还是"查看器画错了"
@@ -1860,6 +1922,7 @@ namespace SprayTrajViewer
             // 精确移除旧平面（只删平面的 ModelVisual3D，不动点云/轨迹）
             foreach (var v in _planeVisuals) Viewport.Children.Remove(v);
             _planeVisuals.Clear();
+            InvalidateSceneBounds();   // 面片顶点参与包围盒
 
             if (!ChkShowPlane.IsChecked.GetValueOrDefault()) return;
             foreach (var p in _planes)
@@ -1969,14 +2032,16 @@ namespace SprayTrajViewer
         }
 
         /// <summary>
-        /// 写原始轨迹 CSV（8 列，与本仓 spray_driver 同口径）。
+        /// 写原始轨迹 CSV（9 列，与本仓 spray_driver 同口径）。
         /// 传进来的 <paramref name="traj"/> 必须已经在**目标坐标系**里了（见 ExportPose）。
+        /// 第 9 列 kind：0=布行本体，1=换行/短换面过渡（枪没关）。下游 spray_safety 会
+        /// 原样透传到 _safe.csv，查看器据此把换面过渡画成橙色。
         /// </summary>
         static void WriteTrajCsv(string path, List<SprayTrajPoint> traj)
         {
-            var sb = new System.Text.StringBuilder("X,Y,Z,I,J,K,speed,spray\n");
+            var sb = new System.Text.StringBuilder("X,Y,Z,I,J,K,speed,spray,kind\n");
             foreach (var p in traj)
-                sb.Append($"{p.x:F3},{p.y:F3},{p.z:F3},{p.i:F4},{p.j:F4},{p.k:F4},{p.speed:F1},{p.spray}\n");
+                sb.Append($"{p.x:F3},{p.y:F3},{p.z:F3},{p.i:F4},{p.j:F4},{p.k:F4},{p.speed:F1},{p.spray},{p.kind}\n");
             System.IO.File.WriteAllText(path, sb.ToString());
         }
 
@@ -2806,6 +2871,9 @@ namespace SprayTrajViewer
         // 合成一条的话空移段就会跟喷涂段同色，"哪一段是空走"在修正层就看不出来了。
         private LinesVisual3D? _fixedSprayVisual;
         private LinesVisual3D? _fixedMoveVisual;
+        // 修正后的换行/短换面过渡（枪没关、但不是覆盖行）：橙。
+        // 和原轨迹层的橙色同一个语义，只是加在修正层上。
+        private LinesVisual3D? _fixedTransVisual;
         // 被安全层过滤掉的喷涂线：不上绿（不执行），单独画成暗灰，
         // 让人一眼看出"哪几条线不喷"，而不是在绿线里凭空少一截还找不到原因。
         private LinesVisual3D? _fixedDroppedVisual;
@@ -3301,6 +3369,7 @@ namespace SprayTrajViewer
             if (_fixedSprayVisual != null) { Viewport.Children.Remove(_fixedSprayVisual); _fixedSprayVisual = null; }
             if (_fixedMoveVisual != null) { Viewport.Children.Remove(_fixedMoveVisual); _fixedMoveVisual = null; }
             if (_fixedDroppedVisual != null) { Viewport.Children.Remove(_fixedDroppedVisual); _fixedDroppedVisual = null; }
+            if (_fixedTransVisual != null) { Viewport.Children.Remove(_fixedTransVisual); _fixedTransVisual = null; }
             if (arr.Length == 0) return;
 
             const uint MaskLocal = RobotSafetyRule.Clearance | RobotSafetyRule.JointLimit;
@@ -3351,6 +3420,10 @@ namespace SprayTrajViewer
             // 超过 25mm 只剩"插点被闸门放弃"的真跳跃 —— 不连是对的，那正是要暴露的段。
             var sprayPts = new Point3DCollection();
             var movePts = new Point3DCollection();
+            // 修正层也要能看出"换行/短换面过渡"：这段枪没关但不是覆盖行，
+            // 和真正的喷涂行分开画，否则一整条修正轨迹全是绿的，用户没法判断
+            // 修正有没有把换面过渡挪掉。
+            var transPts = new Point3DCollection();
             var droppedPts = new Point3DCollection();
             // 可执行掩码：被过滤的喷涂线画成暗灰，不画进绿色喷涂线。
             var drawOk = BuildExecutableMask(arr);
@@ -3369,9 +3442,12 @@ namespace SprayTrajViewer
                     // 这样"下枪/抬枪"那一小截也不会被涂成喷涂色。
                     // 但被安全层拦下的喷涂段要单独归到 dropped —— 它不会被执行，
                     // 染成绿色就是在展示一条机器人不会走的线。
-                    var dst = (o0.spray == 1 && o1.spray == 1)
-                        ? ((drawOk[i - 1] && drawOk[i]) ? sprayPts : droppedPts)
-                        : movePts;
+                    // 第三态：两端都喷、但有一段 kind!=0 → 换行/短换面过渡（枪没关），
+                    // 归 trans，和覆盖行分开（原轨迹层是橙，这里也给一个橙）。
+                    Point3DCollection dst;
+                    if (o0.spray != 1 || o1.spray != 1) dst = movePts;
+                    else if (o0.kind != 0 || o1.kind != 0) dst = transPts;
+                    else dst = (drawOk[i - 1] && drawOk[i]) ? sprayPts : droppedPts;
                     // 显示坐标系：连线的端点也要搬，否则修正层会整层飘在点云外面
                     var d0 = DispP(o0.x, o0.y, o0.z);
                     var d1 = DispP(o1.x, o1.y, o1.z);
@@ -3413,6 +3489,19 @@ namespace SprayTrajViewer
                     Viewport.Children.Add(_fixedDroppedVisual);
                 }
             }
+            // 修正后的换行/短换面过渡（枪没关，非覆盖行）：橙，比喷涂细一点。
+            // 单独一个视觉对象，跟着「显示空移段」一起开关 —— 它不是覆盖行，
+            // 用户查"行距/覆盖"时应该和空移一样被藏掉。
+            if (transPts.Count > 0)
+            {
+                _fixedTransVisual = new LinesVisual3D
+                {
+                    Points = transPts,
+                    Color = Color.FromArgb(225, 255, 160, 40),   // 橙 #FFA028（与图例同色）：修正后换行/换面过渡（枪没关）
+                    Thickness = 1.4
+                };
+                Viewport.Children.Add(_fixedTransVisual);
+            }
 
             ApplyRiskVisibility();
             ApplyFixedVisibility();
@@ -3420,6 +3509,7 @@ namespace SprayTrajViewer
                 $"风险点 红={red.Count} 橙={orange.Count} 黄={nYellowDraw}/{yellowAll.Count}（抽稀）；" +
                 $"修正轨迹线段 喷涂={(_fixedSprayVisual?.Points.Count ?? 0) / 2}" +
                 $" 空移={(_fixedMoveVisual?.Points.Count ?? 0) / 2}" +
+                $" 过渡={(_fixedTransVisual?.Points.Count ?? 0) / 2}" +
                 $" 过滤={droppedPts.Count / 2}" +
                 $" · showFixed={showFixed} arrLen={arr.Length} 收集喷={sprayPts.Count / 2} 空={movePts.Count / 2} max步={dStepDbg:F1}");
         }
@@ -3460,6 +3550,8 @@ namespace SprayTrajViewer
             bool showMove = show && (ChkShowMove == null || ChkShowMove.IsChecked.GetValueOrDefault(true));
             Sync(_fixedSprayVisual, show);
             Sync(_fixedMoveVisual, showMove);
+            // 换行/短换面过渡（枪没关）不是覆盖行：查行距时要跟空移一起藏掉
+            Sync(_fixedTransVisual, showMove);
             // 被过滤的喷涂线跟喷涂段同开关：它替代的是喷涂段，关掉修正层就该一起消失
             Sync(_fixedDroppedVisual, show);
 
@@ -3583,12 +3675,12 @@ namespace SprayTrajViewer
             // 末列 sprayable：1=这条喷涂段能喷（也就能走），0=被安全层拦下。
             // 保留全部点是为了诊断——想知道"哪一片漏喷、为什么漏"，必须看得见被拦的点；
             // 真正下发给机器人的是 plan.json，那里会按 IsValid/GunOpen 把它们关掉。
-            sb.Append("X,Y,Z,I,J,K,speed,spray,tilt_deg,clearance_mm,self_gap_mm,margin_deg,")
+            sb.Append("X,Y,Z,I,J,K,speed,spray,kind,tilt_deg,clearance_mm,self_gap_mm,margin_deg,")
               .Append("standoff_err_mm,lifted_mm,cond,reverted,J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation,sprayable\n");
             for (int i = 0; i < pts.Length; i++)
             {
                 var q = pts[i];
-                sb.Append($"{q.x:F3},{q.y:F3},{q.z:F3},{q.i:F4},{q.j:F4},{q.k:F4},{q.speed:F1},{q.spray},");
+                sb.Append($"{q.x:F3},{q.y:F3},{q.z:F3},{q.i:F4},{q.j:F4},{q.k:F4},{q.speed:F1},{q.spray},{q.kind},");
                 sb.Append($"{q.tiltDeg:F2},{q.clearanceMm:F2},{q.selfGapMm:F2},{q.marginDeg:F2},");
                 sb.Append($"{q.standoffErrMm:E6},{q.liftedMm:F1},{q.cond:F1},{q.reverted}");
                 var th = q.theta ?? new double[6];
@@ -3668,6 +3760,8 @@ namespace SprayTrajViewer
                     Acc(pl.polyVerts![k * 3], pl.polyVerts[k * 3 + 1], pl.polyVerts[k * 3 + 2]);
             }
             foreach (var t in _trajVisuals)
+                foreach (var p in t.Path) Acc(p.X, p.Y, p.Z);
+            foreach (var t in _transVisuals)
                 foreach (var p in t.Path) Acc(p.X, p.Y, p.Z);
             foreach (var t in _moveVisuals)
                 foreach (var p in t.Path) Acc(p.X, p.Y, p.Z);
@@ -3882,6 +3976,299 @@ namespace SprayTrajViewer
 
         void ChkShowAxis_Changed(object sender, RoutedEventArgs e) => ApplyAxisVisibility();
 
+        // ══════════════════════════════════════════════════════════════════
+        //  视野：自动取景 / 复位 / 裁剪面维护
+        //
+        //  用户 2026-11-19 反馈的三个现象，其实是同一处的三个层次：
+        //
+        //   1) 加载点云后"找不到点云"。原来 RenderCloud 里靠 Viewport.ZoomExtents() 取景，
+        //      而这个方法只遍历 Visual3D 的 Bounds —— 点云是 PointsVisual3D
+        //      （ScreenSpaceVisual3D 子类，画在 DrawingVisual 里，Content 为空），
+        //      根本拿不到 Bounds。场景里唯一能被它"看见"的只有那块 600×600 的网格线，
+        //      于是取景完全没框住点云：点云在 1.5 米外（手眼变换后尤其明显）就一片空白。
+        //
+        //   2) 放大之后"突然消失"。滚轮缩放是沿视线推进 Camera.Position，
+        //      没有闸门时推到底就是钻进工件内部，整个点云都跑到镜头背后。
+        //
+        //   3) "只能看到一半点云"。NearPlaneDistance 是取景那一刻按距离算死的一个值，
+        //      之后缩放不再更新。相机越近，近裁剪面切掉的越多，看起来就是从中间被割开。
+        //
+        //  对策：自己算包围盒（ComputeSceneBounds 早就有，遍历点云/面片/轨迹），
+        //  按 8 个角点解出"刚好装下"的相机距离；相机每次变化都重算 near/far；
+        //  相机进包围盒就顶回最近的表面；再给一个常驻的「复位视野」按钮。
+        // ══════════════════════════════════════════════════════════════════
+
+        void InvalidateSceneBounds()
+        {
+            _sceneBbDirty = true;
+            _sceneBb = null;
+        }
+
+        /// <summary>
+        /// 带缓存的场景包围盒。CameraChanged 每帧都会问，不能每次都遍历点云。
+        /// </summary>
+        Rect3D? SceneBounds()
+        {
+            if (!_sceneBbDirty && _sceneBb is Rect3D cached) return cached;
+            _sceneBb = ComputeSceneBounds();
+            _sceneBbDirty = false;
+            return _sceneBb;
+        }
+
+        static Vector3D DefaultViewDir()
+        {
+            var d = new Vector3D(-0.55, -0.72, 0.42);   // 与 ApplyViewPreset 的 iso 同一方向
+            d.Normalize();
+            return d;
+        }
+
+        /// <summary>点到轴对齐包围盒的最短距离；点在盒内时为 0。</summary>
+        static double DistanceToBox(Point3D p, Rect3D r)
+        {
+            double dx = Math.Max(Math.Max(r.X - p.X, 0.0), p.X - (r.X + r.SizeX));
+            double dy = Math.Max(Math.Max(r.Y - p.Y, 0.0), p.Y - (r.Y + r.SizeY));
+            double dz = Math.Max(Math.Max(r.Z - p.Z, 0.0), p.Z - (r.Z + r.SizeZ));
+            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        /// <summary>
+        /// 按相机当前位置重算近/远裁剪面。
+        ///
+        /// 近裁剪面是"只能看到一半点云"的根因：取景时按当时的距离算下一个值，
+        /// 之后滚轮把相机推近，这个值却不动，于是贴着镜头那一层点被整片裁掉。
+        /// 改成：near 永远取「相机到场景表面距离」的一部分，相机越近它越小。
+        /// </summary>
+        void RefreshClipPlanes(ProjectionCamera cam, Rect3D r, Point3D center)
+        {
+            double d = (cam.Position - center).Length;
+            double span = Math.Max(r.SizeX, Math.Max(r.SizeY, Math.Max(r.SizeZ, 1.0)));
+            double rad = 0.5 * Math.Sqrt(r.SizeX * r.SizeX + r.SizeY * r.SizeY + r.SizeZ * r.SizeZ);
+            double gap = DistanceToBox(cam.Position, r);   // 相机到场景表面的距离，盒内=0
+
+            // 盒外：near 不超过表面距离的 75%（留余量给"表面附近那一薄层"），
+            //       同时不超过相机距离的 2%（远处观察时别为了 near 小丢掉深度精度）。
+            // 盒内：near 取下限 0.02，否则近处整片消失。
+            double near = gap > 1e-6 ? Math.Min(d * 0.02, gap * 0.75) : 0.02;
+            near = Math.Max(0.02, near);
+            // 极端情况（相机几乎贴到场景中心）：near 不能大过相机到中心的距离，
+            // 否则连中心都被切掉。
+            near = Math.Min(near, Math.Max(0.02, d * 0.5));
+
+            double far = d + rad * 3.0 + span * 2.0;
+            far = Math.Max(far, near * 100.0);
+
+            // 只在真的变了才赋值：这两个属性一改就会触发 CameraChanged，
+            // 每帧无谓地写一遍会让拖拽发涩。
+            if (Math.Abs(cam.NearPlaneDistance - near) > 1e-3) cam.NearPlaneDistance = near;
+            if (Math.Abs(cam.FarPlaneDistance - far) > 1e-3) cam.FarPlaneDistance = far;
+        }
+
+        /// <summary>
+        /// 相机钻进场景包围盒时，把它顶回最近的表面。
+        /// 滚轮缩放是沿视线推进 Position，没这道闸门推到底就是穿模 —— 屏幕只剩背景色，
+        /// 用户以为点云丢了。顶回之后表现为"放大到底就停住"，这是 CAD 里的常规手感。
+        /// </summary>
+        bool PushCameraOutOfScene(ProjectionCamera cam, Rect3D r)
+        {
+            var p = cam.Position;
+            double x0 = r.X, x1 = r.X + r.SizeX;
+            double y0 = r.Y, y1 = r.Y + r.SizeY;
+            double z0 = r.Z, z1 = r.Z + r.SizeZ;
+            if (!(p.X > x0 && p.X < x1 && p.Y > y0 && p.Y < y1 && p.Z > z0 && p.Z < z1))
+                return false;
+
+            // 六个面里挑最近的一个推出去；多留 0.5mm，避免正好压在面上又被裁掉
+            const double pad = 0.5;
+            double[] dist = { p.X - x0, x1 - p.X, p.Y - y0, y1 - p.Y, p.Z - z0, z1 - p.Z };
+            double best = double.MaxValue; int axis = 0, side = 0;
+            for (int i = 0; i < 6; i++)
+                if (dist[i] < best) { best = dist[i]; axis = i / 2; side = i % 2; }
+
+            double nx = p.X, ny = p.Y, nz = p.Z;
+            if (axis == 0) nx = side == 0 ? x0 - pad : x1 + pad;
+            else if (axis == 1) ny = side == 0 ? y0 - pad : y1 + pad;
+            else nz = side == 0 ? z0 - pad : z1 + pad;
+
+            cam.Position = new Point3D(nx, ny, nz);
+            return true;
+        }
+
+        /// <summary>
+        /// 相机变化的统一入口：维护裁剪面、防穿模，最后刷新轴向指示器。
+        /// </summary>
+        void OnCameraChanged()
+        {
+            if (_inCameraFix) return;   // 下面改相机会再触发本事件，直接放行避免递归
+            _inCameraFix = true;
+            try
+            {
+                if (Viewport.Camera is ProjectionCamera cam
+                    && SceneBounds() is Rect3D r && !r.IsEmpty)
+                {
+                    var center = new Point3D(r.X + r.SizeX / 2, r.Y + r.SizeY / 2, r.Z + r.SizeZ / 2);
+                    if (PushCameraOutOfScene(cam, r))
+                        App.Log("VIEW", null, "相机推到工件内部 → 已顶回表面（否则点云会整片消失）");
+                    RefreshClipPlanes(cam, r, center);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 视野维护跑在每帧的相机回调里，绝不能因为它把整个程序带崩。
+                // 只记第一次：真出问题时一次堆栈就够定位，刷屏反而盖住别的日志。
+                if (!_viewFixWarned)
+                {
+                    _viewFixWarned = true;
+                    App.Log("VIEW/FAIL", ex);
+                }
+            }
+            finally { _inCameraFix = false; }
+            UpdateAxisHud();
+        }
+
+        /// <summary>
+        /// 把相机摆到"整个场景刚好装满画面"的位置。
+        ///
+        /// keepDirection = true：保留当前视线与朝上方向，只改距离和中心 —— 「复位视野」用。
+        ///   点云消失时点它，视角不跳、只是退回到能看全的地方。
+        /// keepDirection = false：切到固定等轴方向 —— 换点云/换坐标系后用，
+        ///   保证每次看到的是同一面（便于前后两次结果对照）。
+        ///
+        /// 距离不是拍脑袋估的：把包围盒 8 个角点投到相机的 right/up 基上，
+        /// 解出"每个角点都落在视锥内"所需的最小距离，取最大值。
+        /// 这样既不会装不下，也不会无谓地拉远。
+        /// </summary>
+        void FitSceneView(bool keepDirection)
+        {
+            if (Viewport.Camera is not ProjectionCamera cur) return;
+
+            var bb = SceneBounds();
+            if (bb is not Rect3D r || r.IsEmpty)
+            {
+                TxtHint.Text = "场景里还没有内容：先加载点云";
+                App.Log("VIEW/WARN", null, "场景为空，跳过取景");
+                return;
+            }
+
+            var center = new Point3D(r.X + r.SizeX / 2, r.Y + r.SizeY / 2, r.Z + r.SizeZ / 2);
+            double span = Math.Max(r.SizeX, Math.Max(r.SizeY, r.SizeZ));
+            if (span < 1e-6) span = 1.0;
+
+            Vector3D dir = (keepDirection && cur.LookDirection.Length > 1e-9)
+                ? cur.LookDirection : DefaultViewDir();
+            if (dir.Length < 1e-9) dir = DefaultViewDir();
+            dir.Normalize();
+
+            // 上方向：复位时沿用当前 up，画面完全不跳；否则视线接近竖直就用 Y 当上
+            Vector3D up = (keepDirection && cur.UpDirection.Length > 1e-9)
+                ? cur.UpDirection
+                : (Math.Abs(dir.Z) > 0.98 ? new Vector3D(0, 1, 0) : new Vector3D(0, 0, 1));
+            up -= dir * Vector3D.DotProduct(up, dir);            // 施密特正交化
+            if (up.Length < 1e-9)
+                up = Math.Abs(dir.Z) > 0.98 ? new Vector3D(0, 1, 0) : new Vector3D(0, 0, 1);
+            up.Normalize();
+
+            var view = -dir;                                     // 屏幕外 → 里
+            var right = Vector3D.CrossProduct(up, view);
+            if (right.Length < 1e-9) right = new Vector3D(1, 0, 0);
+            right.Normalize();
+            up = Vector3D.CrossProduct(view, right);
+            up.Normalize();
+
+            // 8 个角点在相机基上的最大水平/垂直偏移，以及"比中心更靠近相机"的最大突出量
+            double maxH = 0, maxV = 0, nearAhead = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                var q = new Vector3D(
+                    (i & 1) == 0 ? r.X : r.X + r.SizeX,
+                    (i & 2) == 0 ? r.Y : r.Y + r.SizeY,
+                    (i & 4) == 0 ? r.Z : r.Z + r.SizeZ);
+                q -= new Vector3D(center.X, center.Y, center.Z);
+                double h = Math.Abs(Vector3D.DotProduct(q, right));
+                double v = Math.Abs(Vector3D.DotProduct(q, up));
+                double a = -Vector3D.DotProduct(q, dir);          // 正值 = 更靠近相机
+                if (h > maxH) maxH = h;
+                if (v > maxV) maxV = v;
+                if (a > nearAhead) nearAhead = a;
+            }
+
+            var vp = Viewport.Viewport;
+            double aspect = (vp != null && vp.ActualWidth > 1 && vp.ActualHeight > 1)
+                ? vp.ActualWidth / vp.ActualHeight : 1.6;
+
+            ProjectionCamera newCam;
+            if (cur is OrthographicCamera)
+            {
+                // 正交与距离无关：宽度取水平/垂直两个方向里更紧的那个，留 8% 边
+                double width = Math.Max(2 * maxH, 2 * maxV * aspect) * 1.08;
+                double back = span * 4.0 + 1000.0;
+                newCam = new OrthographicCamera
+                {
+                    Position = center - dir * back,
+                    LookDirection = dir * back,
+                    UpDirection = up,
+                    Width = Math.Max(width, 1.0),
+                    NearPlaneDistance = 1.0,
+                    FarPlaneDistance = back * 4.0,
+                };
+            }
+            else
+            {
+                double fov = (cur as PerspectiveCamera)?.FieldOfView ?? 45.0;
+                double tanV = Math.Tan(fov * Math.PI / 360.0);
+                double tanH = tanV * aspect;
+                // 深度 = dist + dot(q,dir) ⟹ 要求 |v| ≤ tanV·(dist−nearAhead)
+                double dist = Math.Max(maxV / Math.Max(tanV, 1e-6), maxH / Math.Max(tanH, 1e-6)) + nearAhead;
+                dist = Math.Max(dist * 1.08, span * 0.6);
+                newCam = new PerspectiveCamera
+                {
+                    Position = center - dir * dist,
+                    LookDirection = dir * dist,
+                    UpDirection = up,
+                    FieldOfView = fov,
+                    NearPlaneDistance = Math.Max(0.05, (dist - nearAhead) * 0.5),
+                    FarPlaneDistance = dist + span * 4.0,
+                };
+                App.Log("VIEW", null,
+                    $"取景({(keepDirection ? "保持方向" : "等轴")}) dist={dist:F1} " +
+                    $"水平半宽={maxH:F1} 竖直半高={maxV:F1} 前沿={nearAhead:F1}");
+            }
+
+            Viewport.Camera = newCam;
+            // 上面的 near/far 是按估算距离给的粗值，这里按实际位置再精算一次
+            RefreshClipPlanes(newCam, r, center);
+            UpdateAxisHud();
+
+            TxtHint.Text = keepDirection
+                ? $"视野已复位：跨度 {span:F0}mm，当前方向不变"
+                : $"已切到等轴视角：跨度 {span:F0}mm";
+            App.Log("VIEW", null,
+                $"场景包围盒 {r.SizeX:F1}x{r.SizeY:F1}x{r.SizeZ:F1}mm，" +
+                $"中心=({center.X:F1},{center.Y:F1},{center.Z:F1})");
+        }
+
+        void BtnResetView_Click(object sender, RoutedEventArgs e) => FitSceneView(keepDirection: true);
+
+        void BtnIsoView_Click(object sender, RoutedEventArgs e) => FitSceneView(keepDirection: false);
+
+        /// <summary>
+        /// 快捷键：F / Home 复位视野，I 切等轴视角。
+        /// 输入框里打字不能触发，否则填参数时按个 i 画面就飞了。
+        /// </summary>
+        void Window_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (Keyboard.FocusedElement is System.Windows.Controls.TextBox) return;
+            if (e.Key == Key.F || e.Key == Key.Home)
+            {
+                FitSceneView(keepDirection: true);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.I)
+            {
+                FitSceneView(keepDirection: false);
+                e.Handled = true;
+            }
+        }
+
         /// <summary>
         /// 相机预设：让界面验证可复现（同一样本每次都用同一视角截图）。
         /// 轴向视图（top/front/side）用正交相机：轨迹悬在离面 standoff 处，
@@ -4045,6 +4432,14 @@ namespace SprayTrajViewer
             // 空移段可以单独关掉：只想看"真正喷涂的那几行"时，蓝线会挡视线
             bool showMove = show && ChkShowMove.IsChecked.GetValueOrDefault(true);
             foreach (var t in _trajVisuals)
+            {
+                bool inTree = Viewport.Children.Contains(t);
+                if (show && !inTree) Viewport.Children.Add(t);
+                else if (!show && inTree) Viewport.Children.Remove(t);
+            }
+            // 橙色换面段 = 枪没关的那部分，属于"喷涂"侧：跟着「显示轨迹」走，
+            // 不受「显示空移段」影响（那个开关只关 blue 的关枪段）。
+            foreach (var t in _transVisuals)
             {
                 bool inTree = Viewport.Children.Contains(t);
                 if (show && !inTree) Viewport.Children.Add(t);

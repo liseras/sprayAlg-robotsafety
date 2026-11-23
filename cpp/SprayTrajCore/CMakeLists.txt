@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # robot_safety.cpp：机器人可执行性校验（倾角规划 + 枪体/连杆碰撞 + IK 可达）。
 # 它与 spray_traj.cpp 各自独立：spray_traj 保证「喷得对不对」，robot_safety 保证
 # 「机器人能不能安全执行」。两者编进同一个 DLL，下游按需调用，互不污染。
-add_library(SprayTraj SHARED spray_traj.cpp robot_safety.cpp)
+add_library(SprayTraj SHARED spray_traj.cpp robot_safety.cpp stamp.cpp)
 target_include_directories(SprayTraj PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(SprayTraj PRIVATE SPRAYTRAJ_EXPORTS)
 if(MSVC)

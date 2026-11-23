@@ -8,11 +8,14 @@ rem Windows treats it as "unknown publisher" and blocks it every single build.
 rem Starting it from a console skips that hook entirely.
 rem
 rem For CLI runs (--ply / --shot / --log ...) call the exe directly instead:
-rem   bin\Release\net9.0-windows\SprayTrajViewer.exe --ply x.ply --shot y.png
+rem   bin\Release\net10.0-windows\SprayTrajViewer.exe --ply x.ply --shot y.png
+rem   （net9.0-windows 是升级目标框架前的输出目录，保留回退以防旧产物还在）
 rem ---------------------------------------------------------------------------
 setlocal
 set "ROOT=%~dp0"
-set "EXE=%ROOT%bin\Release\net9.0-windows\SprayTrajViewer.exe"
+set "EXE=%ROOT%bin\Release\net10.0-windows\SprayTrajViewer.exe"
+if not exist "%EXE%" set "EXE=%ROOT%bin\Release\net9.0-windows\SprayTrajViewer.exe"
+if not exist "%EXE%" set "EXE=%ROOT%bin\Debug\net10.0-windows\SprayTrajViewer.exe"
 if not exist "%EXE%" set "EXE=%ROOT%bin\Debug\net9.0-windows\SprayTrajViewer.exe"
 if not exist "%EXE%" (
   echo [ERROR] SprayTrajViewer.exe not found.

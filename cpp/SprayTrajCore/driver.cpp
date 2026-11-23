@@ -127,7 +127,10 @@ int main(int argc, char** argv){
     if(!read_ply(in, xyz)){ printf("读取失败(支持 ascii / binary_little_endian PLY): %s\n", in); return 1; }
     int n = (int)(xyz.size()/3);
     SprayTrajParams p = spray_traj_default_params();
-    // 可选参数：-flat <平面拟合阈值mm>  -curve <曲面升级阈值mm>
+    // 可选参数：-flat <面吸收阈值mm>  -curve <曲面升级阈值mm>
+    //   -flat = 离一张面多远以内的点仍算这张面覆盖到（进轮廓/覆盖率），不参与解平面方程；
+    //           生效值 = min(-flat, 0.6×离面距离)，超过会被截断并在日志提示。
+    //           （旧语义"平面拟合阈值"已废弃：拟合尺度固定 3mm，与 -flat 无关）
     //           -fill <孔洞填补阈值mm>  -dir <0自动/1长边/2短边>
     //           -row <行距mm>  -pt <点距mm>  -so <离面距离mm>  -sp <速度mm/s>
     //           -gc <枪体安全半径mm>（= 喷头外径/2 + 安全余量，内壁角落让枪用）
@@ -151,6 +154,17 @@ int main(int argc, char** argv){
         if(!strcmp(argv[i],"-ee"))    p.edgeExtend     = atof(argv[i+1]);
         if(!strcmp(argv[i],"-ea"))    p.edgeExtendAcross = atof(argv[i+1]);
         if(!strcmp(argv[i],"-st"))    p.shellThick     = atof(argv[i+1]);
+        // -xface <mm>：换面不关枪的长度上限。0 = 关闭（换面一律关枪）。
+        if(!strcmp(argv[i],"-xface")) p.crossFaceGunOnLen = atof(argv[i+1]);
+        // -xfaceang <deg>：换面不关枪的枪轴转角上限。默认 60。
+        //   距离门（-xface）放行了但实际仍关枪时，八成是这里拦的 —— 折角件常见 70~90°。
+        if(!strcmp(argv[i],"-xfaceang")) p.crossFaceMaxTurnDeg = atof(argv[i+1]);
+        // -fanw <mm>：喷幅宽度（**独立工艺量**，不由行距反推）。行距是为覆盖选出来的，
+        //   喷幅由出粉量/雾化/喷距定。不给 = 退回旧的"由行距反推"口径。
+        if(!strcmp(argv[i],"-fanw")) p.fanWidth = atof(argv[i+1]);
+        // -sdist <mm>：有效喷距上限。喷距 = standoff + 点沿枪轴的弧高；超过就喷不到
+        //   （雾滴干涸、锥面扩散）。0 = 不判轴向（旧口径，只按横向喷幅）。
+        if(!strcmp(argv[i],"-sdist")) p.maxSprayDist = atof(argv[i+1]);
         // -flip 1：把上游所有定向结果强制取反。用于压力测试"方向过滤"这道硬闸——
         // 人为制造一片朝向全错的输入，硬闸必须把能救的翻回来、救不回来的拒喷，
         // 绝不能出现"从背面伸枪"的轨迹。
@@ -181,6 +195,14 @@ int main(int argc, char** argv){
         p.flatnessTol, p.minFaceWidth, p.curvatureTol, p.fillHoleSize, p.scanDirMode,
         p.scanRowSpacing, p.pointSpacing, p.standoff, p.speed, p.gunClear, p.edgeExtend, p.edgeExtendAcross, p.shellThick,
         p.liftDirX, p.liftDirY, p.liftDirZ);
+    printf("工艺: 喷幅=%.1fmm(%s) 有效喷距<=%.1fmm(%s) 行距=%.1fmm\n",
+        p.fanWidth > 1.0 ? p.fanWidth : 0.0,
+        p.fanWidth > 1.0 ? "独立给定" : "未给=由行距反推",
+        p.maxSprayDist, p.maxSprayDist > 1.0 ? "已启用" : "未启用=只判横向",
+        p.scanRowSpacing);
+    printf("换面: 不关枪长度<=%.1fmm(%s) 枪轴转角<=%.0f°(%s)\n",
+        p.crossFaceGunOnLen, p.crossFaceGunOnLen > 0.0 ? "启用" : "关闭=一律关枪",
+        p.crossFaceMaxTurnDeg, p.crossFaceMaxTurnDeg > 0.0 ? "判" : "不判");
     // ABI 自检：C# 侧 Native.cs 必须逐字段一致，改结构体后对一下这三个数
     printf("[abi] sizeof Params=%zu Plane=%zu Point=%zu Result=%zu\n",
         sizeof(SprayTrajParams), sizeof(SprayTrajPlane), sizeof(SprayTrajPoint), sizeof(SprayTrajResult));
@@ -255,11 +277,18 @@ int main(int argc, char** argv){
     // CSV
     FILE* fc=fopen(outcsv,"w");
     if(!fc){ printf("无法写出 CSV: %s\n", outcsv); return 1; }
-    fprintf(fc,"X,Y,Z,I,J,K,speed,spray\n");
+    // SPRAYTRAJ_CSV_KIND=1：多写一列 kind（换行/换面过渡标记），只给调试分析用。
+    // 默认仍是 8 列，保持与 spray_driver / DensoArmKine 的既有格式一致。
+    const bool csvKind = std::getenv("SPRAYTRAJ_CSV_KIND") != nullptr;
+    fprintf(fc, csvKind ? "X,Y,Z,I,J,K,speed,spray,kind\n" : "X,Y,Z,I,J,K,speed,spray\n");
     for(int i=0;i<r.count;++i){
         SprayTrajPoint& q=r.points[i];
-        fprintf(fc,"%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d\n",
-            q.x,q.y,q.z,q.i,q.j,q.k,q.speed,q.spray);
+        if(csvKind)
+            fprintf(fc,"%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d,%d\n",
+                q.x,q.y,q.z,q.i,q.j,q.k,q.speed,q.spray,q.kind);
+        else
+            fprintf(fc,"%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d\n",
+                q.x,q.y,q.z,q.i,q.j,q.k,q.speed,q.spray);
     }
     fclose(fc);
     // PLY

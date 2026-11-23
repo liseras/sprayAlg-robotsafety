@@ -2,7 +2,16 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <!--
+      2026-11-19 从 net9.0-windows 升到 net10.0-windows。
+      原因不是要用新 API，而是**这台机器只装了 .NET SDK 10.0.403**：
+      SDK 10 的 WPF 标记编译器（PresentationBuildTasks）为 net9.0 目标写 BAML 时
+      必然报 `MC1000: 未知的生成错误"Row ID or heap offset is too large."`
+      —— 用 dotnet new wpf 的空白模板都能复现，与项目代码无关。
+      机器上 WindowsDesktop 运行时 10.0.14 已装，直接对齐即可。
+      换回 net9 的唯一前提是装 .NET 9 SDK，且要同步改回本行与 start_viewer.bat。
+    -->
+    <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
