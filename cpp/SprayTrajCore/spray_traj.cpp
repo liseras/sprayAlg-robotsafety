@@ -295,6 +295,30 @@ struct KdTree {
     // 需要"我在射线上前进时，前方有没有点"，而 KNN 只能给最近邻居：
     // 同面邻点永远是最邻近的，会把真正的远处命中挡住。所以按球收集候选，
     // 再由调用方用"沿射线的投影 + 横向偏移"筛。
+    // 沿枪轴找圆柱内第一个实测点，保留点号供覆盖归属判断。
+    int firstRayPoint(Vec3 origin, Vec3 dir, double maxDist, double radius) const {
+        double best = maxDist;
+        int hit = -1;
+        const double radius2 = radius*radius;
+        auto visit = [&](auto&& self, int id) -> void {
+            if(id < 0) return;
+            const Node& node = nodes[id];
+            const Vec3 off = Vec3{node.x, node.y, node.z} - origin;
+            const double dist = dot(off, dir);
+            if(dist >= 0.0 && dist <= best && dot(off, off) - dist*dist <= radius2 &&
+               (dist < best || hit < 0 || node.idx < hit)){
+                best = dist;
+                hit = node.idx;
+            }
+            const double coord = node.axis == 0 ? off.x : (node.axis == 1 ? off.y : off.z);
+            const double slope = node.axis == 0 ? dir.x : (node.axis == 1 ? dir.y : dir.z);
+            if(coord >= std::min(0.0, best*slope) - radius) self(self, node.left);
+            if(coord <= std::max(0.0, best*slope) + radius) self(self, node.right);
+        };
+        if(!nodes.empty()) visit(visit, 0);
+        return hit;
+    }
+
     int radiusCollect(Vec3 q, double r, int* out, int maxOut) const {
         int n = 0;
         recCollect(0, q, r*r, out, n, maxOut);
@@ -609,6 +633,11 @@ struct PlaneSeg {
     // 曲面块标记：true 时 pl 只是"平均平面"（用于定向/统计），真正的轨迹
     // 生成走曲面行追踪（gen_surface_rows），不是平面 2D 布行。
     bool curved = false;
+    // 通过缓翘曲塌缩检查，保留平面布行，仅豁免后续平面性拒喷。
+    bool collapsed = false;
+    // 载体拟合或拆层时的实测支撑点；吸收扩展覆盖后仍用它们核对当前平面。
+    std::vector<int> fitSupport;
+    bool preservedCarrier = false;   // 合并重拟合失效，沿通过校验的外侧载体布行。
     FaceOrient fo;        // 面级朝向诊断；angZ 参与轨迹生成（朝下超窗口不喷），其余只上报
     // 单层壳 / 薄壁双层：1=单层 2=双层 0=未判定；layerThick 是沿法向的分位跨度
     int    layerCnt = 0;
@@ -2238,6 +2267,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
             for(size_t i=0;i<P.size();++i)
                 if(std::fabs(dot(P[i], n) + mainPl.d) <= absorbTol) allAbs.push_back((int)i);
             PlaneSeg seg; seg.pl = mainPl; seg.inl = std::move(allAbs); seg.fixed = true;
+            seg.fitSupport = std::move(mainInl);
             fprintf(stderr, "[split] 台阶高度极差 %.2f <= curvatureTol %.2f，单一可喷面（吸收 %zu 点）\n",
                     span, curvatureTol, seg.inl.size());
             out.push_back(std::move(seg));
@@ -2430,6 +2460,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
         PlaneSeg seg;
         seg.pl = mainPl;
         seg.inl = mainAbs;
+        seg.fitSupport = std::move(mainInl);
         seg.fixed = true;                   // 平面由吸收一次定死
         fprintf(stderr, "[split] 主面入列: %zu 点（吸收集，平面冻结）\n", seg.inl.size());
         out.push_back(std::move(seg));
@@ -2451,6 +2482,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
             continue;
         }
         PlaneSeg seg; seg.pl = m.pl; seg.inl = std::move(m.inl);
+        seg.fitSupport = seg.inl;
         fprintf(stderr, "[split] 面块: 点数=%zu 法向=(%.3f,%.3f,%.3f) 种子夹角=%.1f° RMS=%.2f\n",
             seg.inl.size(), seg.pl.n.x, seg.pl.n.y, seg.pl.n.z, m.ang, rms);
         out.push_back(std::move(seg));
@@ -2513,6 +2545,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
                         fprintf(stderr, "[dbg] 侧壁并入已有面%d: +%zu 点\n", dupAt, seg.inl.size());
                     break;
                 }
+                seg.fitSupport = seg.inl;
                 fprintf(stderr, "[split] 侧壁面: 点数=%zu 法向=(%.3f,%.3f,%.3f) RMS=%.2f 与地面夹角=%.1f°\n",
                     seg.inl.size(), seg.pl.n.x, seg.pl.n.y, seg.pl.n.z, rms, angF);
                 out.push_back(std::move(seg));
@@ -2591,6 +2624,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
             fprintf(stderr, "[split] 缓翘曲/浅曲面 → 塌缩为单一可喷面\n");
             out.clear();
             PlaneSeg seg; seg.pl = mainPl;
+            seg.collapsed = true;
             seg.inl.resize(P.size()); std::iota(seg.inl.begin(), seg.inl.end(), 0);
             out.push_back(std::move(seg));
         }
@@ -2673,6 +2707,7 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
 
     if(out.empty()){
         PlaneSeg seg; seg.pl = mainPl; seg.inl = mainAbs;
+        seg.fitSupport = std::move(mainInl);
         out.push_back(std::move(seg));
     }
 
@@ -2797,12 +2832,14 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
                 for(int m : mem) if(out[m].fixed){ fixedAt = m; break; }
                 if(fixedAt >= 0){
                     seg.pl = out[fixedAt].pl;
+                    seg.fitSupport = std::move(out[fixedAt].fitSupport);
                     seg.fixed = true;
                 } else {
                     Vec3 nf, cf;
                     if(ls_plane(P, seg.inl, nf, cf)){
                         if(dot(nf, seg.pl.n) < 0) nf = nf*(-1.0);
                         seg.pl = {nf, -dot(nf,cf), cf};
+                        seg.fitSupport = seg.inl;
                     }
                 }
                 merged.push_back(std::move(seg));
@@ -2897,10 +2934,12 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
                     if(out[a].fixed || out[b].fixed){
                         const PlaneSeg& fsrc = out[a].fixed ? out[a] : out[b];
                         out[a].pl = fsrc.pl;
+                        if(!out[a].fixed) out[a].fitSupport = std::move(out[b].fitSupport);
                         out[a].fixed = true;
                     } else {
                         if(dot(nf, out[a].pl.n) < 0) nf = nf*(-1.0);
                         out[a].pl = {nf, -dot(nf,cf), cf};
+                        out[a].fitSupport = all;
                     }
                     out[a].inl = std::move(all);
                     out.erase(out.begin()+(long)b);
@@ -3051,10 +3090,13 @@ std::vector<PlaneSeg> split_planes(const std::vector<Vec3>& P, const CloudNormal
                     }
                     fprintf(stderr, "[split] 窄条并面(法向%.1f° 宽%.1fmm 偏差%.1fmm): 面%zu(%zu点) + 面%zu(%zu点) -> %zu点\n",
                             ang, wm, dev, a, out[a].inl.size(), b, out[b].inl.size(), all.size());
-                    if(!(out[a].fixed || out[b].fixed)) out[a].pl = pf;
-                    else {
+                    if(!(out[a].fixed || out[b].fixed)){
+                        out[a].pl = pf;
+                        out[a].fitSupport = all;
+                    } else {
                         const PlaneSeg& fsrc = out[a].fixed ? out[a] : out[b];
                         out[a].pl = fsrc.pl;
+                        if(!out[a].fixed) out[a].fitSupport = std::move(out[b].fitSupport);
                         out[a].fixed = true;
                     }
                     out[a].inl = std::move(all);
@@ -5358,11 +5400,11 @@ static void filterP2Outliers(std::vector<Vec2>& pts, double link, double farGap,
     pts.swap(kept);
 }
 
-enum class TrajectoryFailure { Other, NoRows, AngleWindow };
+enum class TrajectoryFailure { Other, NoRows, AngleWindow, CandidatePath };
 
 static void spray_traj_core(
     const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out,
-    TrajectoryFailure& failure)
+    TrajectoryFailure& failure, bool enableCandidateCheck)
 {
     failure = TrajectoryFailure::Other;
     SprayTrajResult& res = *out;
@@ -5483,6 +5525,7 @@ static void spray_traj_core(
                                         params->standoff);
                 for(auto& s : sub){
                     for(int& k : s.inl) k = back[k];
+                    for(int& k : s.fitSupport) k = back[k];
                     segs.push_back(std::move(s));
                 }
             }
@@ -6050,15 +6093,20 @@ static void spray_traj_core(
             // 这里给的 n 只是"源块法向"这个起点。
             PlaneSeg so;                                     // 高侧（沿源块法向更远）
             so.curved = false;
+            so.collapsed = s.collapsed;
             so.pl.n = n; so.pl.c = cHi; so.pl.d = -dot(n, cHi);
             so.inl  = std::move(hi);
             so.layerCnt = 2; so.layerThick = s.layerThick;
 
             PlaneSeg sn;                                     // 低侧
             sn.curved = false;
+            sn.collapsed = s.collapsed;
             sn.pl.n = n; sn.pl.c = cLo; sn.pl.d = -dot(n, cLo);
             sn.inl  = std::move(lo);
             sn.layerCnt = 2; sn.layerThick = s.layerThick;
+            // 拆层用该侧全体点求质心，保留两片各自的几何支撑点。
+            so.fitSupport = so.inl;
+            sn.fitSupport = sn.inl;
 
             // ---- 拆层也要过方向过滤：两片各自定可喷侧，不许"一片取反" ----
             orient_piece_after_split(Pf, cn.tree, so, partC);
@@ -6138,6 +6186,7 @@ static void spray_traj_core(
                         if(ls_plane(Pf, big->inl, nf2, cf2)){
                             if(dot(nf2, n) < 0) nf2 = nf2*(-1.0);
                             big->pl.n = nf2; big->pl.c = cf2; big->pl.d = -dot(nf2, cf2);
+                            big->fitSupport.clear();
                         }
                         big->layerCnt = 0;                       // 合回一张面，不再是双层
                         orient_piece_after_split(Pf, cn.tree, *big, partC);
@@ -6385,8 +6434,69 @@ static void spray_traj_core(
                 }else if(!segs[mi].fixed){
                     Vec3 nf, cf;
                     if(ls_plane(Pf, segs[mi].inl, nf, cf)){
-                        if(dot(nf, segs[mi].pl.n) < 0) nf = nf*(-1.0);
-                        segs[mi].pl = {nf, -dot(nf,cf), cf};
+                        PlaneSeg& main = segs[mi];
+                        if(dot(nf, main.pl.n) < 0) nf = nf*(-1.0);
+                        const Plane refit{nf, -dot(nf,cf), cf};
+                        const double rmsCap = std::max(3.0, 0.12*params->standoff);
+                        auto supportRms = [&](const PlaneSeg& s, const Plane& pl){
+                            if(s.fitSupport.size() < 20) return 1e30;
+                            double rss = 0.0;
+                            for(int k : s.fitSupport){
+                                const double e = dot(Pf[k]-pl.c, pl.n);
+                                rss += e*e;
+                            }
+                            return std::sqrt(rss/(double)s.fitSupport.size());
+                        };
+                        const double refitRms = enableCandidateCheck ? supportRms(main, refit) : 0.0;
+                        if(refitRms > rmsCap && supportRms(main, main.pl) <= rmsCap){
+                            // 已验收的吸收点继续参与轮廓。重拟合拉偏载体时，先尝试原载体的外侧，
+                            // 方位不合格时再从同方向的吸收面中寻找可喷侧载体。
+                            const Vec3 originalNormal = main.pl.n;
+                            size_t source = segs.size();
+                            Plane carrier;
+                            double window = SPRAYTRAJ_NORMAL_WIN_DEG;
+                            if(const char* e = std::getenv("SPRAYTRAJ_NORMAL_WIN")){
+                                const double value = atof(e);
+                                if(value > 1.0 && value <= 180.0) window = value;
+                            }
+                            double bestAlignment = -1.0;
+                            for(size_t order=0; order<segs.size(); ++order){
+                                const size_t i = (mi+order)%segs.size();
+                                if(i != mi && !drop[i]) continue;
+                                const PlaneSeg& s = segs[i];
+                                const double alignment = std::fabs(dot(originalNormal,s.pl.n));
+                                if(alignment < std::cos(10.0/D2R) ||
+                                   alignment <= bestAlignment || supportRms(s,s.pl) > rmsCap) continue;
+                                Plane trial = s.pl;
+                                if(dot(trial.n, trial.c-partC) < 0.0){
+                                    trial.n = trial.n*(-1.0);
+                                    trial.d = -trial.d;
+                                }
+                                const double angZ = std::acos(std::clamp(trial.n.z,-1.0,1.0))*D2R;
+                                if(angZ > window) continue;
+                                source = i;
+                                carrier = trial;
+                                bestAlignment = alignment;
+                                if(i == mi) break;
+                            }
+                            if(source < segs.size()){
+                                const double carrierRms = supportRms(segs[source], carrier);
+                                if(source != mi){
+                                    main.core = std::move(segs[source].inl);
+                                    main.fitSupport = std::move(segs[source].fitSupport);
+                                }
+                                main.pl = carrier;
+                                main.fo.n = carrier.n;
+                                main.fo.angZ = std::acos(std::clamp(carrier.n.z,-1.0,1.0))*D2R;
+                                main.fo.tilt = 90.0-main.fo.angZ;
+                                main.fo.side = main.fo.angZ < 87.0 ? 1 : (main.fo.angZ > 93.0 ? -1 : 0);
+                                main.fo.isInner = 0;
+                                main.preservedCarrier = true;
+                                fprintf(stderr, "[merge] 重拟合载体 RMS %.2fmm > %.2fmm，沿外侧载体面%zu（RMS %.2fmm）布行并复核枪位\n",
+                                        refitRms, rmsCap, source, carrierRms);
+                            }
+                        }
+                        if(!main.preservedCarrier) main.pl = refit;
                     }
                 }
                 segs[mi].layerCnt = 0;                 // 合回一张面，不再是双层
@@ -6434,6 +6544,8 @@ static void spray_traj_core(
             b.pl.n = nb;
             b.pl.c = s.pl.c + nb*params->shellThick;
             b.pl.d = -dot(b.pl.n, b.pl.c);
+            b.fitSupport.clear();
+            b.preservedCarrier = false;
             b.fo   = s.fo;
             b.fo.n = b.pl.n;
             b.fo.angZ = std::acos(std::max(-1.0,std::min(1.0,b.pl.n.z)))/D2R;
@@ -7349,6 +7461,8 @@ static void spray_traj_core(
     const double gunClearEff = params->gunClear > 0.0
                              ? params->gunClear
                              : std::max(12.0, 0.2*params->standoff);
+    KdTree candidateTree;
+    bool usedCandidateCheck = false;
 
     // ---- 面几何"挡板"清单 ----
     // 只拿点云测距会看漏两种地方：
@@ -7530,6 +7644,20 @@ static void spray_traj_core(
         for(int i=0;i<=nsep;++i){
             Vec3 q = a + (b-a)*((double)i/(double)nsep);
             if(partTree.nearestWithin(q, thr) < thr) return false;
+        }
+        return true;
+    };
+
+    // 原始点云、解析面和边界共同复查实际枪位。半步余量覆盖采样点之间的净空。
+    auto candidateSegmentClear = [&](const Vec3& a, const Vec3& b, double need)->bool{
+        if(segCrossFace(a, b)) return false;
+        const double length = len(b-a);
+        const int steps = std::max(1, (int)std::ceil(length/std::min(pstep, 2.0)));
+        const double margin = need + 0.5*length/steps;
+        for(int j=0; j<=steps; ++j){
+            const Vec3 q = a + (b-a)*((double)j/steps);
+            if(candidateTree.nearestWithin(q, margin) < margin ||
+               planeClearAt(q, -1) < margin || edgeClearAt(q, -1) < margin) return false;
         }
         return true;
     };
@@ -7976,25 +8104,33 @@ static void spray_traj_core(
             fprintf(stderr, "[prof] ==== 面%zu 进入: 内点=%zu curved=%d isCurved=%d ====\n",
                     si, inl.size(), (int)seg.curved, (int)isCurved);
 
-        // ================= 方向过滤硬闸（最后一道，任何上游标签都绕不过） =================
+        // 面级方向和枪位快检。可信平面可用后续实际行复核，角度窗口仍必过。
         // 位置很关键：必须在**所有**定向/劈面/拆层/内壁修正之后，在布行之前。
         // 上游（区域生长 → 初始定向 → 射线定向 → 拆层 → 内壁翻朝腔）每一步都可能把
         // 符号弄错，而它们的错误只有两种下场：漏喷（可接受）或从背面伸枪（撞机，不可接受）。
         // 这里不再相信任何标签，只问"枪能不能站到这一侧"：
         //   站得住 → 按当前法向布行；
         //   站不住但反侧站得住（且没超窗口）→ 翻过来；
-        //   两侧都站不住 → 拒喷。
+        //   快检未过 → 可信平面进入候选行复核，其余面拒喷。
+        bool needsCandidateCheck = seg.preservedCarrier;
         {
             char tag[48];
             std::snprintf(tag, sizeof(tag), "面%zu", si);
-            const bool allowFlip = !(seg.curved && isCurved);   // 曲面块只判不翻
+            const bool isPlanarFace = !(seg.curved && isCurved);
+            const bool allowFlip = isPlanarFace && !seg.preservedCarrier;
             // 曲面块用逐点法向测自由距离：整块平均法向在强曲面上会把射线擦回自身，
             // 见 measure_gun_free 注释（曲型板曾因此整块拒喷）。平面块仍传 nullptr。
-            const std::vector<Vec3>* ln = (seg.curved && isCurved) ? &cn.nor : nullptr;
+            const std::vector<Vec3>* ln = isPlanarFace ? nullptr : &cn.nor;
             ProfStage psGate("4b0.枪位验收");
             const GunSideVerdict gv = verify_gun_side(Pf, cn.tree, seg, partC,
                                                       params->standoff, tag, allowFlip, ln);
-            if(gv == GUN_SIDE_REJECT){
+            if(gv == GUN_SIDE_REJECT && enableCandidateCheck && isPlanarFace &&
+               (!seg.fitSupport.empty() || seg.collapsed) && seg.fo.angZ <= SPRAYTRAJ_NORMAL_WIN_DEG){
+                needsCandidateCheck = true;
+                ++nGunReject;
+                fprintf(stderr, "[gun] 面%zu 面级枪位验收未通过（+n=%.1f / -n=%.1fmm）→ 复核候选行\n",
+                        si, seg.fo.freePlus, seg.fo.freeMinus);
+            } else if(gv == GUN_SIDE_REJECT){
                 ++nGunReject;
                 fprintf(stderr, "[skip] 面%zu 枪位验收未通过（按%s测得 +n=%.1fmm / -n=%.1fmm，负值表示量程内无命中），"
                                 "不布行（内点数 %zu）\n", si, ln ? "逐点法向" : "面法向",
@@ -8046,25 +8182,82 @@ static void spray_traj_core(
                 rss += e*e;
                 emax = std::max(emax, std::fabs(e));
             }
-            const double frms = std::sqrt(rss/(double)inl.size());
+            const double fullRms = std::sqrt(rss/(double)inl.size());
+            double frms = fullRms;
+            const bool useFitSupport = enableCandidateCheck && !seg.fitSupport.empty();
+            if(useFitSupport){
+                double fitRss = 0.0;
+                for(int k : seg.fitSupport){
+                    const double e = dot(Pf[k]-pl.c, pl.n);
+                    fitRss += e*e;
+                }
+                frms = std::sqrt(fitRss/(double)seg.fitSupport.size());
+            }
             const double rmsCap = std::max(3.0, 0.12*params->standoff);
             // 曲面块本来就不是平面（pl 只是平均平面），不能按平面性拒掉——
             // 它后面走 gen_surface_rows 在真实曲面上追行，尺度完全不同。
             const bool isSurfBlock = seg.curved && isCurved;
-            if(!isSurfBlock && frms > rmsCap){
+            const bool skipPlanarity = isSurfBlock || seg.collapsed;
+            if(!skipPlanarity && frms > rmsCap){
                 ++nPlanarSkip;
                 fprintf(stderr, "[skip] 面%zu 平面性不足 RMS=%.1fmm > %.1fmm（%zu 点），"
-                                "疑为误合并/强曲面，不按平面布行\n", si, frms, rmsCap, inl.size());
+                                "疑为误合并/强曲面，不按平面布行\n", si, frms, rmsCap, useFitSupport ? seg.fitSupport.size() : inl.size());
                 continue;
             }
             // 本面点都在枪位下方 standoff 处。查询点本身也可能偏离拟合平面
             // （真实内点最多 emax），故最近距离下界是 standoff - 2*emax。
             // 取 emax < 0.2*standoff，保证下界 >= 60mm，远大于 20mm 安全半径；
             // 只有强起伏/离群点才退回全局查询。典型平面 emax≈5mm，仍走剪枝。
-            if(!isSurfBlock && segs.size() <= 64 && si < 64 &&
+            if(enableCandidateCheck && !skipPlanarity && fullRms > rmsCap){
+                needsCandidateCheck = true;
+                fprintf(stderr, "[fit] 面%zu 载体 RMS=%.2fmm，覆盖点 RMS=%.2fmm → 复核候选行\n",
+                        si, frms, fullRms);
+            }
+            if(!needsCandidateCheck && !isSurfBlock && segs.size() <= 64 && si < 64 &&
                emax < 0.2*params->standoff)
                 faceSkipMask[si] = 1ULL << si;
         }
+
+        enum class RayTarget { NoHit, OnTarget, Blocked };
+        std::vector<unsigned char> target;
+        if(needsCandidateCheck){
+            if(candidateTree.nodes.empty()) candidateTree.init(P);
+            target.resize(Pf.size(), 0);
+            for(int k : inl) target[(size_t)k] = 1;
+            for(int k : seg.core) target[(size_t)k] = 1;
+            for(int k : seg.fitSupport) target[(size_t)k] = 1;
+        }
+        auto candidateHit = [&](const Vec3& gunPos, bool continuousFace = false)->RayTarget{
+            constexpr double rayRadius = 1.5; // 与面级射线的命中半径一致。
+            const double standoff = params->standoff;
+            const double extra = std::max(0.0, std::min(params->flatnessTol, std::max(2.0, 0.6*standoff)));
+            const double rayLength = maxSprayD > 0.0 ? maxSprayD : standoff + extra;
+            const Vec3 dir = pl.n*(-1.0);
+            const int hit = candidateTree.firstRayPoint(gunPos, dir, rayLength, rayRadius);
+            if(hit < 0) return RayTarget::NoHit;
+            KnnBuf near;
+            cn.tree.knn(P[(size_t)hit], 1, near);
+            const double depth = dot(P[(size_t)hit]-gunPos, dir);
+            const bool belongs = near.n > 0 && target[(size_t)near.id[0]];
+            if(!belongs || (maxSprayD > 0.0 && depth < minSprayD)) return RayTarget::Blocked;
+            if(near.d2[0] <= rayRadius*rayRadius) return RayTarget::OnTarget;
+            if(!continuousFace) return RayTarget::Blocked;
+
+            // 射线半径限定横向命中，不能同时用来判定去噪删掉的棱边点属于哪张面。
+            // 规则连续面用同一重建格内、深度相符的多个本面点恢复归属。
+            const double neighborhood = 0.5*kReconGap;
+            KnnBuf support;
+            cn.tree.knn(P[(size_t)hit], 6, support);
+            int matching = 0;
+            for(int j=0; j<support.n; ++j){
+                if(support.d2[j] > neighborhood*neighborhood) continue;
+                const int id = support.id[j];
+                if(!target[(size_t)id]) return RayTarget::Blocked;
+                if(std::fabs(dot(Pf[(size_t)id]-P[(size_t)hit], dir)) <= 2.0*rayRadius)
+                    ++matching;
+            }
+            return matching >= 3 ? RayTarget::OnTarget : RayTarget::Blocked;
+        };
 
         // ================= 曲面块：曲面上的行追踪 =================
         // 不走平面的 2D 布行——曲面投影成 2D 会在陡峭段挤压，行距失控。
@@ -8239,7 +8432,7 @@ static void spray_traj_core(
                 if(!allPts.empty()){
                     Vec3 pEnd{allPts.back().x, allPts.back().y, allPts.back().z};
                     const Vec3 nEnd{-allPts.back().i, -allPts.back().j, -allPts.back().k};
-                    if(tryShortFaceLink(pEnd, nEnd, firstPos, firstN, allPts)){
+                    if(!usedCandidateCheck && tryShortFaceLink(pEnd, nEnd, firstPos, firstN, allPts)){
                         // 短换面：枪不停，直接连过去（点已按点距铺好，kind=1 橙色）
                         // 计数统一放在最后的过渡重建里，这里不重复加（默认会重建）
                     } else if(segClearOK(pEnd, firstPos) && !segCrossFace(pEnd, firstPos)){
@@ -9042,11 +9235,12 @@ static void spray_traj_core(
         if(!ringMode && !loopMode && bestRows.empty()) continue;
         // 载体真的出了行，才允许"其余同带面不布行"；否则（被枪位/朝向/平面性门拒掉）
         // 保持原行为，各面各自布行 —— 宁可多喷，不能漏喷。
-        if(singleBand && si == singleBandCarrier &&
+        if(!needsCandidateCheck && singleBand && si == singleBandCarrier &&
            (ringMode ? (nRing > 0) : (loopMode ? !loopPaths.empty() : !bestRows.empty())))
             carrierEmitted = true;
 
-        totalRows += ringMode ? nRing : (loopMode ? (int)loopPaths.size() : (int)bestRows.size());
+        const int faceRows = ringMode ? nRing : (loopMode ? (int)loopPaths.size() : (int)bestRows.size());
+        if(!needsCandidateCheck) totalRows += faceRows;
         {
             double angN = std::acos(std::min(1.0,std::fabs(dot(pl.n,Vec3{0,0,1}))))*180.0/3.141592653589793;
             if(ringMode)
@@ -9344,6 +9538,54 @@ static void spray_traj_core(
             return c;
         };
 
+        bool alignedZigzag = false;
+        if(needsCandidateCheck && !sparseDisconnected[si] && !routeAroundVoid && segs2.size() > 1){
+            // 矩形单片的行端收齐到共有范围。保留原行距和蛇形顺序，勿跨孔或延长扫描行。
+            double left = -1e30, right = 1e30, outerLeft = 1e30, outerRight = -1e30;
+            double minSpacing = L;
+            bool alternating = true;
+            for(size_t i=0; i<segs2.size(); ++i){
+                const auto& row = segs2[i];
+                const double lo = std::min(row.a.x,row.b.x), hi = std::max(row.a.x,row.b.x);
+                left = std::max(left,lo); right = std::min(right,hi);
+                outerLeft = std::min(outerLeft,lo); outerRight = std::max(outerRight,hi);
+                if(i > 0){
+                    const auto& prev = segs2[i-1];
+                    minSpacing = std::min(minSpacing, row.a.y - prev.a.y);
+                    alternating = alternating && (prev.b.x-prev.a.x)*(row.b.x-row.a.x) < 0.0;
+                }
+            }
+            const double endTolerance = 0.25*minSpacing;
+            alignedZigzag = alternating && minSpacing > 0.0 && right-left >= std::max(10.0,L*0.5) &&
+                            std::max(left-outerLeft,outerRight-right) <= endTolerance;
+            if(alignedZigzag){
+                for(const auto& row : segs2){
+                    if(!candidateSegmentClear(gunOf2({left,row.a.y}),gunOf2({right,row.a.y}),gunClearEff)){
+                        alignedZigzag = false;
+                        break;
+                    }
+                }
+            }
+            if(alignedZigzag){
+                for(size_t i=1; i<segs2.size(); ++i){
+                    const double x = segs2[i-1].b.x > segs2[i-1].a.x ? right : left;
+                    const Vec2 a{x,segs2[i-1].a.y}, b{x,segs2[i].a.y};
+                    if(!polyOK({a,b}) || !candidateSegmentClear(gunOf2(a),gunOf2(b),gunClearEff)){
+                        alignedZigzag = false;
+                        break;
+                    }
+                }
+            }
+            if(alignedZigzag){
+                for(auto& row : segs2){
+                    const bool forward = row.b.x > row.a.x;
+                    row.a.x = forward ? left : right;
+                    row.b.x = forward ? right : left;
+                }
+                fprintf(stderr, "[traj] 面%zu: %zu 条蛇形扫描行端点对齐，横向直线换行\n", si, segs2.size());
+            }
+        }
+
         // ---- 行端点硬约束裁剪（gunClear 是硬约束，不是事后补救）----
         // 布行过滤发生在"面点沿法向抬 standoff"阶段，但有三种情况会让**实际发射点**
         // 偏离被检查过的位置：①补全面是矩形外推、不是真实点；②平面拟合有残差
@@ -9353,20 +9595,22 @@ static void spray_traj_core(
         //   · 该行整段合格 → 原样保留（绝大多数情况，不改任何已有结果）
         //   · 部分合格 → 裁掉两端的不可达段（不足半行距就整行丢掉）
         //   · 全不合格 → 整行丢弃，宁可少喷一行，也不生成贴着工件走的轨迹
-        if(!ringMode && !segs2.empty()){
+        if(!alignedZigzag && !ringMode && !segs2.empty()){
             const double lim = gunClearEff - 0.5;
             std::vector<Seg2> kept; kept.reserve(segs2.size());
             int nCut=0, nDrop=0;
             for(const auto& sg : segs2){
                 const double Ls = len2(sg.b - sg.a);
                 if(Ls < 1e-6){ kept.push_back(sg); continue; }
-                const int ns = std::max(2, (int)std::ceil(Ls/pstep));
+                const double checkStep = needsCandidateCheck ? std::min(pstep, 2.0) : pstep;
+                const int ns = std::max(2, (int)std::ceil(Ls/checkStep));
                 std::vector<char> okv((size_t)ns+1, 1);
                 bool allOK = true;
                 int nFail=0;
                 for(int k=0;k<=ns;++k){
                     const Vec3 g = gunOf2(sg.a + (sg.b-sg.a)*((double)k/(double)ns));
-                    if(clearMin3(g) < lim){
+                    if(clearMin3(g) < lim ||
+                       (needsCandidateCheck && candidateHit(g, seg.preservedCarrier) == RayTarget::Blocked)){
                         okv[k]=0; allOK=false;
                         if(connDbg && nFail<2){
                             fprintf(stderr,"[gun]   失败点 #%d 枪位 (%.1f,%.1f,%.1f) d=%.2f 面法向 (%.2f,%.2f,%.2f) 面心 (%.1f,%.1f,%.1f)\n",
@@ -9514,7 +9758,9 @@ static void spray_traj_core(
                             i, gap, gapHard, segs2[i].b.x, segs2[i].b.y, segs2[i+1].a.x, segs2[i+1].a.y);
                 const Vec2 A = segs2[i].b, B = segs2[i+1].a;
                 const bool strict = sparseDisconnected[si] || routeAroundVoid;
-                if(strict || gap > gapHard){
+                if(alignedZigzag){
+                    sampleLine(A, B, 1);
+                } else if(strict || gap > gapHard){
                     const int from=componentAt(A), to=componentAt(B);
                     if(from>=0 && from==to){
                         if(connectOnPlane(A,B,rowFootprint[from])) continue;
@@ -9566,6 +9812,60 @@ static void spray_traj_core(
 
         // 转 3D（用该平面自己的法向抬升，避免撞击凸起/侧壁）
         Vec3 gun = pl.n*(-1.0);
+
+        if(needsCandidateCheck){
+            const bool continuousRow = alignedZigzag || (seg.preservedCarrier && segs2.size() == 1);
+            auto position = [&](const T2& t)->Vec3{
+                const Vec2 q = rotInv(t.p);
+                return pl.c + u*q.x + v*q.y + pl.n*(params->standoff + t.lift);
+            };
+            // 局部遮挡只关掉该段的喷枪，位置保持原样，关枪段同样复查净空。
+            std::vector<unsigned char> blocked(traj2.size(), 0), hits(traj2.size(), 0);
+            for(size_t k=0; k<traj2.size(); ++k){
+                if(!traj2[k].spray) continue;
+                const Vec3 g = position(traj2[k]);
+                const bool fromSpray = k > 0 && traj2[k-1].spray;
+                const Vec3 prev = fromSpray ? position(traj2[k-1]) : g;
+                const int samples = std::max(1, (int)std::ceil(len(g-prev)/2.0));
+                for(int j=1; j<=samples; ++j){
+                    const Vec3 q = prev + (g-prev)*((double)j/samples);
+                    const RayTarget hit = candidateHit(q, continuousRow);
+                    if(hit == RayTarget::Blocked){
+                        blocked[k] = 1;
+                        if(fromSpray) blocked[k-1] = 1;
+                        break;
+                    }
+                    if(hit == RayTarget::OnTarget) hits[k] = 1;
+                }
+            }
+            size_t muted = 0;
+            for(size_t k=0; k<traj2.size(); ++k){
+                if(traj2[k].spray && blocked[k]){
+                    traj2[k].spray = 0;
+                    ++muted;
+                }
+            }
+            bool targetHit = false;
+            size_t k = 0;
+            for(; k<traj2.size(); ++k){
+                const size_t previous = k == 0 ? 0 : k-1;
+                const bool spraySegment = traj2[k].spray && traj2[previous].spray;
+                const double need = spraySegment ? gunClearEff : std::max(moveClear, gunClearEff);
+                if(!candidateSegmentClear(position(traj2[previous]), position(traj2[k]), need)) break;
+                targetHit = targetHit || (spraySegment && hits[k]);
+            }
+            if(k < traj2.size() || !targetHit){
+                fprintf(stderr, "[skip] 面%zu 候选行复核未通过：%s（轨迹点 %zu）\n",
+                        si, k < traj2.size() ? "枪位净空不足或穿面" : "未命中目标覆盖区", k);
+                continue;
+            }
+            if(muted && continuousRow){
+                fprintf(stderr, "[skip] 面%zu 连续蛇形候选未通过：%zu 点的首个命中或喷距不符\n", si, muted);
+                continue;
+            }
+            if(muted)
+                fprintf(stderr, "[gun] 面%zu 候选轨迹 %zu 点因首个命中或喷距不符而关枪\n", si, muted);
+        }
 
         // ---- 端点选择（空移最短）：首/末两端，取"进得去、也出得来"的那端作起点 ----
         // 蛇形路线的两头都是合法起点：反走等于"行序与行向一起反过来"，走的是同一批
@@ -9637,7 +9937,8 @@ static void spray_traj_core(
             //    除点云净空外还要查**穿面**：点云稀疏/被去噪删掉的壁上，
             //    segClearOK 只看最近点会一路放行（complex 实测一段 204mm 直线穿过
             //    凸台，最差 0.38mm）。
-            if(tryShortFaceLink(pEnd, {-allPts.back().i,-allPts.back().j,-allPts.back().k},
+            if(!needsCandidateCheck && !usedCandidateCheck &&
+               tryShortFaceLink(pEnd, {-allPts.back().i,-allPts.back().j,-allPts.back().k},
                                 pStart, pl.n, allPts)){
                 // 短换面：枪不停，直接连过去（点已按点距铺好，kind=1 橙色过渡）
                 // 计数统一放在最后的过渡重建里，这里不重复加（默认会重建）
@@ -9747,6 +10048,13 @@ static void spray_traj_core(
             ++nDropFace;
             continue;
         }
+        if(needsCandidateCheck){
+            usedCandidateCheck = true;
+            const int emitted = (ringMode || loopMode) ? faceRows : (int)segs2.size();
+            totalRows += emitted;
+            if(singleBand && si == singleBandCarrier && emitted > 0) carrierEmitted = true;
+            fprintf(stderr, "[gun] 面%zu 候选行复核通过，保留 %d 行\n", si, emitted);
+        }
         prevNormal = pl.n;
 
         const size_t faceBeg = allPts.size();          // 本面面内轨迹的起点（供最后重排）
@@ -9762,8 +10070,10 @@ static void spray_traj_core(
             const size_t begin = k++;
             while(k<allPts.size() && allPts[k].spray) ++k;
             if(fanCoverOn) fanHarvest(begin,k,pl.n);
-            faceSpan.push_back({begin,k,si});
+            if(!needsCandidateCheck) faceSpan.push_back({begin,k,si});
         }
+        // 保留已复核的面内关枪区间，避免重排把关枪段重连成喷涂段。
+        if(needsCandidateCheck) faceSpan.push_back({faceBeg,allPts.size(),si});
     }
     if(nGapSafe)
         fprintf(stderr, "[traj] 曲面行间安全空移: %d 处（直线会穿件，spray=0）\n", nGapSafe);
@@ -9793,7 +10103,7 @@ static void spray_traj_core(
         // ⓪ 短换面：枪位一跳就到、直线不擦件 → 不停枪，直接连过去。
         //    kind=1 让查看器画橙色（"这是换面过渡，不是布行，但没停枪"）。
         //    代价预估那一趟 nFixOut=nullptr，不计数。
-        if(tryShortFaceLink(pEnd, nEnd, pStart, nStart, out)){
+        if(!usedCandidateCheck && tryShortFaceLink(pEnd, nEnd, pStart, nStart, out)){
             if(nFixOut) ++nGunOnLink;
             return 0;
         }
@@ -10587,6 +10897,18 @@ static void spray_traj_core(
             err += "。请检查点云中喷涂侧的遮挡及面吸收阈值。";
         res.error=_strdup(err.c_str()); return;
     }
+    if(usedCandidateCheck){
+        for(size_t k=0; k<allPts.size(); ++k){
+            const auto& a = allPts[k == 0 ? 0 : k-1];
+            const auto& b = allPts[k];
+            const double need = a.spray && b.spray ? gunClearEff : std::max(moveClear, gunClearEff);
+            if(candidateSegmentClear({a.x,a.y,a.z}, {b.x,b.y,b.z}, need)) continue;
+            fprintf(stderr, "[skip] 最终轨迹原始点云净空复核失败：第 %zu 段，要求 %.1fmm\n", k, need);
+            failure = TrajectoryFailure::CandidatePath;
+            res.error = _strdup("最终轨迹原始点云净空复核失败");
+            return;
+        }
+    }
     res.rows = totalRows;
 
     // 曲面件：把"平面残差"换成"行到曲面的贴合残差"（行追踪跑完才有的值）
@@ -10662,7 +10984,16 @@ static void run_with_retry(const double* xyz, int n, const SprayTrajParams* para
                            SprayTrajResult* out)
 {
     TrajectoryFailure failure;
-    spray_traj_core(xyz, n, params, out, failure);
+    auto runAttempt = [&](){
+        spray_traj_core(xyz, n, params, out, failure, true);
+        if(failure == TrajectoryFailure::CandidatePath){
+            // 新候选加入后整条路径未通过，恢复原有验收流程，保住原来能喷的面。
+            fprintf(stderr, "[gun] 新候选路径复核失败，按原有验收流程重新布行\n");
+            spray_traj_free(out);
+            spray_traj_core(xyz, n, params, out, failure, false);
+        }
+    };
+    runAttempt();
     // 自动体素档位可能将薄壳切成两层，退一档重试。保留用户显式设置的体素档位。
     if(out->error && params && n > 120000 && !std::getenv("SPRAYTRAJ_VOXEL")
        && failure == TrajectoryFailure::NoRows){
@@ -10673,7 +11004,7 @@ static void run_with_retry(const double* xyz, int n, const SprayTrajParams* para
             fprintf(stderr, "[体素] 整件无有效行（薄壳/档位巧合），退档重试 %.1fmm\n", leaf);
             spray_traj_free(out);
             g_voxelLeafOverride = leaf;
-            spray_traj_core(xyz, n, params, out, failure);
+            runAttempt();
             if(!out->error) break;
         }
         g_voxelLeafOverride = -1.0;
