@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <array>
+#include <queue>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -1229,7 +1230,129 @@ static bool detect_band_uv(const std::vector<Vec2>& uv, BandUV& out)
 // 由面内点集重建规则三角网格（局部 uv 坐标，mm）。
 //   reconGap 重建几何尺度（不是工艺行距；跨线空隙用闭运算桥接，否则每行独立成条）
 //   fillHole 孔洞填补阈值：连通孔洞的外接跨距 <= 此值 → 填实（覆盖重建）
+// 值 2 标出阈值主动填补的格，供布行区分补面与无支撑区域。
+static int fill_reconstruction_holes(std::vector<unsigned char>& occ, int width, int height,
+                                     double dx, double dy, double maxSpan,
+                                     const std::vector<unsigned char>* rimSupport = nullptr)
+{
+    if(maxSpan <= 0.0) return 0;
+    const double mouthLimit = maxSpan/3.0;
+    const int rx = (int)std::min((double)width, std::floor(mouthLimit/(2.0*dx)));
+    const int ry = (int)std::min((double)height, std::floor(mouthLimit/(2.0*dy)));
+    const int w = width+2*rx+2, h = height+2*ry+2;
+    const int x0 = rx+1, y0 = ry+1;
+    std::vector<unsigned char> original((size_t)w*h, 0);
+    for(int y=0; y<height; ++y)
+        for(int x=0; x<width; ++x)
+            original[(size_t)(y+y0)*w+x+x0] = occ[(size_t)y*width+x] != 0;
+
+    // 只在副本上临时封住窄口，再查哪些空区由外部变成了内孔。
+    // 外轮廓不使用闭运算结果，避免把开阔凹口或不同面之间的外部空区填掉。
+    auto closeMask = [&](int radX, int radY){
+        auto filter = [&](const std::vector<unsigned char>& src, int radius, bool vertical, bool dilate){
+            auto dst = src;
+            if(radius == 0) return dst;
+            const int lines = vertical ? w : h, length = vertical ? h : w;
+            std::vector<int> sums(length+1, 0);
+            for(int j=0; j<lines; ++j){
+                auto index = [&](int i){ return vertical ? (size_t)i*w+j : (size_t)j*w+i; };
+                for(int i=0; i<length; ++i) sums[i+1] = sums[i]+src[index(i)];
+                for(int i=0; i<length; ++i){
+                    const int sum = sums[std::min(length,i+radius+1)]-sums[std::max(0,i-radius)];
+                    dst[index(i)] = dilate ? sum>0 : sum==2*radius+1;
+                }
+            }
+            return dst;
+        };
+        auto mask = filter(original, radX, false, true);
+        mask = filter(mask, radY, true, true);
+        mask = filter(mask, radX, false, false);
+        return filter(mask, radY, true, false);
+    };
+    auto visit = [&](int p, auto&& fn){
+        const int x=p%w, y=p/w;
+        if(x>0) fn(p-1);
+        if(x+1<w) fn(p+1);
+        if(y>0) fn(p-w);
+        if(y+1<h) fn(p+w);
+    };
+    int filled = 0;
+    std::vector<unsigned char> originalExterior;
+    const std::array<std::pair<int,int>,3> radii{{{0,0}, {(rx+1)/2,(ry+1)/2}, {rx,ry}}};
+    std::pair<int,int> previous{-1,-1};
+    for(const auto& radius : radii){
+        if(radius == previous) continue;
+        previous = radius;
+        const auto mask = closeMask(radius.first,radius.second);
+        std::vector<unsigned char> seen(mask.size(),0);
+        std::vector<int> cells{0};
+        seen[0]=1;
+        auto addEmpty = [&](int p){
+            if(!mask[p] && !seen[p]){ seen[p]=1; cells.push_back(p); }
+        };
+        for(size_t i=0; i<cells.size(); ++i) visit(cells[i],addEmpty);
+        if(radius.first==0 && radius.second==0) originalExterior = seen;
+        for(int y=y0; y<y0+height; ++y) for(int x=x0; x<x0+width; ++x){
+            const int start = y*w+x;
+            if(mask[start] || seen[start]) continue;
+            cells.assign(1,start);
+            seen[start]=1;
+            int left=x, right=x, bottom=y, top=y;
+            for(size_t i=0; i<cells.size(); ++i){
+                const int p=cells[i];
+                left=std::min(left,p%w); right=std::max(right,p%w);
+                bottom=std::min(bottom,p/w); top=std::max(top,p/w);
+                visit(p,addEmpty);
+            }
+            const bool open = radius.first || radius.second;
+            if(open && !originalExterior[start]) continue;
+            if(open){
+                // 补上临时封口新增的格；只从孔内向窄口长，且严格限定在孔周围。
+                const int xl=left-2*radius.first, xr=right+2*radius.first;
+                const int yl=bottom-2*radius.second, yr=top+2*radius.second;
+                for(size_t i=0; i<cells.size(); ++i) visit(cells[i],[&](int p){
+                    const int px=p%w, py=p/w;
+                    if(seen[p] || !mask[p] || original[p] || !originalExterior[p] ||
+                       px<xl || px>xr || py<yl || py>yr) return;
+                    seen[p]=1; cells.push_back(p);
+                    left=std::min(left,px); right=std::max(right,px);
+                    bottom=std::min(bottom,py); top=std::max(top,py);
+                });
+            }
+            const double spanX = (right-left+1)*dx, spanY = (top-bottom+1)*dy;
+            if(std::max(spanX,spanY) > maxSpan) continue;
+            if(rimSupport){
+                // 曲面投影里的空区也可能是被剥离的腔底。只有边缘有足够朝向一致的
+                // 实测表面支持，才在该基面内补洞。
+                int observed=0, facing=0;
+                for(int cell : cells) visit(cell,[&](int p){
+                    const int px=p%w-x0, py=p/w-y0;
+                    if(!original[p] || px<0 || px>=width || py<0 || py>=height) return;
+                    const auto v=(*rimSupport)[(size_t)py*width+px];
+                    if(v==0) return;
+                    ++observed;
+                    if(v==2) ++facing;
+                });
+                if(observed==0 || 2*facing<observed) continue;
+            }
+            const int keep = filled;
+            for(int p : cells){
+                const int px=p%w-x0, py=p/w-y0;
+                if(px<0 || px>=width || py<0 || py>=height) continue;
+                auto& cell = occ[(size_t)py*width+px];
+                if(cell==0){ cell=2; ++filled; }
+            }
+            if(filled != keep)
+                fprintf(stderr, "[mesh] %s孔洞填补: %.1f×%.1fmm，阈值 %.1fmm，填补 %d 格\n",
+                        open ? "开口" : "闭合",
+                        spanX, spanY, maxSpan, filled-keep);
+        }
+    }
+    return filled;
+}
+
 static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, double fillHole,
+                             double minFaceWidth,
                              std::vector<Vec2>& outVerts, std::vector<int>& outTris,
                              int maxVerts, int maxTris,
                              std::vector<char>* keepMask = nullptr,
@@ -1311,47 +1434,7 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, doubl
         if(!changed) break;
     }
 
-    // 4) 孔洞：外部泛洪，未被外部到达的空区即内部孔洞；仅当跨距 <= fillHole 才填
-    {
-        std::vector<unsigned char> out((size_t)nU*nV,0);
-        std::vector<int> st;
-        auto push=[&](int iu,int iv){
-            if(iu<0||iv<0||iu>=nU||iv>=nV) return;
-            size_t k=(size_t)iv*nU+iu;
-            if(occ[k]||out[k]) return;
-            out[k]=1; st.push_back((int)k);
-        };
-        for(int iu=0;iu<nU;++iu){ push(iu,0); push(iu,nV-1); }
-        for(int iv=0;iv<nV;++iv){ push(0,iv); push(nU-1,iv); }
-        while(!st.empty()){
-            int k=st.back(); st.pop_back();
-            int iu=k%nU, iv=k/nU;
-            push(iu+1,iv); push(iu-1,iv); push(iu,iv+1); push(iu,iv-1);
-        }
-        // 内部空区按连通域统计跨距
-        std::vector<char> seen((size_t)nU*nV,0);
-        for(size_t k0=0;k0<occ.size();++k0){
-            if(occ[k0]||out[k0]||seen[k0]) continue;
-            std::vector<int> comp; comp.push_back((int)k0); seen[k0]=1;
-            int lo_u=nU,hi_u=0,lo_v=nV,hi_v=0;
-            for(size_t t=0;t<comp.size();++t){
-                int k=comp[t], iu=k%nU, iv=k/nU;
-                lo_u=std::min(lo_u,iu); hi_u=std::max(hi_u,iu);
-                lo_v=std::min(lo_v,iv); hi_v=std::max(hi_v,iv);
-                const int du[4]={1,-1,0,0}, dv[4]={0,0,1,-1};
-                for(int d=0;d<4;++d){
-                    int ju=iu+du[d], jv=iv+dv[d];
-                    if(ju<0||jv<0||ju>=nU||jv>=nV) continue;
-                    size_t kk=(size_t)jv*nU+ju;
-                    if(occ[kk]||out[kk]||seen[kk]) continue;
-                    seen[kk]=1; comp.push_back((int)kk);
-                }
-            }
-            double spanU=(hi_u-lo_u+1)*cs, spanV=(hi_v-lo_v+1)*cs;
-            if(std::max(spanU,spanV) <= fillHole)
-                for(int k : comp) occ[(size_t)k]=1;   // 覆盖重建：小洞填实
-        }
-    }
+    fill_reconstruction_holes(occ, nU, nV, cs, cs, fillHole);
 
     // 4.5) 回填"哪些点属于这个重建面"：开运算已经去掉了稀疏细尾巴，
     // 落在被删掉区域里的点（相邻面混入的孤立扫描线）不应继续参与轨迹生成，
@@ -1415,17 +1498,27 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, doubl
     // 最大环面积：用于剔除"同一个面上孤立的小碎块"。
     // 现场件边缘是掠射扫描，点云沿边缘断续，形态学闭运算也接不上，
     // 边界追踪就会得到几个互不相连的小环——渲染上表现为一个面上叠了几块补丁。
-    // 面积不足主环 10% 的环直接丢弃（这点面积也生成不出有效行）。
+    // 只比较外环面积。小而紧凑的孤岛用更严格的面积门槛，细长折边仍按原门槛。
     double maxLoopArea = 0.0;
-    for(auto& lp : loops) maxLoopArea = std::max(maxLoopArea, std::fabs(polyArea2(lp)));
+    for(const auto& lp : loops) maxLoopArea = std::max(maxLoopArea, polyArea2(lp));
+    std::vector<const std::vector<Vec2>*> droppedIslands;
 
     for(auto& lp : loops){
         double a0=polyArea2(lp);
         if(dbg) fprintf(stderr, "[mesh]   环: 点=%zu 面积=%.0f\n", lp.size(), a0);
-        if(std::fabs(a0) < 9.0*cs*cs) { if(dbg) fprintf(stderr, "[mesh]     -> 太小丢弃\n"); continue; }
-        if(loops.size()>1 && std::fabs(a0) < 0.10*maxLoopArea){
-            if(dbg) fprintf(stderr, "[mesh]     -> 碎块丢弃(占主环 %.0f%%)\n", std::fabs(a0)/maxLoopArea*100.0);
-            continue;
+        if(a0 > 0.0){
+            bool drop = a0 < 9.0*cs*cs || a0 < 0.10*maxLoopArea;
+            if(!drop && minFaceWidth > 0.0 && a0 < 0.25*maxLoopArea){
+                double longSide = 0.0;
+                minRectShortSide(lp, &longSide);
+                drop = longSide < 4.0*minFaceWidth;
+            }
+            if(drop){
+                droppedIslands.push_back(&lp);
+                fprintf(stderr, "[mesh] 剔除孤立碎块: %.0fmm²（占主块 %.1f%%）\n",
+                        a0, 100.0*a0/maxLoopArea);
+                continue;
+            }
         }
         // 直线简化的容差取"重建几何尺度"：线扫点云边界天然是"梳齿"状
         // （每行末端位置不同，齿深约等于扫描线间距），容差小于齿深就会把梳齿保留
@@ -1489,6 +1582,14 @@ static bool build_plane_mesh(const std::vector<Vec2>& uv, double reconGap, doubl
         else     holes.push_back(std::move(s));
     }
     if(outers.empty()) return false;
+    if(keepMask && !droppedIslands.empty()){
+        for(size_t k=0; k<uv.size(); ++k){
+            if(!(*keepMask)[k]) continue;
+            for(const auto* island : droppedIslands){
+                if(pointInPoly(uv[k], *island)){ (*keepMask)[k]=0; break; }
+            }
+        }
+    }
 
     // 6.5) 窄条面矩形补全
     // 场景：折型板的折边带只有 ~43mm 宽、700mm 长，激光对它是掠射，点云沿长向
@@ -1861,6 +1962,53 @@ enum GunSideVerdict { GUN_SIDE_OK = 0, GUN_SIDE_FLIP = 1, GUN_SIDE_REJECT = 2 };
 //   沿平均法向 +n 中位 1.2mm（±1~3）  → 拒喷，93% 点数一行不出
 //   沿逐点法向 12/12 采样点 400mm 内无命中 → 空间完全自由
 // 平面块的两者一致，所以默认走 pl.n，行为与原来逐位相同。
+// 冻结平面的轮廓点用于计算覆盖范围。按数组下标取样会随吸收、轮廓回筛而移动，
+// 甚至集中在同一边缘。按面内位置分区，从每个有点的区域取最接近中心的实测点。
+static std::vector<int> sample_fitted_face(const std::vector<Vec3>& points,
+                                           const std::vector<int>& indices, const Plane& plane)
+{
+    const Vec3 n = plane.n;
+    const Vec3 u = norm(cross(n, std::fabs(n.z) < 0.9 ? Vec3{0,0,1} : Vec3{1,0,0}));
+    const Vec3 v = cross(n, u);
+    double uMin = 1e300, uMax = -1e300, vMin = 1e300, vMax = -1e300;
+    for(int index : indices){
+        const Vec3 p = points[index] - plane.c;
+        const double pu = dot(p, u), pv = dot(p, v);
+        uMin = std::min(uMin, pu); uMax = std::max(uMax, pu);
+        vMin = std::min(vMin, pv); vMax = std::max(vMax, pv);
+    }
+
+    // 沿长边分三格、短边分两格，每侧最多六条射线。
+    const int uCells = (uMax - uMin >= vMax - vMin) ? 3 : 2;
+    const int vCells = 6 / uCells;
+    const double du = std::max((uMax - uMin) / uCells, 1e-9);
+    const double dv = std::max((vMax - vMin) / vCells, 1e-9);
+    std::array<int, 6> nearest;
+    std::array<double, 6> distance2;
+    nearest.fill(-1);
+    distance2.fill(1e300);
+    for(int index : indices){
+        const Vec3 p = points[index] - plane.c;
+        const double pu = dot(p, u) - uMin, pv = dot(p, v) - vMin;
+        const int col = std::clamp((int)(pu / du), 0, uCells - 1);
+        const int row = std::clamp((int)(pv / dv), 0, vCells - 1);
+        const int cell = row * uCells + col;
+        const double x = pu - (col + 0.5) * du;
+        const double y = pv - (row + 0.5) * dv;
+        const double h = dot(p, n);
+        const double d2 = x*x + y*y + h*h;
+        if(d2 < distance2[cell]){
+            nearest[cell] = index;
+            distance2[cell] = d2;
+        }
+    }
+
+    std::vector<int> samples;
+    for(int index : nearest)
+        if(index >= 0) samples.push_back(index);
+    return samples;
+}
+
 static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
                              const PlaneSeg& s, double standoff,
                              double& freePlus, double& freeMinus,
@@ -1873,7 +2021,11 @@ static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
     // inl 里混着侧壁点；沿**主面法向**从侧壁点打射线 1.1mm 就撞到侧壁本体，
     // 中位数被拉穿，整张主面判"枪伸不进去"而拒喷（p001 主面 8433 点、p009 15631 点）。
     // 枪位验收要回答的是"从这张面自己的表面上打出去空不空"，侧壁不回答这个问题。
-    const std::vector<int>& samp = s.core.empty() ? s.inl : s.core;
+    const std::vector<int>& candidates = s.core.empty() ? s.inl : s.core;
+    // 合并面已有独立于轮廓的验收点集，继续使用原有采样。
+    const auto spatialSamples = s.fixed && s.core.empty() && !localNor && candidates.size() > 6
+                              ? sample_fitted_face(P, candidates, s.pl) : std::vector<int>{};
+    const std::vector<int>& samp = spatialSamples.empty() ? candidates : spatialSamples;
     const double N = (double)samp.size();
     freePlus = freeMinus = -1.0;
     if(samp.empty()) return;
@@ -1898,6 +2050,9 @@ static void measure_gun_free(const std::vector<Vec3>& P, const KdTree& tree,
         }
         dp.push_back(ray_free_dist(P, tree, p + d*0.4,  d,         maxFree, hitR, collR));
         dm.push_back(ray_free_dist(P, tree, p - d*0.4,  d*(-1.0),  maxFree, hitR, collR));
+        if(std::getenv("SPRAYTRAJ_FACE_DBG"))
+            fprintf(stderr, "[gun-sample] idx=%d p=(%.2f,%.2f,%.2f) h=%.2f +n=%.2f -n=%.2f\n",
+                    samp[k], p.x, p.y, p.z, dot(p, n) + s.pl.d, dp.back(), dm.back());
     }
     auto med = [](std::vector<double>& v){
         if(v.empty()) return -1.0;
@@ -2991,6 +3146,7 @@ struct SurfPatch {
     std::vector<Vec3> rowP;
     std::vector<Vec3> rowN;
     std::vector<int>  rowBeg;   // 每行起始下标，末尾再加一个哨兵
+    std::vector<std::vector<Vec3>> rowTurns; // 截线之间的连续喷涂连接
     double rowGap = 0.0;        // 实际行距
     double cover = 0.0;         // 覆盖率 0..1
     double fitRms = 0.0;        // 点到局部拟合面的残差 RMS
@@ -3500,10 +3656,29 @@ static bool surf_model_query(const SurfPatch& sp, const Vec3& p, double& hout, V
     return true;
 }
 
+static void measure_surface_row_coverage(SurfPatch& sp, double spacing)
+{
+    KdTree tree;
+    tree.init(sp.rowP);
+    const double tol = std::max(sp.rowGap, spacing)*0.75;
+    int covered = 0;
+    double squaredError = 0.0;
+    for(const Vec3& p : sp.P){
+        KnnBuf nearest;
+        tree.knn(p, 1, nearest);
+        if(nearest.n == 0) continue;
+        if(nearest.d2[0] <= tol*tol) ++covered;
+        squaredError += nearest.d2[0];
+    }
+    sp.cover = (double)covered/(double)sp.P.size();
+    sp.fitRms = std::sqrt(squaredError/(double)sp.P.size());
+}
+
 // 在曲面块上生成蛇形行（就地写回 sp.rowP/rowN/rowBeg）
 static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillHole,
-                             int dirMode, double speed)
+                             int dirMode, double speed, bool& openContours)
 {
+    openContours = false;
     const int m = (int)sp.P.size();
     if(m < 50 || L <= 0 || pstep <= 0) return false;
     if(!sp.modelOk) build_surf_model(sp, 0.0);   // 显示网格已建则复用，避免重复计算
@@ -3977,6 +4152,19 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     }
     if(rowsMade < 1) return false;
 
+    // 围绕质心有点分布，并不能证明表面上存在闭合等高线。
+    if(isoMode){
+        const double minLength = 0.5*std::min(ext1, ext2);
+        openContours = true;
+        for(int r=0; r<sp.nRow; ++r){
+            const int b = sp.rowBeg[r], e = sp.rowBeg[r+1];
+            if(len(sp.rowP[e-1]-sp.rowP[b]) > 3.0*pstep) continue;
+            double length = 0.0;
+            for(int k=b+1; k<e; ++k) length += len(sp.rowP[k]-sp.rowP[k-1]);
+            if(length >= minLength){ openContours = false; break; }
+        }
+    }
+
     // 调试：SPRAYTRAJ_DUMP=1 时导出行点（含横向坐标 s = p·eIdx）与行边界。
     // 曲面件的 3D 截图分不清"行内抖动"和"端部卷边"，离线按 s 看最直观。
     if(dbg){
@@ -3994,20 +4182,7 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
     }
 
     // ---- 覆盖率：每个曲面点到最近行点的距离 ----
-    {
-        KdTree rt; rt.init(sp.rowP);
-        int cov=0;
-        const double tol = std::max(gap*0.75, L*0.75);
-        double rss=0; int rn=0;
-        for(int i=0;i<m;++i){
-            KnnBuf b; rt.knn(sp.P[i], 1, b);
-            double d = (b.n>0)? std::sqrt(b.d2[0]) : 1e9;
-            if(d <= tol) ++cov;
-            rss += d*d; ++rn;
-        }
-        sp.cover = (double)cov/(double)m;
-        sp.fitRms = std::sqrt(rss/std::max(1,rn));
-    }
+    measure_surface_row_coverage(sp, L);
     fprintf(stderr, "[曲面] 行追踪: %d 行 行距=%.2fmm 点距=%.2fmm 覆盖率=%.1f%% 残差RMS=%.2fmm\n",
             sp.nRow, sp.rowGap, pstep, sp.cover*100.0, sp.fitRms);
     return true;
@@ -4025,11 +4200,10 @@ static bool gen_surface_rows(SurfPatch& sp, double L, double pstep, double fillH
 //   3) 闭运算（膨胀 1 格再腐蚀 1 格）桥接扫描线间隙，否则网格中间漏缝；
 //   4) 只对"四角都占用且四角高度有效"的格发 2 个三角（CCW，法向朝外，
 //      与平面路径的绕向约定一致）；顶点/三角数在循环里逐项对照 ABI 预算保护。
-static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fillHole,
+static bool build_surface_mesh(const SurfPatch& sp, double fillHole,
                                std::vector<Vec3>& verts, std::vector<int>& tris,
-                               int maxVerts, int maxTris)
+                               std::vector<unsigned char>& filledTris, int maxVerts, int maxTris)
 {
-    (void)reconGap; (void)fillHole;   // 网格分辨率改由 ABI 预算决定，不再用行距/重建尺度推
     const int m = (int)sp.P.size();
     if(m < 20) return false;
     std::vector<Vec2> uv(m);
@@ -4068,20 +4242,25 @@ static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fill
     // ---- 2) 每个网格点：最近格内点云的中位高度 ----
     const size_t NG = (size_t)nU*(size_t)nV;
     std::vector<std::vector<double>> bucket(NG);
+    std::vector<int> facingCount(NG,0);
     for(int i=0;i<m;++i){
         int iu=(int)std::lround((uv[i].x-minU)/du);
         int iv2=(int)std::lround((uv[i].y-minV)/dv);
         iu=std::min(nU-1,std::max(0,iu)); iv2=std::min(nV-1,std::max(0,iv2));
-        bucket[(size_t)iu*nV+iv2].push_back(dot(sp.P[i]-sp.c0, sp.n0));
+        const size_t k=(size_t)iu*nV+iv2;
+        bucket[k].push_back(dot(sp.P[i]-sp.c0, sp.n0));
+        if(dot(sp.N[i],sp.n0)>=0.7071067811865476) ++facingCount[k]; // 与基面法向偏差不超过 45°
     }
     std::vector<double> h(NG, 1e300);
     std::vector<unsigned char> occ(NG, 0);
+    std::vector<unsigned char> rimSupport(NG,0);
     for(size_t i=0;i<NG;++i){
         std::vector<double>& bk=bucket[i];
         if(bk.empty()) continue;
         std::nth_element(bk.begin(), bk.begin()+bk.size()/2, bk.end());
         h[i]=bk[bk.size()/2];       // 中位高：单点噪声顶不出尖刺
         occ[i]=1;
+        rimSupport[i] = 2*facingCount[i]>=(int)bk.size() ? 2 : 1;
     }
     // 空格：最多 8 轮"邻域已填值平均"的扩散填空
     for(int it=0; it<8; ++it){
@@ -4127,6 +4306,7 @@ static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fill
         }
         occ.swap(ero);
     }
+    fill_reconstruction_holes(occ, nV, nU, dv, du, fillHole, &rimSupport);
     // ---- 3.5) 有曲面模型时：格高换成模型的平滑高度，再在网格自身尺度上补一次高斯 ----
     // 模型格(8.5mm)比显示网格格(18.2mm)细，直接插值仍会留下格间台阶；
     // 在网格自身尺度补一次 σ=1.2 格（≈22mm）的正则化，顶点二面角才真正落下来。
@@ -4146,7 +4326,7 @@ static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fill
         fprintf(stderr, "[曲面] 网格高度正则化: %d 个格取自曲面模型 + σ=1.2格高斯\n", rep);
     }
     // ---- 4) 三角化：只对"四角都占用且高度有效"的格发 2 个三角 ----
-    verts.clear(); tris.clear();
+    verts.clear(); tris.clear(); filledTris.clear();
     std::vector<int> vid(NG, -1);           // 顶点惰性创建，按 nU*nV 预分配
     bool budgetHit=false;
     for(int iv2=0; iv2+1<nV && !budgetHit; ++iv2) for(int iu=0; iu+1<nU; ++iu){
@@ -4173,7 +4353,9 @@ static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fill
         if(budgetHit) break;
         if((int)(tris.size()/3)+2 > maxTris) break;      // 三角预算保护
         tris.push_back(idx4[0]); tris.push_back(idx4[1]); tris.push_back(idx4[2]);
+        filledTris.push_back(occ[cc[0]]==2 || occ[cc[1]]==2 || occ[cc[2]]==2);
         tris.push_back(idx4[0]); tris.push_back(idx4[2]); tris.push_back(idx4[3]);
+        filledTris.push_back(occ[cc[0]]==2 || occ[cc[2]]==2 || occ[cc[3]]==2);
     }
     int occN=0; for(size_t i=0;i<NG;++i) if(occ[i]) ++occN;
     fprintf(stderr, "[曲面] 曲面网格: %dx%d 顶点=%d 三角=%d (cell=%.1fmm 占用格=%d/%d)\n",
@@ -4181,20 +4363,449 @@ static bool build_surface_mesh(const SurfPatch& sp, double reconGap, double fill
     return !verts.empty() && !tris.empty();
 }
 
-// 多平面件排除（第十四轮）。
-// 现象：开口盒子这种"底面 + 4 个侧壁"的纯多面体，被当成曲面块走行追踪，
-//       覆盖率只有 57.3%、残差 59.6mm，轨迹完全不对。
-// 原因：连通判据是"相邻点法向夹角 < 20°"。棱边两侧的点，KNN 邻域同时包含两个面，
-//       法向落在中间过渡带；这一串过渡点把 0° 的底面和 90° 的侧壁一段段接起来，
-//       于是 91.2% 的点连成一个"光滑块"，整体平面拟合 p95 自然高达 167.7mm，
-//       超过"曲面"门限（max(4*curvatureTol, 2*重建尺度) = 40mm）而被判成曲面。
-//
-// 判据：真正的曲面没法被少数几个平面**精确**覆盖；多面体可以。
-//       用紧公差顺序 RANSAC 剥离，若 <=nmax 个平面就能覆盖 >=coverReq 的点 → 多面体。
-// 实测（tol=2mm, nmax=6）：
-//       开口盒子  5 个平面覆盖 100.0%（底面 23.2 / 侧壁 22.3+22.3 / 端壁 16.0+16.0）
-//       曲型板    6 个平面只覆盖 43.5%（曲面是连续的，每个 2mm 薄层只吃一条带）
-// 余量约 46 个百分点，两边都不靠边。
+// 同一网格截线遇到孔洞或断口时，拆成独立喷涂段。
+template<class ClearSegment>
+static bool gen_surface_mesh_rows(SurfPatch& sp, const std::vector<Vec3>& verts,
+                                  const std::vector<int>& tris, const std::vector<unsigned char>& filledTris,
+                                  double spacing, double step,
+                                  int dirMode, double turnRadius, double fanRadius, ClearSegment clearSegment,
+                                  double& scoreOut)
+{
+    if(verts.empty() || tris.empty() || spacing <= 0.0 || step <= 0.0) return false;
+    std::vector<Vec2> footprint, rectangle;
+    footprint.reserve(verts.size());
+    for(const Vec3& p : verts){
+        const Vec3 d = p - sp.c0;
+        footprint.push_back({dot(d, sp.eL), dot(d, sp.eS)});
+    }
+    if(minAreaRect(footprint, rectangle) <= 0.0) return false;
+    Vec2 axis = rectangle[1]-rectangle[0], other = rectangle[2]-rectangle[1];
+    if((len2(axis) < len2(other)) != (dirMode == 2)) axis = other;
+    const Vec3 along = norm(sp.eL*axis.x + sp.eS*axis.y);
+    const Vec3 across = cross(sp.n0, along);
+    std::vector<Vec2> uv;
+    uv.reserve(verts.size());
+    double lo = 1e18, hi = -1e18;
+    for(const Vec3& p : verts){
+        const Vec3 d = p - sp.c0;
+        uv.push_back({dot(d, along), dot(d, across)});
+        lo = std::min(lo, uv.back().y);
+        hi = std::max(hi, uv.back().y);
+    }
+    if(hi - lo < 1e-6) return false;
+    const int count = (int)std::min(2000.0, std::ceil((hi-lo)/spacing));
+    const double gap = (hi-lo)/count;
+    // 固定枪轴有条件：只在重建面朝向和工件实测点都支持时出喷涂点。
+    constexpr double minNormalDot = 0.8660254037844386; // 入射偏角 30°
+    const double supportDist = std::max(sp.mCell, 2.0*sp.rFit);
+    // 沿枪轴核对材料支撑。枪位高度沿已重建的连续网格走，
+    // 以免台阶附近最近点在不同高度层之间来回跳。
+    std::vector<Vec3> footprintSamples;
+    footprintSamples.reserve(sp.P.size());
+    for(size_t i=0; i<sp.P.size(); ++i){
+        if(dot(sp.N[i], sp.n0) < minNormalDot) continue;
+        const Vec3 d = sp.P[i]-sp.c0;
+        footprintSamples.push_back({dot(d, along), dot(d, across), 0.0});
+    }
+    if(footprintSamples.size() < 3) return false;
+    KdTree footprintTree;
+    footprintTree.init(footprintSamples);
+    auto supported = [&](const Vec3& p){
+        const Vec3 d = p-sp.c0;
+        KnnBuf neighbors;
+        footprintTree.knn({dot(d,along), dot(d,across), 0.0}, 3, neighbors);
+        return neighbors.n == 3 && neighbors.d2[0] <= supportDist*supportDist;
+    };
+    struct Section { double x0, x1; Vec3 first, last; bool filled; };
+    auto sectionRow = [&](double y, bool reverse, std::vector<Vec3>& points,
+                          std::vector<int>& beginnings){
+        const size_t rowBounds = beginnings.size();
+        double runScore = 0.0;
+        std::vector<Section> sections;
+        for(size_t i=0; i<tris.size(); i+=3){
+            Vec3 hits[2];
+            double xs[2];
+            int nHits = 0;
+            for(int j=0; j<3; ++j){
+                const int a = tris[i+j], b = tris[i+(j+1)%3];
+                if((uv[a].y <= y) == (uv[b].y <= y)) continue;
+                const double f = (y-uv[a].y)/(uv[b].y-uv[a].y);
+                hits[nHits] = verts[a] + (verts[b]-verts[a])*f;
+                xs[nHits++] = uv[a].x + (uv[b].x-uv[a].x)*f;
+            }
+            if(nHits != 2 || std::fabs(xs[1]-xs[0]) < 1e-6) continue;
+            if(xs[1] < xs[0]){ std::swap(xs[0], xs[1]); std::swap(hits[0], hits[1]); }
+            sections.push_back({xs[0], xs[1], hits[0], hits[1], filledTris[i/3]!=0});
+        }
+        std::sort(sections.begin(), sections.end(), [](const Section& a, const Section& b){
+            return a.x0 < b.x0;
+        });
+        if(reverse){
+            std::reverse(sections.begin(), sections.end());
+            for(auto& s : sections){
+                std::swap(s.x0, s.x1);
+                std::swap(s.first, s.last);
+            }
+        }
+        auto finishRun = [&]{
+            const int start = beginnings.back();
+            if((int)points.size() - start < 2){
+                points.resize(start);
+                return;
+            }
+            const double span = std::fabs(dot(points.back()-points[start], along));
+            if(span < 2.0*step){
+                points.resize(start);
+                return;
+            }
+            beginnings.push_back((int)points.size());
+            runScore += span - std::min(gap*0.5, 2.0*supportDist);
+        };
+        std::vector<Vec3> lane;
+        std::vector<char> support;
+        auto finishLane = [&]{
+            // 同一个连续网格条带内，允许跨过短的测量缺口。孔洞与净空失败已在外层断开。
+            for(size_t j=0; j<lane.size();){
+                if(support[j]){ ++j; continue; }
+                const size_t begin = j;
+                while(j < lane.size() && !support[j]) ++j;
+                if(begin > 0 && j < lane.size() &&
+                   std::fabs(dot(lane[j]-lane[begin-1],along)) <= 2.0*supportDist)
+                    std::fill(support.begin()+begin, support.begin()+j, 1);
+            }
+            for(size_t j=0; j<lane.size(); ++j){
+                if(support[j]) points.push_back(lane[j]);
+                else finishRun();
+            }
+            finishRun();
+            lane.clear();
+            support.clear();
+        };
+        double end = -1e18;
+        for(const auto& s : sections){
+            const bool adjacent = std::fabs(s.x0-end) <= 1e-5;
+            if(!adjacent) finishLane();
+            const int steps = std::max(1, (int)std::ceil(len(s.last-s.first)/step));
+            for(int j=0; j<=steps; ++j){
+                if(j == 0 && adjacent && !lane.empty()) continue;
+                const Vec3 p = s.first + (s.last-s.first)*((double)j/steps);
+                if(!clearSegment(p,p)){
+                    finishLane();
+                    continue;
+                }
+                if(!lane.empty()){
+                    const Vec3 delta = p-lane.back();
+                    if(std::fabs(dot(delta,sp.n0)) > std::fabs(dot(delta,along))+step ||
+                       !clearSegment(lane.back(), p))
+                        finishLane();
+                }
+                lane.push_back(p);
+                support.push_back(s.filled || supported(p));
+            }
+            end = s.x1;
+        }
+        finishLane();
+        // 锯齿边缘的短残段容易多出一趟绕行。仅在本行已经有完整长段、
+        // 且短段仍落在相邻长段的喷幅内时将其吸收。
+        const size_t firstRun = rowBounds;
+        if(beginnings.size()>firstRun+1){
+            size_t write=beginnings[firstRun-1];
+            const size_t runCount=beginnings.size();
+            const auto spans=beginnings;
+            beginnings.resize(firstRun);
+            for(size_t r=firstRun; r<runCount; ++r){
+                const int b=spans[r-1], e=spans[r];
+                const double span=len(points[e-1]-points[b]);
+                const bool coveredBefore = beginnings.size()>firstRun &&
+                    len(points[write-1]-points[beginnings[beginnings.size()-2]])>fanRadius &&
+                    len(points[e-1]-points[write-1])<=fanRadius;
+                const bool coveredAfter = r+1<runCount &&
+                    len(points[spans[r+1]-1]-points[spans[r]])>fanRadius &&
+                    len(points[b]-points[spans[r]])<=fanRadius;
+                if(span<=fanRadius && (coveredBefore || coveredAfter)){
+                    runScore -= span - std::min(gap*0.5,2.0*supportDist);
+                    continue;
+                }
+                for(int k=b; k<e; ++k) points[write++]=points[k];
+                beginnings.push_back((int)write);
+            }
+            points.resize(write);
+        }
+        return runScore;
+    };
+    // 整组行平移同一距离，行距保持一致；优先保留长的连续喷涂段。
+    std::vector<Vec3> bestPoints;
+    std::vector<int> bestBeginnings;
+    std::vector<int> bestRows;
+    double bestScore = -1e18;
+    for(double offset : {0.0, -1.0/6, 1.0/6, -1.0/3, 1.0/3}){
+        std::vector<Vec3> points;
+        std::vector<int> beginnings{0};
+        std::vector<int> rows;
+        double score = 0.0;
+        bool reverse = false;
+        for(int row=0; row<count; ++row){
+            const size_t before = rows.size();
+            const double y=lo+(row+0.5+offset)*gap;
+            double rowScore=sectionRow(y,reverse,points,beginnings);
+            if(count>1 && (row==0 || row+1==count) && beginnings.size()>before+2){
+                // 最外行恰好落在阶梯轮廓上时，在半喷幅内向面内移，优先用完整直行。
+                const double budget=std::min(fanRadius,gap*0.25);
+                const double sign=row==0 ? 1.0 : -1.0;
+                size_t bestRuns=beginnings.size()-1-before;
+                const double penalty=std::min(gap*0.5,2.0*supportDist);
+                const double originalSpan=rowScore+penalty*bestRuns;
+                for(double shift : {budget*0.5,budget}){
+                    std::vector<Vec3> trialPoints;
+                    std::vector<int> trialBeginnings{0};
+                    const double trialScore=sectionRow(y+sign*shift,reverse,trialPoints,trialBeginnings);
+                    const size_t runs=trialBeginnings.size()-1;
+                    if(runs==0 || runs>=bestRuns || trialScore+penalty*runs+budget<originalSpan)
+                        continue;
+                    const int base=beginnings[before];
+                    points.resize(base);
+                    points.insert(points.end(),trialPoints.begin(),trialPoints.end());
+                    beginnings.resize(before+1);
+                    for(size_t k=1; k<trialBeginnings.size(); ++k)
+                        beginnings.push_back(base+trialBeginnings[k]);
+                    bestRuns=runs;
+                    rowScore=trialScore;
+                }
+            }
+            score += rowScore;
+            rows.resize(beginnings.size()-1, row);
+            if(rows.size() != before) reverse = !reverse;
+        }
+        for(size_t r=1; r<rows.size(); ++r){
+            const int k = beginnings[r];
+            score -= 0.5*std::fabs(dot(points[k]-points[k-1],along));
+        }
+        if(beginnings.size() > 1 && score > bestScore){
+            bestPoints.swap(points);
+            bestBeginnings.swap(beginnings);
+            bestRows.swap(rows);
+            bestScore = score;
+        }
+    }
+    if(bestBeginnings.empty()) return false;
+    scoreOut = bestScore;
+    // 实体上的相邻行允许保持喷涂。板边外的同侧折返仍保留弧线，走安全净空后关枪通过。
+    auto meshPoint = [&](Vec2 q, Vec3& p, bool& filled){
+        for(size_t k=0; k<tris.size(); k+=3){
+            const int a = tris[k], b = tris[k+1], c = tris[k+2];
+            const Vec2 u = uv[b]-uv[a], v = uv[c]-uv[a], d = q-uv[a];
+            const double det = cross2(u,v);
+            if(std::fabs(det) < 1e-9) continue;
+            const double t = cross2(d,v)/det, s = cross2(u,d)/det;
+            if(t < -1e-7 || s < -1e-7 || t+s > 1.0+1e-7) continue;
+            p = verts[a] + (verts[b]-verts[a])*t + (verts[c]-verts[a])*s;
+            filled = filledTris[k/3]!=0;
+            return (int)(k/3);
+        }
+        return -1;
+    };
+    auto toUV = [&](const Vec3& p){
+        const Vec3 d = p-sp.c0;
+        return Vec2{dot(d, along), dot(d, across)};
+    };
+    auto traceOnMesh = [&](const Vec3& a, const Vec3& b, double bulge,
+                           std::vector<Vec3>& path, double side=0.0){
+        const Vec2 av=toUV(a), bv=toUV(b);
+        const int samples=std::max(2,(int)std::ceil((len(b-a)+2.0*(std::fabs(bulge)+std::fabs(side)))/
+                                                   std::max(0.5,step*0.5)));
+        path.clear();
+        Vec3 prev=a;
+        for(int i=1; i<samples; ++i){
+            const double f=(double)i/samples;
+            const double progress = bulge==0.0 ? f : f*f*(3.0-2.0*f);
+            const double arch=4.0*f*(1.0-f);
+            const Vec2 q=av+(bv-av)*progress+Vec2{arch*bulge,arch*arch*side};
+            Vec3 p;
+            bool filled=false;
+            if(meshPoint(q,p,filled)<0 || len(p-prev)>2.0*step || !clearSegment(prev,p))
+                return false;
+            path.push_back(p);
+            prev=p;
+        }
+        return len(b-prev)<=2.0*step && clearSegment(prev,b);
+    };
+    // 以三角形重心和共享边中点构建面内通路。只有真正共享边的三角片可以互通。
+    const int triangleCount = (int)(tris.size()/3);
+    std::vector<Vec3> nodes;
+    std::vector<std::vector<int>> links(triangleCount);
+    nodes.reserve(tris.size());
+    for(int t=0; t<triangleCount; ++t)
+        nodes.push_back((verts[tris[t*3]]+verts[tris[t*3+1]]+verts[tris[t*3+2]])*(1.0/3.0));
+    std::map<std::pair<int,int>,int> edgeOwners;
+    for(int t=0; t<triangleCount; ++t) for(int e=0; e<3; ++e){
+        const int a=tris[t*3+e], b=tris[t*3+(e+1)%3];
+        auto [owner, inserted] = edgeOwners.emplace(std::minmax(a,b), t);
+        if(inserted) continue;
+        const int portal = (int)nodes.size(), neighbor = owner->second;
+        nodes.push_back((verts[a]+verts[b])*0.5);
+        links.push_back({t,neighbor});
+        links[t].push_back(portal);
+        links[neighbor].push_back(portal);
+    }
+    auto routeOnMesh = [&](const Vec3& a, const Vec3& b, std::vector<Vec3>& path){
+        Vec3 surface;
+        bool filled = false;
+        const int start=meshPoint(toUV(a),surface,filled), goal=meshPoint(toUV(b),surface,filled);
+        if(start<0 || goal<0 || !clearSegment(a,nodes[start]) || !clearSegment(nodes[goal],b))
+            return false;
+        std::vector<double> distance(nodes.size(),1e30);
+        std::vector<int> parent(nodes.size(),-1);
+        using Entry = std::pair<double,int>;
+        std::priority_queue<Entry,std::vector<Entry>,std::greater<Entry>> pending;
+        distance[start]=0.0;
+        pending.emplace(0.0,start);
+        while(!pending.empty()){
+            const auto [cost,u] = pending.top();
+            pending.pop();
+            if(cost>distance[u]) continue;
+            if(u==goal) break;
+            for(int v : links[u]){
+                const double next=cost+len(nodes[v]-nodes[u]);
+                if(next >= distance[v] || !clearSegment(nodes[u],nodes[v])) continue;
+                distance[v]=next;
+                parent[v]=u;
+                pending.emplace(next,v);
+            }
+        }
+        if(distance[goal]>=1e30) return false;
+        std::vector<Vec3> waypoints{b};
+        for(int u=goal; u>=0; u=parent[u]) waypoints.push_back(nodes[u]);
+        waypoints.push_back(a);
+        std::reverse(waypoints.begin(), waypoints.end());
+        path.clear();
+        // 在有效网格上尝试跳过中间节点，消除三角片边上的锯齿折返。
+        std::vector<Vec3> shortcut;
+        for(size_t i=0; i+1<waypoints.size();){
+            size_t j=waypoints.size()-1;
+            for(; j>i+1; --j){
+                if(traceOnMesh(waypoints[i],waypoints[j],0.0,shortcut)){
+                    path.insert(path.end(),shortcut.begin(),shortcut.end());
+                    break;
+                }
+            }
+            if(j==i+1){
+                const Vec3 delta=waypoints[j]-waypoints[i];
+                const int samples=std::max(1,(int)std::ceil(len(delta)/step));
+                for(int k=1; k<samples; ++k)
+                    path.push_back(waypoints[i]+delta*((double)k/samples));
+            }
+            if(j+1<waypoints.size()) path.push_back(waypoints[j]);
+            i=j;
+        }
+        return true;
+    };
+    std::vector<std::vector<Vec3>> turns(bestRows.size());
+    std::vector<int> starts(bestBeginnings.begin(),bestBeginnings.end()-1);
+    std::vector<int> ends(bestBeginnings.begin()+1,bestBeginnings.end());
+    const double trimLimit=std::min(fanRadius, gap*0.25);
+    int alignedTurns=0, meshDetours=0;
+    for(size_t r=1; r<bestRows.size(); ++r){
+        const Vec3& a = bestPoints[ends[r-1]-1];
+        const Vec3& b = bestPoints[starts[r]];
+        const Vec2 av = toUV(a), bv = toUV(b);
+        const double sign = (av.x >= toUV(bestPoints[starts[r-1]]).x) ? 1.0 : -1.0;
+        const bool adjacent = bestRows[r]-bestRows[r-1]==1 && std::fabs(bv.x-av.x)<=1.5*gap;
+        const double bulge = adjacent ? std::min(turnRadius, gap*0.5)*sign : 0.0;
+        auto& turn=turns[r];
+        if(adjacent && std::fabs(av.x-bv.x) <= trimLimit){
+            // 先对齐相邻行的行端，最多退到喷幅仍能覆盖原端点的位置。
+            bool aligned=false;
+            for(double extra : {0.0,trimLimit*0.25,trimLimit*0.5}){
+                const double endLine=std::min(sign*av.x,sign*bv.x)-extra;
+                int ai=ends[r-1]-1, bi=starts[r];
+                while(ai>starts[r-1]+1 && sign*toUV(bestPoints[ai]).x>endLine+step*0.5) --ai;
+                while(bi<ends[r]-2 && sign*toUV(bestPoints[bi]).x>endLine+step*0.5) ++bi;
+                if(sign*(av.x-toUV(bestPoints[ai]).x)>trimLimit ||
+                   sign*(bv.x-toUV(bestPoints[bi]).x)>trimLimit ||
+                   std::fabs(toUV(bestPoints[ai]).x-toUV(bestPoints[bi]).x)>step)
+                    continue;
+                if(traceOnMesh(bestPoints[ai],bestPoints[bi],bulge,turn) ||
+                   traceOnMesh(bestPoints[ai],bestPoints[bi],bulge*0.5,turn) ||
+                   traceOnMesh(bestPoints[ai],bestPoints[bi],0.0,turn)){
+                    ends[r-1]=ai+1; starts[r]=bi;
+                    ++alignedTurns;
+                    aligned=true;
+                    break;
+                }
+            }
+            if(aligned) continue;
+        }
+        if(adjacent && (traceOnMesh(a,b,bulge,turn) || traceOnMesh(a,b,bulge*0.5,turn)
+                     || traceOnMesh(a,b,-bulge*0.5,turn))) continue;
+        if(traceOnMesh(a,b,0.0,turn)) continue;
+        if(bestRows[r]==bestRows[r-1]){
+            // 同一行内的小凹口，用一条与喷涂行相切的短弧绕开。
+            const double reach=std::min(gap*0.5,2.0*fanRadius);
+            bool bowed=false;
+            for(double retreat : {0.0,trimLimit*0.5,trimLimit}){
+                int ai=ends[r-1]-1, bi=starts[r];
+                while(ai>starts[r-1]+1 && len(bestPoints[ai-1]-a)<=retreat) --ai;
+                while(bi<ends[r]-2 && len(bestPoints[bi+1]-b)<=retreat) ++bi;
+                for(double f : {0.25,0.5,0.75,1.0}){
+                    const double d=reach*f;
+                    if(traceOnMesh(bestPoints[ai],bestPoints[bi],0.0,turn,d) ||
+                       traceOnMesh(bestPoints[ai],bestPoints[bi],0.0,turn,-d)){
+                        ends[r-1]=ai+1; starts[r]=bi;
+                        bowed=true;
+                        scoreOut-=d+retreat;
+                        break;
+                    }
+                }
+                if(bowed) break;
+            }
+            if(bowed) continue;
+        }
+        if(routeOnMesh(a,b,turn)){
+            double length=0.0;
+            Vec3 previous=a;
+            for(const auto& p : turn){ length+=len(p-previous); previous=p; }
+            scoreOut -= gap + length+len(b-previous)-len(b-a);
+            ++meshDetours;
+            continue;
+        }
+        fprintf(stderr, "[曲面] 第 %zu 段与下一段没有满足净空的面内连接\n", r);
+        return false;
+    }
+    double turnCost=0.0;
+    for(size_t r=1; r<starts.size(); ++r){
+        Vec2 prev=toUV(bestPoints[ends[r-1]-1]);
+        Vec2 direction=norm2(prev-toUV(bestPoints[ends[r-1]-2]));
+        auto addTurn = [&](const Vec3& p){
+            const Vec2 next=toUV(p), delta=next-prev;
+            if(len2(delta)<step*0.1) return;
+            const Vec2 dir=norm2(delta);
+            // 惩罚急拐角，自动方向优先选能接成常规折返的排布。
+            turnCost+=std::max(0.0,0.5-dot2(direction,dir));
+            prev=next;
+            direction=dir;
+        };
+        for(const auto& p : turns[r]) addTurn(p);
+        addTurn(bestPoints[starts[r]]);
+        addTurn(bestPoints[starts[r]+1]);
+    }
+    scoreOut-=gap*turnCost;
+    sp.rowP.clear();
+    sp.rowBeg.assign(1,0);
+    for(size_t r=0; r<starts.size(); ++r){
+        sp.rowP.insert(sp.rowP.end(),bestPoints.begin()+starts[r],bestPoints.begin()+ends[r]);
+        sp.rowBeg.push_back((int)sp.rowP.size());
+    }
+    sp.rowN.assign(sp.rowP.size(), sp.n0);
+    sp.rowTurns.swap(turns);
+    sp.nRow = (int)sp.rowBeg.size()-1;
+    sp.rowGap = gap;
+    if(std::getenv("SPRAYTRAJ_DUMP"))
+        fprintf(stderr,"[曲面] 对齐行端 %d 处，网格绕行 %d 处，布行评分 %.1f\n",
+                alignedTurns,meshDetours,scoreOut);
+    return true;
+}
+
+// 用紧公差顺序 RANSAC 剥离，检查少量平面能否覆盖曲面候选块。
 static bool patch_is_polyhedral(const std::vector<Vec3>& P, const std::vector<int>& blk,
                                 int nmax, double tolPlane, double coverReq,
                                 int& nPlaneOut, double& covOut,
@@ -4747,9 +5358,13 @@ static void filterP2Outliers(std::vector<Vec2>& pts, double link, double farGap,
     pts.swap(kept);
 }
 
+enum class TrajectoryFailure { Other, NoRows, AngleWindow };
+
 static void spray_traj_core(
-    const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out)
+    const double* xyz, int n, const SprayTrajParams* params, SprayTrajResult* out,
+    TrajectoryFailure& failure)
 {
+    failure = TrajectoryFailure::Other;
     SprayTrajResult& res = *out;
     std::memset(out, 0, sizeof(*out));
     res.error = nullptr;
@@ -5753,7 +6368,21 @@ static void spray_traj_core(
                                    segs[mi].inl.end());
                 // 主面平面由吸收一次定死（fixed）：这里只并点，不重拟合，
                 // 否则"吸收完的平面"又被下游改回去，等于吸收白做。
-                if(!segs[mi].fixed){
+                if(segs[mi].curved && isCurved){
+                    // 重建网格与布行都读 SurfPatch，吸收后必须与面点归属同步。
+                    // 曲面参考基仍沿原曲面的朝向，避免被并入的侧壁扭转。
+                    surf.P.clear();
+                    surf.N.clear();
+                    surf.P.reserve(segs[mi].inl.size());
+                    surf.N.reserve(segs[mi].inl.size());
+                    for(int k : segs[mi].inl){
+                        surf.P.push_back(Pf[k]);
+                        const Vec3 n = cn.nor[k];
+                        surf.N.push_back(dot(n, surf.n0) < 0.0 ? n*(-1.0) : n);
+                    }
+                    surf.tree.init(surf.P);
+                    segs[mi].pl = {surf.n0, -dot(surf.n0,surf.c0), surf.c0};
+                }else if(!segs[mi].fixed){
                     Vec3 nf, cf;
                     if(ls_plane(Pf, segs[mi].inl, nf, cf)){
                         if(dot(nf, segs[mi].pl.n) < 0) nf = nf*(-1.0);
@@ -5919,6 +6548,10 @@ static void spray_traj_core(
     // 重建网格是否碎片化（碎成多块且最大块 <= 50%）：这类面必须按轮廓切段，
     // 否则行会横穿两块材料之间的空档。在重建阶段算一次，轨迹阶段直接用。
     std::vector<char> planeFrag(segs.size(), 0);
+    std::vector<char> sparseDisconnected(segs.size(), 0);
+    std::vector<Vec3> surfaceVerts;
+    std::vector<int> surfaceTris;
+    std::vector<unsigned char> surfaceFilledTris;
     std::vector<int> planeSeg;          // res.planes[wi] 对应的 segs 下标（拆薄壁行时要用）
     for(size_t i=0;i<segs.size() && wi<SPRAYTRAJ_PLANE_SLOTS;++i){
         Plane& P = segs[i].pl;
@@ -5999,8 +6632,8 @@ static void spray_traj_core(
             {
                 ProfStage ps("3.曲面重建", &tMesh);
                 if(!surf.modelOk) build_surf_model(surf, 0.0);
-                okMesh = build_surface_mesh(surf, kReconGap, params->fillHoleSize,
-                                            verts3, tris,
+                okMesh = build_surface_mesh(surf, params->fillHoleSize,
+                                            verts3, tris, surfaceFilledTris,
                                             SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
                                             SPRAYTRAJ_PLANE_MAX_POLY_TRIS);
             }
@@ -6042,6 +6675,8 @@ static void spray_traj_core(
                 fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（曲面块）宽度=%.1fmm 内点=%zu\n",
                         wi, nv, nt, faceW, segs[i].inl.size());
                 meshOk[i] = 1;
+                surfaceVerts = std::move(verts3);
+                surfaceTris = std::move(tris);
                 planeSeg.push_back((int)i);
                 ++wi;
             } else {
@@ -6095,7 +6730,7 @@ static void spray_traj_core(
                         }
                     }
                 }
-                okMesh = build_plane_mesh(uv, cellMesh, params->fillHoleSize,
+                okMesh = build_plane_mesh(uv, cellMesh, params->fillHoleSize, params->minFaceWidth,
                                           verts, tris,
                                           SPRAYTRAJ_PLANE_MAX_POLY_VERTS,
                                           SPRAYTRAJ_PLANE_MAX_POLY_TRIS,
@@ -6155,7 +6790,8 @@ static void spray_traj_core(
             // 最大块仅 53%，但它是实实在在的一块面），一律丢面会漏喷。
             // 真正要抑制的是"行越出面的范围"，那件事在布行阶段按重建轮廓裁剪解决
             // （build_plane_mesh 现在会回传重建轮廓 loopsOut，genRows 用它夹住行端点）。
-            if(okMesh && keepMask.size()==segs[i].inl.size()){
+            const size_t inputCount = segs[i].inl.size();
+            if(okMesh && keepMask.size()==inputCount){
                 std::vector<int> kept; kept.reserve(segs[i].inl.size());
                 for(size_t t=0;t<keepMask.size();++t) if(keepMask[t]) kept.push_back(segs[i].inl[t]);
                 if(kept.size() >= 20){
@@ -6189,6 +6825,7 @@ static void spray_traj_core(
                     int nc=0; double lf=0, ar=0;
                     mesh_connect_stats(verts, tris, nc, lf, ar);
                     planeFrag[i] = (nc > 1 && lf <= 0.50) ? 1 : 0;
+                    sparseDisconnected[i] = (nc > 1 && segs[i].inl.size() <= inputCount/2);
                     fprintf(stderr, "[重建] 面片%zu: 顶点=%d 三角=%d（规则轮廓）连通块=%d 最大块占比=%.0f%% 面积=%.0fmm2 宽度=%.1fmm 内点=%zu%s\n",
                             wi, nv, nt, nc, lf*100.0, ar, faceW, segs[i].inl.size(),
                             planeFrag[i] ? "  ← 碎片化，轨迹按轮廓切段" : "");
@@ -7359,7 +7996,7 @@ static void spray_traj_core(
                                                       params->standoff, tag, allowFlip, ln);
             if(gv == GUN_SIDE_REJECT){
                 ++nGunReject;
-                fprintf(stderr, "[skip] 面%zu 枪位验收未通过：两侧都伸不进枪（按%s测得 +n=%.1fmm / -n=%.1fmm），"
+                fprintf(stderr, "[skip] 面%zu 枪位验收未通过（按%s测得 +n=%.1fmm / -n=%.1fmm，负值表示量程内无命中），"
                                 "不布行（内点数 %zu）\n", si, ln ? "逐点法向" : "面法向",
                         seg.fo.freePlus, seg.fo.freeMinus, inl.size());
                 continue;
@@ -7433,11 +8070,49 @@ static void spray_traj_core(
         // 不走平面的 2D 布行——曲面投影成 2D 会在陡峭段挤压，行距失控。
         // 行点/法向已由 gen_surface_rows 在曲面上直接算好，这里只做抬升与串接。
         if(seg.curved && isCurved){
+            bool meshRows = false;
             if(surf.nRow <= 0){
                 ProfStage ps("4b.曲面行追踪", &tTraj);
-                if(!gen_surface_rows(surf, L, pstep, params->fillHoleSize,
-                                     params->scanDirMode, params->speed)){
-                    fprintf(stderr, "[曲面] 行追踪失败，跳过该块\n");
+                bool openContours = false;
+                const bool traced = gen_surface_rows(surf, L, pstep, params->fillHoleSize,
+                                                     params->scanDirMode, params->speed, openContours);
+                const bool hasFilledSurface = std::find(surfaceFilledTris.begin(),surfaceFilledTris.end(),1)
+                                              != surfaceFilledTris.end();
+                if(!traced || openContours || hasFilledSurface){
+                    const Vec3 lift = surf.n0*params->standoff;
+                    auto clearSpraySegment = [&](const Vec3& a, const Vec3& b){
+                        const Vec3 ga = a + lift, gb = b + lift;
+                        return partTree.nearestWithin(gb, gunClearEff) >= gunClearEff &&
+                               segClearGe(ga, gb, gunClearEff) && !segCrossFace(ga,gb);
+                    };
+                    double score = 0.0;
+                    meshRows = gen_surface_mesh_rows(surf, surfaceVerts, surfaceTris, surfaceFilledTris, L, pstep,
+                                                     params->scanDirMode, turnR, fanR, clearSpraySegment, score);
+                    if(params->scanDirMode == 0 && meshRows){
+                        auto points = std::move(surf.rowP), normals = std::move(surf.rowN);
+                        auto starts = std::move(surf.rowBeg);
+                        auto turns = std::move(surf.rowTurns);
+                        const double gap = surf.rowGap;
+                        double crossScore = 0.0;
+                        if(!gen_surface_mesh_rows(surf, surfaceVerts, surfaceTris, surfaceFilledTris, L, pstep,
+                                                  2, turnR, fanR, clearSpraySegment, crossScore) ||
+                           crossScore <= score){
+                            surf.rowP = std::move(points); surf.rowN = std::move(normals);
+                            surf.rowBeg = std::move(starts); surf.rowTurns = std::move(turns);
+                            surf.nRow = (int)surf.rowBeg.size()-1;
+                            surf.rowGap = gap;
+                        }
+                    }else if(params->scanDirMode == 0 && !meshRows){
+                        meshRows = gen_surface_mesh_rows(surf, surfaceVerts, surfaceTris, surfaceFilledTris, L, pstep,
+                                                         2, turnR, fanR, clearSpraySegment, score);
+                    }
+                    if(meshRows){
+                        measure_surface_row_coverage(surf, L);
+                        fprintf(stderr, "[曲面] 蛇形截线 %d 段，按网格连续喷涂\n", surf.nRow);
+                    }
+                }
+                if((!traced || openContours || hasFilledSurface) && !meshRows){
+                    fprintf(stderr, "[曲面] 未能生成满足净空的连续轨迹，跳过该块\n");
                     continue;
                 }
             }
@@ -7457,7 +8132,7 @@ static void spray_traj_core(
             //     插值法向还会在中间过零，枪位直接落到工件表面（0.09mm）。
             auto emitGap=[&](const Vec3& a, const Vec3& na, const Vec3& b, const Vec3& nb){
                 double d = len(b-a);
-                if(d <= pstep*0.5) return;
+                if(!meshRows && d <= pstep*0.5) return;
                 const Vec3 ga = a + na*params->standoff;
                 const Vec3 gb = b + nb*params->standoff;
                 // 关枪判据必须看**枪位行程**，不是面点跳距。
@@ -7467,7 +8142,11 @@ static void spray_traj_core(
                 // 而实际喷嘴只挪了十几毫米，根本不需要断。
                 const double dg = len(gb - ga);
                 const double nd = dot(na, nb);
-                if(dg <= 3.0*L && nd > 0.5 && segClearOK(ga,gb) && !segCrossFace(ga,gb)){
+                if(meshRows && dg > 1e-6 && nd > 0.5 && segClearOK(ga,gb) && !segCrossFace(ga,gb)){
+                    const Vec3 midN = norm(na+nb);
+                    allPts.push_back({(ga.x+gb.x)*0.5, (ga.y+gb.y)*0.5, (ga.z+gb.z)*0.5,
+                                      -midN.x,-midN.y,-midN.z,params->speed,0});
+                } else if(!meshRows && dg <= 3.0*L && nd > 0.5 && segClearOK(ga,gb) && !segCrossFace(ga,gb)){
                     int np = std::max(2, (int)std::ceil(d/pstep));
                     for(int t=1;t<np;++t){
                         double f = (double)t/(double)np;
@@ -7612,7 +8291,16 @@ static void spray_traj_core(
                     if(e-b < 2) continue;
                     const int k0 = revSurf ? (e-1) : b;
                     const int kstep = revSurf ? -1 : 1;
-                    if(hasLast) emitGap(lastP, lastN, surf.rowP[k0], surf.rowN[k0]);
+                    if(hasLast){
+                        const auto* turn = meshRows ? &surf.rowTurns[revSurf ? r+1 : r] : nullptr;
+                        if(turn){
+                            const auto& points = *turn;
+                            for(size_t j=0; j<points.size(); ++j)
+                                emitPt(points[revSurf ? points.size()-1-j : j], surf.n0, 1);
+                        }else{
+                            emitGap(lastP, lastN, surf.rowP[k0], surf.rowN[k0]);
+                        }
+                    }
                     for(int k=k0;; k+=kstep){
                         emitPt(surf.rowP[k], surf.rowN[k], 1);
                         if(revSurf ? (k <= b) : (k+1 >= e)) break;
@@ -8223,6 +8911,8 @@ static void spray_traj_core(
                         si, bandLoops[0].size(), planeLoops[si].size());
             }
         }
+        std::vector<std::vector<Vec2>> rowFootprint;
+        bool routeAroundVoid = false;
         if(!ringMode && !loopMode && !bestRows.empty() && !std::getenv("SPRAYTRAJ_NO_ROWCLIP")){
             const std::vector<std::vector<Vec2>>& loopsUU = planeLoops[si];
             if(!loopsUU.empty()){
@@ -8236,6 +8926,7 @@ static void spray_traj_core(
                 }
                 // 单带件载体：换成整条带的轮廓（见上方 bandLoops 的注释）
                 if(!bandLoops.empty()) loops = bandLoops;
+                rowFootprint = loops;
                 // ---- 只做"端点夹紧"，不做切段 ----
                 // 反复试过三种策略，只有这一种在所有用例上单调改善：
                 //   A) 按轮廓切段 → 框形面对了，但稀疏/锯齿轮廓被切成碎屑
@@ -8270,7 +8961,7 @@ static void spray_traj_core(
                 // 判据放在面级（不按行判），所以不会像逐行切段那样在锯齿面上碎掉：
                 // 真·锯齿面（norim 面9）连通块 4 但最大块 52%、面积 46,376mm²，
                 // 已经 >= 50% 门槛，走"只夹端点"分支。
-                bool fragmented = planeFrag[si];
+                const bool fragmented = planeFrag[si] || sparseDisconnected[si];
                 if(fragmented && std::getenv("SPRAYTRAJ_ROWCLIP_DBG"))
                     fprintf(stderr, "[traj] 面%zu: 重建网格碎片化 → 行按轮廓切段\n", si);
                 // ---- 首末行豁免"缩水"判据 ----
@@ -8287,8 +8978,11 @@ static void spray_traj_core(
                 for(const Row& r : bestRows){
                     const bool edgeRow = multiRow &&
                         (std::fabs(r.yc - ycLo) < 1e-6 || std::fabs(r.yc - ycHi) < 1e-6);
-                    if(edgeRow && !fragmented){ kept.push_back(r); continue; }
                     auto iv = clipRowByLoops(r.yc, r.xs, r.xe, loops);
+                    bool materialGap = false;
+                    for(size_t k=1; k<iv.size(); ++k)
+                        if(iv[k].first-iv[k-1].second >= kReconGap){ materialGap = true; break; }
+                    if(edgeRow && !fragmented && !materialGap){ kept.push_back(r); continue; }
                     const double rowLen = std::max(1e-9, r.xe - r.xs);
                     if(std::getenv("SPRAYTRAJ_ROWCLIP_DBG")){
                         fprintf(stderr, "[clip] yc=%8.1f row=[%8.1f,%8.1f] len=%7.1f iv=%zu",
@@ -8304,12 +8998,14 @@ static void spray_traj_core(
                     }
                     double cov = 0.0;
                     for(auto& s : iv) cov += std::max(0.0, std::min(s.second, r.xe) - std::max(s.first, r.xs));
-                    if(fragmented){
+                    if(fragmented || materialGap){
                         // 碎片化面：每个区间都是独立的一块材料，逐段保留
                         if(iv.size() > 1 || cov / rowLen < 0.99){
                             int keptSeg = 0;
                             for(size_t k=0;k<iv.size();++k){
-                                if(iv[k].second - iv[k].first < std::max(10.0, L*0.5)) continue;
+                                const double minLength = (sparseDisconnected[si] || materialGap)
+                                    ? std::max(10.0, 2.0*pstep) : std::max(10.0, L*0.5);
+                                if(iv[k].second - iv[k].first < minLength) continue;
                                 Row q = r;
                                 q.xs = iv[k].first; q.xe = iv[k].second;
                                 q.segIdx = r.segIdx*8 + (int)k;
@@ -8318,6 +9014,7 @@ static void spray_traj_core(
                                 cutLen += rowLen - (q.xe - q.xs);
                             }
                             if(keptSeg) ++nClip;
+                            routeAroundVoid = routeAroundVoid || (materialGap && keptSeg>1);
                             continue;
                         }
                     }else if(cov / rowLen >= 0.40){
@@ -8339,9 +9036,10 @@ static void spray_traj_core(
                 if(!kept.empty() && (nClip || nDrop))
                     fprintf(stderr, "[traj] 面%zu: 按重建轮廓夹端点 %d 行、丢弃 %d 行（行数 %zu -> %zu，%zu 环，夹掉 %.0fmm）\n",
                             si, nClip, nDrop, bestRows.size(), kept.size(), loops.size(), cutLen);
-                if(!kept.empty()) bestRows.swap(kept);
+                if(!kept.empty() || sparseDisconnected[si]) bestRows.swap(kept);
             }
         }
+        if(!ringMode && !loopMode && bestRows.empty()) continue;
         // 载体真的出了行，才允许"其余同带面不布行"；否则（被枪位/朝向/平面性门拒掉）
         // 保持原行为，各面各自布行 —— 宁可多喷，不能漏喷。
         if(singleBand && si == singleBandCarrier &&
@@ -8419,6 +9117,7 @@ static void spray_traj_core(
         // 3D 视图里又是一圈"出框"的线，看着不像长在工件上的轨迹。半条喷幅以内
         // 就足够把边沿那一条带盖住（喷幅本身有 20~30% 搭接）。
         double extRow = params->edgeExtend >= 0.0 ? params->edgeExtend : 0.25*params->scanRowSpacing;
+        if(sparseDisconnected[si] || routeAroundVoid) extRow = 0.0;
         // ---- 盲扩量还要受"面自身尺度"约束 ----
         // 行距是工艺参数（喷幅/搭接），与这块面有多大无关；拿它决定"往面外伸多长"
         // 在大行距下会离谱：242×40 的板用 rowSpacing=150，extRow=37.5mm，两端各伸
@@ -8735,7 +9434,72 @@ static void spray_traj_core(
             };
             emit3(P1,0); emit3(P2,0); emit3(B,0);
         };
+        if(routeAroundVoid){
+            // 包含真孔的面统一按同一轮廓收尾，避免未被切段的首末行停在轮廓外。
+            std::vector<Seg2> inside;
+            for(const auto& seg : segs2){
+                const bool reverse = seg.a.x > seg.b.x;
+                const auto iv=clipRowByLoops(seg.a.y,std::min(seg.a.x,seg.b.x),
+                                             std::max(seg.a.x,seg.b.x),rowFootprint);
+                for(size_t k=0; k<iv.size(); ++k){
+                    const auto& span=iv[reverse ? iv.size()-1-k : k];
+                    const Vec2 a{span.first,seg.a.y}, b{span.second,seg.a.y};
+                    inside.push_back(reverse ? Seg2{b,a} : Seg2{a,b});
+                }
+            }
+            segs2.swap(inside);
+        }
+        auto inFootprint = [](Vec2 p, const std::vector<Vec2>& loop){
+            if(pointInPoly(p,loop)) return true;
+            for(size_t i=0; i<loop.size(); ++i){
+                const Vec2 a=loop[i], d=loop[(i+1)%loop.size()]-a;
+                const double dd=dot2(d,d);
+                if(dd<1e-12) continue;
+                const double t=std::clamp(dot2(p-a,d)/dd,0.0,1.0);
+                if(len2(p-(a+d*t))<1e-5) return true;
+            }
+            return false;
+        };
+        auto componentAt = [&](Vec2 p){
+            for(size_t i=0; i<rowFootprint.size(); ++i)
+                if(inFootprint(p,rowFootprint[i])) return (int)i;
+            return -1;
+        };
+        auto connectOnPlane = [&](Vec2 a, Vec2 b, const std::vector<Vec2>& loop){
+            auto valid = [&](Vec2 p, Vec2 q){
+                const int n=std::max(1,(int)std::ceil(len2(q-p)/std::max(0.5,pstep*0.5)));
+                for(int k=1; k<n; ++k)
+                    if(!inFootprint(p+(q-p)*((double)k/n),loop)) return false;
+                return polyOK({p,q});
+            };
+            if(valid(a,b)){ sampleLine(a,b,1); return true; }
+            std::vector<Vec2> nodes{a,b};
+            nodes.insert(nodes.end(),loop.begin(),loop.end());
+            std::vector<double> distance(nodes.size(),1e30);
+            std::vector<int> parent(nodes.size(),-1);
+            std::vector<char> visited(nodes.size(),0);
+            distance[0]=0.0;
+            for(size_t k=0; k<nodes.size(); ++k){
+                int i=-1;
+                for(size_t j=0; j<nodes.size(); ++j)
+                    if(!visited[j] && distance[j]<1e30 && (i<0 || distance[j]<distance[i])) i=(int)j;
+                if(i<0 || i==1) break;
+                visited[i]=1;
+                for(size_t j=1; j<nodes.size(); ++j){
+                    const double d=distance[i]+len2(nodes[j]-nodes[i]);
+                    if(visited[j] || d>=distance[j] || !valid(nodes[i],nodes[j])) continue;
+                    distance[j]=d; parent[j]=i;
+                }
+            }
+            if(parent[1]<0) return false;
+            std::vector<int> order;
+            for(int i=1; i>=0; i=parent[i]) order.push_back(i);
+            for(size_t k=order.size()-1; k>0; --k)
+                sampleLine(nodes[order[k]],nodes[order[k-1]],1);
+            return true;
+        };
         int nHop=0, nShrink=0;
+        bool missingConnection = false;
         for(size_t i=0;i<segs2.size();++i){
             sampleLine(segs2[i].a, segs2[i].b, 1);
             if(i+1<segs2.size()){
@@ -8749,7 +9513,18 @@ static void spray_traj_core(
                     fprintf(stderr, "[conn]   conn%zu gap=%.1f hard=%.1f A=(%.1f,%.1f) B=(%.1f,%.1f)\n",
                             i, gap, gapHard, segs2[i].b.x, segs2[i].b.y, segs2[i+1].a.x, segs2[i+1].a.y);
                 const Vec2 A = segs2[i].b, B = segs2[i+1].a;
-                if(gap > gapHard){
+                const bool strict = sparseDisconnected[si] || routeAroundVoid;
+                if(strict || gap > gapHard){
+                    const int from=componentAt(A), to=componentAt(B);
+                    if(from>=0 && from==to){
+                        if(connectOnPlane(A,B,rowFootprint[from])) continue;
+                        missingConnection = true;
+                        break;
+                    }
+                    if(strict && (from<0 || to<0)){
+                        missingConnection = true;
+                        break;
+                    }
                     // 跨段大跳跃：本来就是空移（spray=0），先试直连，穿不过才抬高。
                     // 空移抬枪不打断喷涂，所以这里保留 hopZ 是合理的。
                     if(polyOK({A, B})) sampleLine(A, B, 0);
@@ -8778,6 +9553,10 @@ static void spray_traj_core(
                     }
                 }
             }
+        }
+        if(missingConnection){
+            fprintf(stderr, "[skip] 面%zu 找不到满足净空的连续面内连接\n", si);
+            continue;
         }
         if(nShrink)
             fprintf(stderr, "[traj] 面%zu: %d 处换行转角按枪体安全半径收缩（保持连续喷涂）\n",
@@ -8977,9 +9756,13 @@ static void spray_traj_core(
             Vec3 pos = X + pl.n*(params->standoff + t2.lift);
             allPts.push_back({pos.x,pos.y,pos.z, gun.x,gun.y,gun.z, params->speed, t2.spray, t2.kind});
         }
-        if(allPts.size() > faceBeg){
-            if(fanCoverOn) fanHarvest(faceBeg, allPts.size(), pl.n);
-            faceSpan.push_back({faceBeg, allPts.size(), si});
+        // 同一拟合平面上可能有多个不相连的实体区域，分别保留它们的轨迹区间。
+        for(size_t k=faceBeg; k<allPts.size();){
+            if(!allPts[k].spray){ ++k; continue; }
+            const size_t begin = k++;
+            while(k<allPts.size() && allPts[k].spray) ++k;
+            if(fanCoverOn) fanHarvest(begin,k,pl.n);
+            faceSpan.push_back({begin,k,si});
         }
     }
     if(nGapSafe)
@@ -9784,7 +10567,24 @@ static void spray_traj_core(
     }
 
     if(allPts.empty()){
-        err = nDownSkip>0 ? "无有效扫描行（所有面可喷侧朝下，超出角度窗口被滤除）" : "无有效扫描行";
+        failure = nDownSkip > 0 ? TrajectoryFailure::AngleWindow : TrajectoryFailure::NoRows;
+        err = "无有效扫描行";
+        if(nGunReject > 0 || nDownSkip > 0 || nPlanarSkip > 0){
+            err += "（";
+            if(nGunReject > 0)
+                err += "枪位验收未通过 " + std::to_string(nGunReject) + " 面";
+            if(nDownSkip > 0){
+                if(nGunReject > 0) err += "；";
+                err += "超出可喷角度窗口 " + std::to_string(nDownSkip) + " 面";
+            }
+            if(nPlanarSkip > 0){
+                if(nGunReject > 0 || nDownSkip > 0) err += "；";
+                err += "平面性不足 " + std::to_string(nPlanarSkip) + " 面";
+            }
+            err += "）";
+        }
+        if(nGunReject > 0)
+            err += "。请检查点云中喷涂侧的遮挡及面吸收阈值。";
         res.error=_strdup(err.c_str()); return;
     }
     res.rows = totalRows;
@@ -9854,21 +10654,18 @@ static void spray_traj_core(
     res.seg_len_max = smax;
 }
 
-// ---- 对外入口：核心流程 + 体素档位兜底重试 ----
-// 只处理一种可自愈的失败：整件因为"枪位验收不过"而没出行。
-// 成因是双层薄壳正好被体素切成两层（见 auto_voxel_leaf 上方注释），退一档
-// （粗 1.6×，两层合并）即可恢复；多花 0.3~0.5s，且只在失败时发生。
-// 不动"朝下被角度窗口滤除"那种——那是工艺判定，退档不会变好，白等。
-// 用户显式指定了 -voxel / SPRAYTRAJ_VOXEL 时不介入（他要的就是那个档）。
+// ---- 对外入口：整件无轨迹时按失败原因重试 ----
 //
 // 全程只写 out，不产生按值返回的大结构体：调用方（P/Invoke 或栈上局部）
 // 只需要一块 289KB 的结果区，栈占用与改造前一致。
 static void run_with_retry(const double* xyz, int n, const SprayTrajParams* params,
                            SprayTrajResult* out)
 {
-    spray_traj_core(xyz, n, params, out);
+    TrajectoryFailure failure;
+    spray_traj_core(xyz, n, params, out, failure);
+    // 自动体素档位可能将薄壳切成两层，退一档重试。保留用户显式设置的体素档位。
     if(out->error && params && n > 120000 && !std::getenv("SPRAYTRAJ_VOXEL")
-       && std::strstr(out->error, "无有效扫描行") && !std::strstr(out->error, "朝下")){
+       && failure == TrajectoryFailure::NoRows){
         double leaf = auto_voxel_leaf(params);
         for(int k=0;k<2;++k){
             leaf *= 1.6;                                  // 7.5 → 12 → 19
@@ -9876,7 +10673,7 @@ static void run_with_retry(const double* xyz, int n, const SprayTrajParams* para
             fprintf(stderr, "[体素] 整件无有效行（薄壳/档位巧合），退档重试 %.1fmm\n", leaf);
             spray_traj_free(out);
             g_voxelLeafOverride = leaf;
-            spray_traj_core(xyz, n, params, out);
+            spray_traj_core(xyz, n, params, out, failure);
             if(!out->error) break;
         }
         g_voxelLeafOverride = -1.0;

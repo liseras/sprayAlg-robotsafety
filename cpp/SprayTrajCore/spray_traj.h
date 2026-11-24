@@ -239,7 +239,7 @@ typedef struct SprayTrajResult {
     int             inlier_points;  // 平面内点数量（重建平面覆盖的点）
     int             plane_count;    // 分割出的平面数
     SprayTrajPlane  planes[SPRAYTRAJ_PLANE_SLOTS];  // 各分割平面 / 拆层后的面
-    const char*     error;          // 失败原因（成功为 NULL）
+    const char*     error;          // UTF-8 失败原因（成功为 NULL）
 } SprayTrajResult;
 
 // 主入口：生成连续S形轨迹

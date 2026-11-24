@@ -589,7 +589,7 @@
                 </StackPanel>
 
                 <Border Background="#66000000" Padding="10" CornerRadius="6" HorizontalAlignment="Left">
-                    <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13"/>
+                    <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13" TextWrapping="Wrap"/>
                 </Border>
 
                 <!-- 当前显示坐标系：常驻标签，不随提示条一起被覆盖。

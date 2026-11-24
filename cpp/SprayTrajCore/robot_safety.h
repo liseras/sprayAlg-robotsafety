@@ -246,7 +246,7 @@ typedef struct RobotSafetyResult {
     int    l0Issues;         // L0 输入层自检问题数（吊臂余量 / 反推喷距不一致），非 0 时结论不可信
     double standoffMedianMm; // 沿枪轴反推的喷距中位数（<0 = 未测到）
 
-    const char* error;       // 失败原因（成功为 NULL）
+    const char* error;       // UTF-8 失败原因（成功为 NULL）
 } RobotSafetyResult;
 
 // 默认参数（standoff=100 safety=20 search=120 toolLen=150 ...）

@@ -733,6 +733,7 @@ namespace SprayTrajViewer
                 var swLoad = System.Diagnostics.Stopwatch.StartNew();
                 _cloud = PlyReader.Read(path);
                 swLoad.Stop();
+                InvalidateTrajectory("已更换点云");
                 _currentFile = path;
                 _exportDirResolved = null;
                 // 原样留一份：手眼变换每次从它重算，保证反复触发不会叠加。
@@ -1431,7 +1432,10 @@ namespace SprayTrajViewer
         /// </summary>
         void InvalidateTrajectory(string reason)
         {
-            if (_lastTraj.Count == 0 && _safetyPts.Length == 0) return;
+            CardSafety.Visibility = Visibility.Collapsed;
+            TxtResult.Text = "";
+            TxtSafetyInline.Text = $"尚未评估（{reason}，请重新生成轨迹）";
+            if (_lastTraj.Count == 0 && _safetyPts.Length == 0 && _planes.Count == 0) return;
 
             _lastTraj.Clear();
             _safetyPts = Array.Empty<RobotSafetyPoint>();
@@ -1453,9 +1457,10 @@ namespace SprayTrajViewer
             if (_fixedDroppedVisual != null) { Viewport.Children.Remove(_fixedDroppedVisual); _fixedDroppedVisual = null; }
             if (_fixedTransVisual != null) { Viewport.Children.Remove(_fixedTransVisual); _fixedTransVisual = null; }
 
-            TxtResult.Text = "";
-            TxtSafetyInline.Text = "尚未评估（" + reason + "，请重新生成轨迹）";
-            InvalidateSceneBounds();   // 轨迹没了，包围盒要收缩回点云/面片
+            _planes.Clear();
+            RenderPlane();
+            GridFaces.ItemsSource = null;
+            TxtFaceStat.Text = "";
             App.Log("INVALIDATE", null, reason + " → 已清除旧轨迹与评估结果");
         }
 
@@ -1515,6 +1520,8 @@ namespace SprayTrajViewer
                 MessageBox.Show("请先加载点云文件", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
+
+            InvalidateTrajectory("正在重新生成轨迹");
 
             SprayTrajParams p = new()
             {
@@ -1599,20 +1606,20 @@ namespace SprayTrajViewer
             }
             catch (DllNotFoundException)
             {
-                MessageBox.Show("未找到 SprayTraj.dll，请先编译 C++ 核心库并复制到程序目录。", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                ReportGenerationFailure("未找到 SprayTraj.dll，请先编译 C++ 核心库并复制到程序目录。");
                 return;
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"调用失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                ReportGenerationFailure(ex.Message);
                 return;
             }
 
             if (res.error != IntPtr.Zero)
             {
-                string err = Marshal.PtrToStringAnsi(res.error) ?? "未知错误";
-                TxtResult.Text = $"失败：{err}";
+                string err = Marshal.PtrToStringUTF8(res.error) ?? "未知错误";
                 Native.spray_traj_free(ref res);
+                ReportGenerationFailure(err);
                 return;
             }
 
@@ -1695,6 +1702,15 @@ namespace SprayTrajViewer
             // 少了这一步，用户看到的漂亮轨迹可能是不可达或撞工件的。
             if (ChkAutoSafety.IsChecked == true && !_suppressAutoSafety)
                 _ = RunSafetyCheckAsync(true);
+        }
+
+        void ReportGenerationFailure(string error)
+        {
+            string message = $"轨迹生成失败：{error}";
+            TxtResult.Text = message;
+            TxtHint.Text = message;
+            TxtSafetyInline.Text = "轨迹生成失败，请生成有效轨迹后再评估。";
+            App.Log("GEN/FAIL", null, error);
         }
 
         void RenderTrajectory(List<SprayTrajPoint> traj)
@@ -3092,6 +3108,8 @@ namespace SprayTrajViewer
 
         async Task RunSafetyCheckAsync(bool auto)
         {
+            if (!BtnSafety.IsEnabled) return;
+
             if (_lastTraj.Count == 0)
             {
                 if (!auto)
@@ -3148,7 +3166,8 @@ namespace SprayTrajViewer
             p.tiltSideX = CmbTiltSide.SelectedIndex switch { 1 => 1.0, 2 => -1.0, _ => 0.0 };
 
             double[]? basePose = BuildBasePose();
-            var pts = _lastTraj.ToArray();
+            var trajectory = _lastTraj;
+            var pts = trajectory.ToArray();
             var cloudXyz = new double[_cloud.Count * 3];
             for (int i = 0; i < _cloud.Count; i++)
             {
@@ -3174,13 +3193,13 @@ namespace SprayTrajViewer
                     ? "竖直向上 = 基座 +Z（由基座位姿给出，忽略「重力向上」下拉）"
                     : "竖直向上 = 「重力向上」下拉（基座为自动假设，没有基座系可用）");
                 st = await Task.Run(() =>
-                    Native.robot_safety_check_up(pts, pts.Length, cloudXyz, _cloud.Count,
+                    Native.robot_safety_check_up(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
                                                  basePose, ref p, upVec));
                 sw.Stop();
 
                 if (st.error != IntPtr.Zero)
                 {
-                    err = Marshal.PtrToStringAnsi(st.error) ?? "未知错误";
+                    err = Marshal.PtrToStringUTF8(st.error) ?? "未知错误";
                 }
                 else
                 {
@@ -3199,6 +3218,14 @@ namespace SprayTrajViewer
             {
                 try { Native.robot_safety_free(ref st); } catch { }
                 BtnSafety.IsEnabled = true;
+            }
+
+            // 点云或轨迹在后台评估期间可能已经换过。
+            if (!ReferenceEquals(_lastTraj, trajectory) || trajectory.Count == 0)
+            {
+                if (_lastTraj.Count > 0 && ChkAutoSafety.IsChecked == true && !_suppressAutoSafety)
+                    await RunSafetyCheckAsync(true);
+                return;
             }
 
             if (err != null)
@@ -3520,7 +3547,7 @@ namespace SprayTrajViewer
             try
             {
                 IntPtr p = Native.robot_safety_build_stamp();
-                return p == IntPtr.Zero ? "未知" : (Marshal.PtrToStringAnsi(p) ?? "未知");
+                return p == IntPtr.Zero ? "未知" : (Marshal.PtrToStringUTF8(p) ?? "未知");
             }
             catch (EntryPointNotFoundException) { return "旧版库（无构建戳，请同步 SprayTraj.dll）"; }
             catch { return "未知"; }

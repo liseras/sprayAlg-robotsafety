@@ -120,3 +120,16 @@ cpp/SprayTrajCore/_abi_probe/
 
 # 归档目录子文件夹里的点云/轨迹 PLY（可由同名 CSV + 驱动重生成，只留结论页与数值）
 outputs/*/*.ply
+
+# ---------------------------------------------------------------
+# 2026-11-24 补充
+# ---------------------------------------------------------------
+
+# 曲面网格截线布行改造的改动前/合并前对照跑批（整套 big/bin 输入输出，7MB 级，可重跑）
+cpp/_regress/regress_out_*/
+
+# row150/so150 全量跑批（report.html + fig + csv，跑一遍脚本就重生成）
+outputs/regress_row150_so150/
+
+# 算法包预览图的 PNG 转换副本（与同目录 preview.bmp 同源，随时可再转）
+tools/spray_traj_package/out_p*/preview.png
