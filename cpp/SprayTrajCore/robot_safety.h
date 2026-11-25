@@ -142,6 +142,13 @@ typedef struct RobotSafetyParams {
 // 方位恒 0；这个的倾角和方位都由**机器人前臂构型**反推，是运动学闭环。
 // 两者可同时置位（基线口径仍按 PERP 跑，J5 在其上叠加救援）。
 #define RS_POSE_TILT_J5     (1 << 2)   // 逐点解析救 J5（基线之上叠加，姿态逐点可变）
+// 先在原喷涂 TCP 上规划枪轴，再按 requireReach 对最终位姿独立做运动学评估。
+// 固定模式共用面组枪轴，逐点模式限速。运动学不参与选姿，也不启用 J5 倾角救援。
+#define RS_POSE_GEOMETRY_FIRST (1 << 3)
+// 已知基座在逐点模式下固定 TCP，沿不同方位搜索枪轴，复核落点、碰撞和连续性。
+#define RS_POSE_REACH_ASSIST (1 << 4)
+// 允许在原工件坐标上平移、等比缩放 TCP 轨迹并重新定向，保留路径形状。
+#define RS_POSE_SHAPE_SHIFT (1 << 5)
 // 注意：requireReach 占用的就是原来那个没用上的 `maxCloudPoints` 保留槽位，
 // fastPose 占的是结构体尾部原本的 4 字节对齐填充，所以 sizeof(RobotSafetyParams) 仍是 152、
 // ABI 不变，旧调用方（不碰这两个字段）拿到的仍是 default_params 给的 1/0 —— 行为与以前逐字节一致。
@@ -158,7 +165,8 @@ typedef struct RobotSafetyParams {
 #define RS_VIOL_LINK_HIT       (1u << 8)   // P0 连杆/关节/底座撞点云（不含枪体）
 #define RS_VIOL_TOOL_HIT       (1u << 9)   // P0 枪体/细管/喷嘴撞点云
 #define RS_VIOL_STEP_JUMP      (1u << 10)  // P2 相邻点 TCP 直线步长过大（跨行/跨换段也查）
-#define RS_VIOL_COUNT          11
+#define RS_VIOL_AIM_MISS       (1u << 11)  // P1 枪轴在名义喷距窗口内缺少点云支撑
+#define RS_VIOL_COUNT          11          // byRule 的 ABI 固定，AIM_MISS 单独计数
 
 // TILT_JUMP 与 STEP_JUMP 的分工（两个都报过，别合并）：
 //   TILT_JUMP 看**姿态**——相邻枪轴夹角超 tiltRate 的 3 倍（最低 10°）。用 3D 夹角而不是
@@ -244,6 +252,7 @@ typedef struct RobotSafetyResult {
     int    azStanceRows;     // 其中**实际生效**地改用「站位侧」的笔画数（被逐点回退的不算）
 
     int    l0Issues;         // L0 输入层自检问题数（吊臂余量 / 反推喷距不一致），非 0 时结论不可信
+    int    aimMissPoints;   // AIM_MISS 点数，使用原有的 4 字节对齐填充
     double standoffMedianMm; // 沿枪轴反推的喷距中位数（<0 = 未测到）
 
     const char* error;       // UTF-8 失败原因（成功为 NULL）
@@ -299,6 +308,22 @@ SPRAYTRAJ_API RobotSafetyResult robot_safety_check_up(
     const double* basePose16,
     const RobotSafetyParams* params,
     const double upCloud[3]);
+
+// 机型由调用方显式指定，旧入口继续使用 VS-087。
+#define RS_MODEL_VS087 0
+#define RS_MODEL_CGXI_G20 1
+SPRAYTRAJ_API RobotSafetyResult robot_safety_check_up_model(
+    const SprayTrajPoint* pts, int n,
+    const double* cloudXyz, int cloudCount,
+    const double* basePose16,
+    const RobotSafetyParams* params,
+    const double upCloud[3],
+    int modelId);
+
+// G20 固定工具滚转试验（度），保持 TCP 与枪轴定义不变。
+SPRAYTRAJ_API RobotSafetyResult robot_safety_check_g20_roll(
+    const SprayTrajPoint* pts, int n, const double* cloudXyz, int cloudCount,
+    const double* basePose16, const RobotSafetyParams* params, const double upCloud[3], double rollDeg);
 
 SPRAYTRAJ_API void robot_safety_free(RobotSafetyResult* res);
 

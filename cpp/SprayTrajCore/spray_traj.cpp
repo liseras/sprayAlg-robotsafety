@@ -363,8 +363,7 @@ struct TrajPoint { Vec3 pos; Vec3 dir; double speed; int spray; };
 // 才拦住）。那个"碎面"是体素把主面撕下来的一块，不是真碎面 —— 碎面过滤在
 // 相当程度上是在给体素擦屁股。全分辨率下它被主面正常吸收。
 //
-// 分辨率口径见 auto_voxel_leaf()：锚定重建尺度 kReconGap/6，下限守点距/2
-// （采样定理：点距 p 的点云几何信息只到 p/2），上限 10mm。与工艺行距无关。
+// 分辨率锚定重建尺度 kReconGap/6。轨迹点距、扫描行距不参与体素大小选择。
 //
 // 体素代表点的**索引**版本：不复制点，只挑出"每格最靠近格心"的那个原始下标。
 // 返回下标而不是复制点：分割结果 seg.inl 用的是原始点下标，两套口径共用
@@ -419,13 +418,9 @@ static constexpr double kReconGap = 12.0;
 // 于是同一份点云填不同行距会得到**不同的降采样点云 → 不同的平面重建**，
 // 用户 2026-11-20 15:28 实测 p047 行距 12 出 2 个面、行距 120 出 3 个面，
 // 就是这个口径漏出来的（重建与工艺必须是两条独立的链）。
-// 现在：分辨率锚定重建尺度 kReconGap/6 = 2mm（"重建格距的 1/6"，比一个重
-// 建格子细一档，足够分辨轮廓与窄筋），下限守点距/2（采样定理），上限 10mm
-// （实测 10mm 在 8° 斜面上出现 15mm 台阶）。
-static double auto_voxel_leaf(const SprayTrajParams* p){
-    const double byGeo   = kReconGap/6.0;
-    const double byPoint = p->pointSpacing*0.5;
-    return std::min(10.0, std::max(byPoint, byGeo));
+// 重建格距的 1/6 保留轮廓和窄筋。指令采样密度不应改变点云预处理结果。
+static double auto_voxel_leaf(){
+    return kReconGap / 6.0;
 }
 // 兜底重试用的临时档位（>0 时覆盖自动档；-1 = 不覆盖）。
 // 为什么需要：双层薄壳在"体素边长大致等于壁厚"的窄带里，两层会被切成两个面、
@@ -5450,7 +5445,7 @@ static void spray_traj_core(
     {
         if(const char* e = std::getenv("SPRAYTRAJ_VOXEL")) planLeaf = std::atof(e);
         else if(g_voxelLeafOverride > 1e-6) planLeaf = g_voxelLeafOverride;   // 兜底重试档
-        else if(n > 120000) planLeaf = auto_voxel_leaf(params);
+        else if(n > 120000) planLeaf = auto_voxel_leaf();
     }
     nAfterVoxel = P.size();
 
@@ -10997,7 +10992,7 @@ static void run_with_retry(const double* xyz, int n, const SprayTrajParams* para
     // 自动体素档位可能将薄壳切成两层，退一档重试。保留用户显式设置的体素档位。
     if(out->error && params && n > 120000 && !std::getenv("SPRAYTRAJ_VOXEL")
        && failure == TrajectoryFailure::NoRows){
-        double leaf = auto_voxel_leaf(params);
+        double leaf = auto_voxel_leaf();
         for(int k=0;k<2;++k){
             leaf *= 1.6;                                  // 7.5 → 12 → 19
             if(leaf > 25.0) break;

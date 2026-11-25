@@ -213,6 +213,7 @@ struct TrajCsv {
     std::vector<SprayTrajPoint> pts;
     std::vector<std::string> header;
     std::vector<std::vector<std::string> > rawRows;   // 原始 token，用于原样带出额外列
+    int kindColumn = -1;
     std::string error;
 };
 
@@ -270,9 +271,9 @@ bool readTraj(const char* path, TrajCsv& out) {
         size_t b = h.find_last_not_of(" \t");
         h = (a == std::string::npos) ? std::string() : h.substr(a, b - a + 1);
     }
-    int idx[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-    const char* want[8] = {"x", "y", "z", "i", "j", "k", "speed", "spray"};
-    for (int w = 0; w < 8; ++w) {
+    int idx[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    const char* want[9] = {"x", "y", "z", "i", "j", "k", "speed", "spray", "kind"};
+    for (int w = 0; w < 9; ++w) {
         for (size_t c = 0; c < out.header.size(); ++c) {
             std::string h = out.header[c];
             for (auto& ch : h) ch = (char)tolower((unsigned char)ch);
@@ -282,6 +283,7 @@ bool readTraj(const char* path, TrajCsv& out) {
             }
         }
     }
+    out.kindColumn = idx[8];
     for (int w = 0; w < 6; ++w) {
         if (idx[w] < 0) {
             out.error = std::string("轨迹缺列 ") + want[w];
@@ -302,6 +304,7 @@ bool readTraj(const char* path, TrajCsv& out) {
         p.k = atof(tok[idx[5]].c_str());
         p.speed = idx[6] >= 0 && idx[6] < (int)tok.size() ? atof(tok[idx[6]].c_str()) : 200.0;
         p.spray = idx[7] >= 0 && idx[7] < (int)tok.size() ? atoi(tok[idx[7]].c_str()) : 1;
+        p.kind = idx[8] >= 0 && idx[8] < (int)tok.size() ? atoi(tok[idx[8]].c_str()) : 0;
         out.pts.push_back(p);
         out.rawRows.push_back(tok);
     }
@@ -335,6 +338,10 @@ const char* violText(unsigned int v, std::string& buf) {
             if (!buf.empty()) buf += "|";
             buf += nm;
         }
+    }
+    if (v & RS_VIOL_AIM_MISS) {
+        if (!buf.empty()) buf += "|";
+        buf += robot_safety_rule_name(RS_VIOL_AIM_MISS);
     }
     return buf.c_str();
 }
@@ -370,6 +377,7 @@ int main(int argc, char** argv) {
         printf("      -standoff -safety -hardclr -search -tool -tilt -tiltmax -rate -sprayang\n");
         printf("      -hardclr <mm>  绝对安全距离/回退硬下限（默认 2；0=只要不穿透）\n");
         printf("      -threads <n>  -stride <n>  -voxel <mm>  -azmode <0|1>  -base <x y z rx ry rz>\n");
+        printf("      -model <VS-087|CGXi-G20>  运动学和碰撞模型，默认 VS-087\n");
         printf("      -up <+X|-X|+Y|-Y|+Z|-Z | x y z>  点云系重力向上方向（默认 +Z=旧口径）。\n");
         printf("          点云是相机系时必须改：相机 +Z 是光轴不是重力，倾角『朝上』会判错方向。\n");
         printf("      -reach <0|1>   1=要求可达（完整口径，默认）；0=只查几何（不解 IK / 不查连杆自碰撞）\n");
@@ -377,6 +385,9 @@ int main(int argc, char** argv) {
         printf("      -tiltmode <0|1> 1=倾角逐点连续（tilt=系数×δ/90，δ=法向与重力向上夹角，系数见 -tilt）；\n");
         printf("                      0=面级常量（默认：一个面组锁一个倾角）\n");
         printf("      -tiltj5 <0|1>  1=逐点解析救 J5（倾角+方位由前臂方向反推，姿态逐点可变）；优先于 -tiltmode\n");
+        printf("      -geometry-first <0|1>  保留喷涂 TCP，先规划枪轴，按 -reach 对最终位姿做运动学检查\n");
+        printf("      -reach-assist <0|1>  在已知基座上，固定 TCP 并搜索枪轴方位，尝试修正不可达枪姿\n");
+        printf("      -shape-shift <0|1>   允许整条 TCP 轨迹平移或等比缩放，并复核喷枪瞄准和机器人运动学\n");
         printf("      -quiet\n");
         printf("      -azmode 0 = 按机器人站位逐行择优进刀侧（默认）；1 = 只用「向上」（旧口径）\n");
         return 2;
@@ -386,6 +397,7 @@ int main(int argc, char** argv) {
     const char* outPath = argv[3];
 
     RobotSafetyParams p = robot_safety_default_params();
+    int model = RS_MODEL_VS087;
     double basePose[16];
     bool hasBase = false;
     double up[3] = {0, 0, 1};   // 点云系重力向上；默认旧口径 +Z
@@ -394,7 +406,13 @@ int main(int argc, char** argv) {
     bool reach = true;   // 是否要求"这台机器人够得着/不撞自己"（对应 p.requireReach）
 
     for (int i = 4; i < argc; ++i) {
-        if (!strcmp(argv[i], "-standoff") && i + 1 < argc) p.standoff = atof(argv[++i]);
+        if (!strcmp(argv[i], "-model") && i + 1 < argc) {
+            const char* name = argv[++i];
+            if (!strcmp(name, "VS-087")) model = RS_MODEL_VS087;
+            else if (!strcmp(name, "CGXi-G20") || !strcmp(name, "G20")) model = RS_MODEL_CGXI_G20;
+            else { printf("未知机型: %s\n", name); return 2; }
+        }
+        else if (!strcmp(argv[i], "-standoff") && i + 1 < argc) p.standoff = atof(argv[++i]);
         else if (!strcmp(argv[i], "-safety") && i + 1 < argc) p.safety = atof(argv[++i]);
         else if ((!strcmp(argv[i], "-hardclr") || !strcmp(argv[i], "-hard")) && i + 1 < argc) p.hardClearance = atof(argv[++i]);
         else if (!strcmp(argv[i], "-search") && i + 1 < argc) p.search = atof(argv[++i]);
@@ -421,6 +439,18 @@ int main(int argc, char** argv) {
             // 注意 fastPose 是位掩码，这里只动 bit0，不影响 -tiltmode 设的 bit1。
             if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_FAST;
             else                     p.fastPose &= ~RS_POSE_FAST;
+        }
+        else if (!strcmp(argv[i], "-geometry-first") && i + 1 < argc) {
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_GEOMETRY_FIRST;
+            else                     p.fastPose &= ~RS_POSE_GEOMETRY_FIRST;
+        }
+        else if (!strcmp(argv[i], "-reach-assist") && i + 1 < argc) {
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_REACH_ASSIST;
+            else                     p.fastPose &= ~RS_POSE_REACH_ASSIST;
+        }
+        else if (!strcmp(argv[i], "-shape-shift") && i + 1 < argc) {
+            if (atoi(argv[++i]) != 0) p.fastPose |= RS_POSE_SHAPE_SHIFT;
+            else                     p.fastPose &= ~RS_POSE_SHAPE_SHIFT;
         }
         else if ((!strcmp(argv[i], "-tiltmode") || !strcmp(argv[i], "-tiltperp")) && i + 1 < argc) {
             // 1 = 倾角逐点连续：tilt = tiltNonUpDeg × δ/90，δ = 法向与 +Z（正位置）夹角，
@@ -509,6 +539,8 @@ int main(int argc, char** argv) {
         printf("参数: standoff=%.1f safety=%.1f hardClearance=%.1f search=%.1f tool=%.1f tilt=%.1f/%.1f rate=%.1f sprayAngle<=%.1f\n",
                p.standoff, p.safety, p.hardClearance, p.search, p.toolLen, p.tiltNonUpDeg, p.tiltMaxDeg,
                p.tiltRateDeg, p.maxSprayAngleDeg);
+        if (p.fastPose & RS_POSE_GEOMETRY_FIRST)
+            printf("姿态规划: 几何优先，运动学仅复核已确定的位姿\n");
         printf("口径: reach=%d（1=几何+运动学；0=仅几何，不解 IK）· 姿态=%s · 倾角=%s\n",
                p.requireReach,
                (p.fastPose & RS_POSE_FAST) ? "单次逆解" : "搜索",
@@ -518,10 +550,9 @@ int main(int argc, char** argv) {
                                                      : "面级常量"));
     }
 
-    RobotSafetyResult r = robot_safety_check_up(traj.pts.data(), (int)traj.pts.size(),
-                                                cloud.xyz.data(), cloud.n,
-                                                hasBase ? basePose : NULL, &p,
-                                                hasUp ? up : NULL);
+    if (!quiet) printf("机型: %s\n", model == RS_MODEL_CGXI_G20 ? "CGXi-G20" : "VS-087");
+    RobotSafetyResult r = robot_safety_check_up_model(traj.pts.data(), (int)traj.pts.size(),
+        cloud.xyz.data(), cloud.n, hasBase ? basePose : nullptr, &p, hasUp ? up : nullptr, model);
     if (r.error) {
         printf("失败: %s\n", r.error);
         robot_safety_free(&r);
@@ -540,10 +571,7 @@ int main(int argc, char** argv) {
     // 修正层要靠它画橙色。输入若已带 kind 列，就不要再从 c>=8 里重复带一遍。
     fprintf(fc, "X,Y,Z,I,J,K,speed,spray,kind");
     for (int c = 8; c < nCols; ++c) {
-        std::string h = traj.header[c];
-        for (auto& ch : h) ch = (char)tolower((unsigned char)ch);
-        if (h == "kind") continue;
-        fprintf(fc, ",%s", traj.header[c].c_str());
+        if (c != traj.kindColumn) fprintf(fc, ",%s", traj.header[c].c_str());
     }
     fprintf(fc, ",tilt_deg,clearance_mm,clearance_tool_mm,clearance_link_mm,worst_part,link_part,"
                 "self_gap_mm,margin_deg,standoff_err_mm,lifted_mm,cond,reverted,"
@@ -552,7 +580,7 @@ int main(int argc, char** argv) {
     const int nRaw = (int)traj.rawRows.size();
     for (int i = 0; i < r.count; ++i) {
         const RobotSafetyPoint& q = r.points[i];
-        fprintf(fc, "%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d", q.x, q.y, q.z, q.i, q.j, q.k, q.speed, q.spray);
+        fprintf(fc, "%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.1f,%d,%d", q.x, q.y, q.z, q.i, q.j, q.k, q.speed, q.spray, q.kind);
         // ⚠ 越界防护是必须的，不是保险：安全层会**插补点**（步长硬上限那段把大步切成
         // 小步），输出点数 r.count 因此常常大于输入行数 nRaw。这里原来直接写
         // traj.rawRows[i] —— 插补一发生就越界读，实测 p047 界面口径
@@ -561,7 +589,8 @@ int main(int argc, char** argv) {
         // 对拍时被误判成算法不稳定。插补点没有对应的输入行，额外列留空。
         const std::vector<std::string>* tok = (i < nRaw) ? &traj.rawRows[i] : nullptr;
         for (int c = 8; c < nCols; ++c) {
-            fprintf(fc, ",%s", (tok && c < (int)tok->size()) ? (*tok)[c].c_str() : "");
+            if (c != traj.kindColumn)
+                fprintf(fc, ",%s", (tok && c < (int)tok->size()) ? (*tok)[c].c_str() : "");
         }
         // MSVC 的 %f 遇到 inf 会打出 "-1.#INF00"，CSV 直接不可解析；
         // 不可达点的 clearance 就是 -inf，这里必须显式写成 nan。
@@ -634,6 +663,9 @@ int main(int argc, char** argv) {
             printf("  %-15s %7d  [P%d]\n", nm ? nm : "?", r.byRule[b], lv);
         }
     }
+    acc[1] += r.aimMissPoints;
+    if (r.aimMissPoints > 0 && !quiet)
+        printf("  %-15s %7d  [P1]\n", robot_safety_rule_name(RS_VIOL_AIM_MISS), r.aimMissPoints);
     int pts[3] = {0, 0, 0};      // 按点去重：该点取命中的最高等级
     // 同时按「喷涂点 / 空移点」拆开数。空移段现在按点距铺满（每 4mm 一个 spray=0 点），
     // 于是它也被逐点判 IK/碰撞 —— 以前空移段只有几个拐点，这一层几乎等于没查。
@@ -644,14 +676,15 @@ int main(int argc, char** argv) {
     for (int i = 0; i < r.count; ++i) {
         unsigned int v = r.points[i].violation;
         if (!v) continue;
-        int lv = 2;
+        int lv = (v & RS_VIOL_AIM_MISS) ? 1 : 2;
         for (int b = 0; b < RS_VIOL_COUNT; ++b) {
             if ((v & (1u << b)) && kLevel[b] < lv) lv = kLevel[b];
         }
         ++pts[lv];
         if (r.points[i].spray) ++ptsS[lv]; else ++ptsM[lv];
     }
-    const char* verdict = (pts[0] > 0) ? "REJECT" : (pts[1] > 0 ? "PASS_WITH_WARNINGS" : "PASS");
+    const bool warnings = pts[1] > 0 || ((p.fastPose & RS_POSE_GEOMETRY_FIRST) && pts[2] > 0);
+    const char* verdict = pts[0] > 0 ? "REJECT" : (warnings ? "PASS_WITH_WARNINGS" : "PASS");
     printf("结论: %s  (P0=%d)\n", verdict, pts[0]);
     printf("  按点去重 P0=%d P1=%d P2=%d · 按类型累加 P0=%d P1=%d P2=%d\n",
            pts[0], pts[1], pts[2], acc[0], acc[1], acc[2]);

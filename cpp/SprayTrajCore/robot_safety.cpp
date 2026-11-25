@@ -1,4 +1,4 @@
-// robot_safety.cpp —— 机器人可执行性校验（VS-087）
+// robot_safety.cpp —— 喷涂轨迹的机器人运动学与碰撞校验
 //
 // 参数与算法同源于 tools/DensoArmKine（C#）：
 //   连杆表  <- Models/DensoLibrary.cs::Vs087()   （官方 vs087.urdf，reach 905）
@@ -20,12 +20,14 @@
 #include "robot_safety.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <string>
 #include <thread>
@@ -280,6 +282,22 @@ inline M3 frameFromZ(const V3& zAxis) {
     return R;
 }
 
+// 与 WPF 的 DENSO 计划导出一致：在基座系传递工具 X 轴，逆解失败也不改变目标姿态序列。
+inline M3 exportedToolFrame(const V3& gun, const V3* previousX) {
+    const V3 z = unit(gun);
+    V3 x = previousX ? *previousX - z * dot(*previousX, z) : V3(0, 0, 0);
+    if (norm(x) < 1e-3) {
+        const V3 ref = std::fabs(z.z) < 0.9 ? V3(0, 0, 1) : V3(1, 0, 0);
+        x = cross(ref, z);
+    }
+    const V3 y = unit(cross(z, x));
+    M3 R;
+    R.setCol(0, unit(cross(y, z)));
+    R.setCol(1, y);
+    R.setCol(2, z);
+    return R;
+}
+
 // 点到线段距离
 inline double pointSegDist(const V3& p, const V3& a, const V3& b) {
     V3 ab = b - a;
@@ -404,7 +422,36 @@ const JointDef kJoints[6] = {
     {"J6",   0.0, 0.0,  80.0,  0.0, 0.0, 1.0, -360.0, 360.0},
 };
 
-constexpr double kReach = 905.0;
+// G20 的轴线、限位及弯腕安装面来自 DensoArmKine/Models/CGXiLibrary.cs。
+const JointDef kG20Joints[6] = {
+    {"J1",    0.0, 0.0, 227.0,  0.0, 0.0, 1.0, -360.0, 360.0},
+    {"J2",  234.0, 0.0,   0.0,  1.0, 0.0, 0.0, -360.0, 360.0},
+    {"J3",    0.0, 0.0, 872.3,  0.0, 0.0, 1.0, -165.0, 165.0},
+    {"J4", -168.3, 0.0,   0.0,  1.0, 0.0, 0.0, -360.0, 360.0},
+    {"J5",    0.0, 0.0, 793.5,  0.0, 0.0, 1.0, -360.0, 360.0},
+    {"J6",  134.2, 0.0, 134.2,  0.0, 0.0, 1.0, -360.0, 360.0},
+};
+
+struct SafetyModel {
+    const JointDef* joints;
+    double reach;
+    Pose flangeMount;
+    V3 shoulderCenter;
+    double wristOffset;
+    double roughWristReach;
+    bool densoWrist;
+};
+
+const SafetyModel kVs087{kJoints, 905.0, poseTrans(0, 0, 0),
+    V3(0, 0, kJoints[0].oz + kJoints[1].oz), kJoints[5].oz,
+    std::hypot(kJoints[2].oz + kJoints[3].oz + kJoints[4].oz, std::fabs(kJoints[3].ox)) + kJoints[1].ox,
+    true};
+constexpr double kG20FlangeFace = 124.2;
+const SafetyModel kG20{kG20Joints, 1800.0,
+    poseMul(poseRot(V3(0, 1, 0), 90.0 * kDeg), poseTrans(0, 0, kG20FlangeFace)),
+    V3(0, 0, kG20Joints[0].oz), kG20FlangeFace,
+    kG20Joints[1].ox + kG20Joints[2].oz + std::fabs(kG20Joints[3].ox)
+        + kG20Joints[4].oz + std::hypot(kG20Joints[5].ox, kG20Joints[5].oz), false};
 constexpr double kDefaultToolLen = 150.0;
 
 struct FkOut {
@@ -415,17 +462,17 @@ struct FkOut {
     Pose tcp;
 };
 
-void fk(const double thetaDeg[6], const double toolLen, FkOut& out) {
+void fk(const double thetaDeg[6], const double toolLen, FkOut& out, const SafetyModel& model) {
     out.frames[0].R = M3::I();
     out.frames[0].t = V3(0, 0, 0);
     for (int i = 0; i < 6; ++i) {
-        const JointDef& j = kJoints[i];
+        const JointDef& j = model.joints[i];
         V3 ax(j.ax, j.ay, j.az);
         out.axes[i] = unit(m3mul(out.frames[i].R, ax));
         Pose local = poseMul(poseTrans(j.ox, j.oy, j.oz), poseRot(ax, thetaDeg[i] * kDeg));
         out.frames[i + 1] = poseMul(out.frames[i], local);
     }
-    out.flange = out.frames[6];
+    out.flange = model.densoWrist ? out.frames[6] : poseMul(out.frames[6], model.flangeMount);
     Pose tool = poseTrans(0.0, 0.0, toolLen);   // 法兰 +Z 指向喷嘴出口
     out.tcp = poseMul(out.flange, tool);
     for (int i = 0; i < 7; ++i) out.origins[i] = out.frames[i].t;
@@ -445,24 +492,24 @@ void jacobian(const FkOut& f, double J[6][6]) {
     }
 }
 
-inline bool overLimit(const double th[6]) {
+inline bool overLimit(const double th[6], const SafetyModel& model) {
     for (int i = 0; i < 6; ++i)
-        if (th[i] < kJoints[i].lo - 1e-9 || th[i] > kJoints[i].hi + 1e-9) return true;
+        if (th[i] < model.joints[i].lo - 1e-9 || th[i] > model.joints[i].hi + 1e-9) return true;
     return false;
 }
-inline double limitMarginMin(const double th[6]) {
+inline double limitMarginMin(const double th[6], const SafetyModel& model) {
     double m = 1e18;
-    for (int i = 0; i < 6; ++i) m = std::min(m, std::min(th[i] - kJoints[i].lo, kJoints[i].hi - th[i]));
+    for (int i = 0; i < 6; ++i) m = std::min(m, std::min(th[i] - model.joints[i].lo, model.joints[i].hi - th[i]));
     return m;
 }
 
 // 归一化雅可比条件数。**位置行必须除以特征长度**：原始 J 前三行是 mm（量级 ~500）、
 // 后三行是 rad（~1），直接 SVD 得到的条件数正常姿态就有上千，与"是否接近奇异"无关。
-inline double condNumber(const FkOut& f) {
+inline double condNumber(const FkOut& f, double positionScale) {
     double J[6][6];
     jacobian(f, J);
     for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 6; ++j) J[i][j] /= 500.0;
+        for (int j = 0; j < 6; ++j) J[i][j] /= positionScale;
     double A[6][6];
     for (int i = 0; i < 6; ++i)
         for (int j = 0; j < 6; ++j) {
@@ -571,10 +618,12 @@ constexpr double kIkValidRotDeg = 0.20; // 判定「这个解能用」的门槛�
 constexpr int kIkMaxIters = 40;         // 原 90；配合上面的容差，跑满 40 的基本都是真失败（再降到 30 实测只快 4%，已到边际）
 
 // 阻尼最小二乘的单次迭代
-IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double seed[6]) {
+IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double seed[6],
+             const SafetyModel& model) {
     double th[6];
     for (int i = 0; i < 6; ++i) th[i] = seed[i];
-    const double wRot = 100.0;   // 1rad 姿态误差 ≈ 100mm 位置误差，把两行拉到同一量纲
+    const double wRot = model.densoWrist ? 100.0 : 180.0;
+    const int maxIters = model.densoWrist ? kIkMaxIters : 60;
     double lam = 30.0;
     double bestErr = 1e300;
     int stall = 0;               // 连续"没把误差压下去"的迭代次数
@@ -584,9 +633,9 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
     // 提到循环外不改变任何数值：fk 只读自己上一轮写过的 frames[i]，不读初值。
     FkOut f;
 
-    for (int it = 0; it < kIkMaxIters; ++it) {
+    for (int it = 0; it < maxIters; ++it) {
         ++iters;
-        fk(th, toolLen, f);
+        fk(th, toolLen, f, model);
         V3 ep = pTarget - f.tcp.t;
         V3 er = matToRotvec(m3mul(RTarget, m3T(f.tcp.R)));
         double err[6] = {ep.x, ep.y, ep.z, wRot * er.x, wRot * er.y, wRot * er.z};
@@ -647,14 +696,14 @@ IkSol ikOnce(const V3& pTarget, const M3& RTarget, double toolLen, const double 
     if (g_prof.on) g_prof.ikIters += iters;   // 常开会在 8 线程间抢同一条缓存行
 
     // 退出循环时 th 已经走了一步（最后一轮的 dth 已加），所以 f 是过期的，必须重算。
-    fk(th, toolLen, f);
+    fk(th, toolLen, f, model);
     IkSol sol;
     for (int i = 0; i < 6; ++i) sol.theta[i] = th[i];
     sol.posErr = norm(pTarget - f.tcp.t);
     sol.rotErrDeg = norm(matToRotvec(m3mul(RTarget, m3T(f.tcp.R)))) * kRad;
     sol.ok = (sol.posErr <= std::max(0.02 * 20, 0.5) && sol.rotErrDeg <= std::max(0.02 * 20, 0.5));
-    sol.over = overLimit(th);
-    sol.margin = limitMarginMin(th);
+    sol.over = overLimit(th, model);
+    sol.margin = limitMarginMin(th, model);
     // cond 不在这里算：见 IkSol::cond 的注释（19 个候选里 18 个会被丢弃）。
     return sol;
 }
@@ -733,7 +782,113 @@ constexpr int kOverSweepMax = 8;
 // 所以定为 0：解析段全灭就直接返回失败，一组固定种子都不跑。
 // 真遇到"闭式解漏了、固定种子能捞回来"的件，把它调大即可（0 → 12 = 旧行为）。
 constexpr int kFixedSeedAfterAnaFail = 0;
-IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed) {
+// G20 的 J5/J6 轴方向相同而中心错开。沿腕部偏置圆周构造初值，再用完整 TCP 位姿求逆解。
+IkSol ikG20(const V3& target, const M3& rotation, double toolLen, const double* seed,
+            const SafetyModel& model) {
+    const auto* j = model.joints;
+    const double zero[6] = {};
+    const double* reference = seed ? seed : zero;
+    auto solve = [&](const double* initial) {
+        if (g_prof.on) ++g_prof.ikOnceN;
+        IkSol sol = ikOnce(target, rotation, toolLen, initial, model);
+        for (int i = 0; i < 6; ++i) {
+            if (!std::isfinite(sol.theta[i])) { sol.ok = false; return sol; }
+            const double lo = std::ceil((j[i].lo - sol.theta[i]) / 360.0 - 1e-12);
+            const double hi = std::floor((j[i].hi - sol.theta[i]) / 360.0 + 1e-12);
+            if (lo <= hi) {
+                const double nearest = std::round((reference[i] - sol.theta[i]) / 360.0);
+                sol.theta[i] += 360.0 * clampd(nearest, lo, hi);
+            }
+        }
+        sol.over = overLimit(sol.theta, model);
+        sol.margin = limitMarginMin(sol.theta, model);
+        return sol;
+    };
+    auto valid = [](const IkSol& sol) {
+        return sol.ok && !sol.over && sol.posErr < kIkValidPosMM && sol.rotErrDeg < kIkValidRotDeg;
+    };
+    IkSol best;
+    if (seed) {
+        best = solve(seed);
+        if (valid(best) && maxJointDelta(best.theta, seed) <= kBranchContinuityTrigDeg) return best;
+    }
+
+    const M3 wrist = m3mul(rotation, m3T(model.flangeMount.R));
+    const V3 forearm = wrist.col(2);
+    const V3 joint6 = target - rotation.col(2) * (toolLen + model.wristOffset);
+    const V3 elbowCenter = joint6 - forearm * (j[4].oz + j[5].oz) - model.shoulderCenter;
+    const double shoulderSide = j[1].ox, upper = j[2].oz, elbowSide = -j[3].ox;
+    // J4 必须同时落在腕部偏置圆和肩部回转所能到达的距离带内。
+    const double axial = dot(elbowCenter, forearm);
+    const double lateralRadius = norm(elbowCenter - forearm * axial);
+    const double elbowReach = std::hypot(upper, elbowSide);
+    const double nearestElbow = std::hypot(axial, lateralRadius - j[5].ox);
+    const double farthestElbow = std::hypot(axial, lateralRadius + j[5].ox);
+    if (!best.ok && (nearestElbow > elbowReach + shoulderSide + 1.0 ||
+                     farthestElbow < elbowReach - shoulderSide - 1.0)) return best;
+    struct Seed { std::array<double, 6> theta; double score; };
+    constexpr int sectors = 24;
+    std::array<Seed, sectors * 4> starts;
+    size_t count = 0;
+    for (int i = 0; i < sectors; ++i) {
+        const double az = i * 2.0 * kPi / sectors;
+        const V3 lateral = wrist.col(0) * std::cos(az) + wrist.col(1) * std::sin(az);
+        const V3 elbow = elbowCenter - lateral * j[5].ox;
+        const double radial = std::hypot(elbow.x, elbow.y);
+        const double projection = (dot(elbow, elbow) + sq(shoulderSide) - sq(upper) - sq(elbowSide))
+                                / (2.0 * shoulderSide);
+        const double bearing = std::atan2(elbow.y, elbow.x);
+        const double turn = std::acos(clampd(projection / std::max(radial, kEps), -1.0, 1.0));
+        for (double q1 : {bearing + turn, bearing - turn}) {
+            const M3 base = rotAxis(V3(0, 0, 1), q1);
+            const double elbowX = dot(elbow, base.col(0)) - shoulderSide;
+            const double q3abs = std::acos(clampd(-elbowX / elbowSide, -1.0, 1.0));
+            for (double q3 : {q3abs, -q3abs}) {
+                const double q2 = std::atan2(-dot(elbow, base.col(1)), elbow.z)
+                                - std::atan2(elbowSide * std::sin(q3), upper);
+                const M3 shoulder = m3mul(base, rotAxis(V3(1, 0, 0), q2));
+                const M3 elbowFrame = m3mul(shoulder, rotAxis(V3(0, 0, 1), q3));
+                const double q4 = std::atan2(-dot(forearm, elbowFrame.col(1)), dot(forearm, elbowFrame.col(2)));
+                const M3 arm = m3mul(elbowFrame, rotAxis(V3(1, 0, 0), q4));
+                const double q5 = std::atan2(dot(lateral, arm.col(1)), dot(lateral, arm.col(0)));
+                const double q56 = std::atan2(dot(wrist.col(0), arm.col(1)), dot(wrist.col(0), arm.col(0)));
+                const double radialError = std::fabs(norm(elbow - base.col(0) * shoulderSide)
+                                                     - elbowReach);
+                const double limits = std::max(0.0, std::fabs(q3) * kRad - j[2].hi);
+                starts[count++] = {{q1*kRad, q2*kRad, q3*kRad, q4*kRad, q5*kRad, (q56-q5)*kRad},
+                    radialError + std::fabs(dot(forearm, elbowFrame.col(0))) * j[4].oz + limits * 2.0};
+            }
+        }
+    }
+    constexpr size_t attempts = 12;
+    std::partial_sort(starts.begin(), starts.begin() + attempts, starts.end(),
+                     [](const Seed& a, const Seed& b) { return a.score < b.score; });
+    bool hasValid = valid(best);
+    double bestDistance = hasValid ? jointDist2(best.theta, reference) : 1e300;
+    for (size_t i = 0; i < attempts; ++i) {
+        IkSol trial = solve(starts[i].theta.data());
+        if (valid(trial)) {
+            if (!seed) return trial;
+            const double dist = jointDist2(trial.theta, reference);
+            if (!hasValid || dist < bestDistance) {
+                best = trial;
+                hasValid = true;
+                bestDistance = dist;
+            }
+            if (maxJointDelta(trial.theta, seed) <= kBranchContinuityTrigDeg) break;
+        } else if (!hasValid && rankCmp(trial, best) < 0) {
+            best = trial;
+        }
+    }
+    return best;
+}
+
+IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed,
+         const SafetyModel& model) {
+    if (!model.densoWrist) {
+        if (g_prof.on) ++g_prof.ik;
+        return ikG20(pTarget, RTarget, toolLen, seed, model);
+    }
     if (g_prof.on) ++g_prof.ik;   // 仅诊断计数：常开时 8 线程抢同一条缓存行，实测有 2~3% 开销
     double seeds[1 + 16 + 12][6];
     int ns = 0;
@@ -769,7 +924,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
 
     // 先跑上一点种子：连续且合法就直接返回，保持主路径速度。
     if (seed) {
-        IkSol sol = ikOnce(pTarget, RTarget, toolLen, seed);
+        IkSol sol = ikOnce(pTarget, RTarget, toolLen, seed, model);
         if (g_prof.on) ++g_prof.ikOnceN;
         ++nOnce;
         best = sol;
@@ -814,7 +969,7 @@ IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* see
                 if (same) { ++g_prof.sweepDup; break; }
             }
         }
-        IkSol sol = ikOnce(pTarget, RTarget, toolLen, seeds[i]);
+        IkSol sol = ikOnce(pTarget, RTarget, toolLen, seeds[i], model);
         if (g_prof.on) ++g_prof.ikOnceN;
         ++nOnce;
         if (sol.ok) anyGeo = true;
@@ -936,6 +1091,8 @@ void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vect
         }
     }
     // 工具段：法兰→TCP 的方向就是工具 +Z，展开成握把/细管/喷嘴三段
+    if (norm(f.flange.t - f.origins[6]) > kEps)
+        out.push_back({f.origins[6], f.flange.t, sz.wristLinkR, SG_LINK, 6, 6, "腕部法兰", RS_SEG_LINK});
     buildToolSegs(f.flange.t, f.tcp.t, sz, out);
 }
 
@@ -1063,8 +1220,26 @@ public:
         if (nodes_.empty()) return radius;
         if (g_prof.on) ++g_prof.seg;
         double best = radius;
-        queryRec(root_, a, b, best);
+        queryRec(root_, a, b, lowerBound(nodes_[root_], a, b), best);
         return best;
+    }
+
+    // 落点验证只关心有没有支撑点，命中后就可以停止搜索。
+    bool hasPointNearSegment(const V3& a, const V3& b, double radius) const {
+        if (nodes_.empty()) return false;
+        if (g_prof.on) ++g_prof.seg;
+        double best = radius;
+        queryRec<true>(root_, a, b, lowerBound(nodes_[root_], a, b), best);
+        return best < radius;
+    }
+
+    bool nearestToSegment(const V3& a, const V3& b, double radius, V3& hit) const {
+        if (nodes_.empty()) return false;
+        int index = -1;
+        queryRec(root_, a, b, lowerBound(nodes_[root_], a, b), radius, &index);
+        if (index < 0) return false;
+        hit = point(index);
+        return true;
     }
 
     // 平均点间距（抽样 200 个点的最近邻距离中位数）—— 给"沿枪轴投影"的管道半径用
@@ -1163,26 +1338,34 @@ private:
         return std::max(lb1, std::max(lb2, 0.0));
     }
 
-    void queryRec(int node, const V3& A, const V3& B, double& best) const {
-        if (best <= 0.0) return;
+    template<bool stopOnHit = false>
+    void queryRec(int node, const V3& A, const V3& B, double bound, double& best,
+                  int* nearest = nullptr) const {
+        if (best <= 0.0 || bound >= best) return;
         const KdNode& nd = nodes_[node];
-        if (lowerBound(nd, A, B) >= best) return;
         if (nd.count > 0) {
             for (int i = nd.start; i < nd.start + nd.count; ++i) {
                 int p = idx_[i];
                 double d = pointSegDist(V3(px_[p], py_[p], pz_[p]), A, B);
-                if (d < best) best = d;
+                if (d < best) {
+                    if constexpr (stopOnHit) {
+                        best = 0.0;
+                        return;
+                    }
+                    best = d;
+                    if (nearest) *nearest = p;
+                }
             }
             return;
         }
         double lbL = nd.left >= 0 ? lowerBound(nodes_[nd.left], A, B) : 1e300;
         double lbR = nd.right >= 0 ? lowerBound(nodes_[nd.right], A, B) : 1e300;
         if (lbL <= lbR) {
-            if (nd.left >= 0) queryRec(nd.left, A, B, best);
-            if (nd.right >= 0) queryRec(nd.right, A, B, best);
+            if (nd.left >= 0) queryRec<stopOnHit>(nd.left, A, B, lbL, best, nearest);
+            if (nd.right >= 0) queryRec<stopOnHit>(nd.right, A, B, lbR, best, nearest);
         } else {
-            if (nd.right >= 0) queryRec(nd.right, A, B, best);
-            if (nd.left >= 0) queryRec(nd.left, A, B, best);
+            if (nd.right >= 0) queryRec<stopOnHit>(nd.right, A, B, lbR, best, nearest);
+            if (nd.left >= 0) queryRec<stopOnHit>(nd.left, A, B, lbL, best, nearest);
         }
     }
 
@@ -1254,6 +1437,8 @@ void computeRows(const TrajIn& t, std::vector<std::pair<int, int>>& rows) {
 // ================================================================ 评价器
 
 struct Params {
+    const SafetyModel* model = &kVs087;
+    double gunRollRad = 0.0;
     double standoff = 100.0;
     double safety = 20.0;          // 间隙告警阈值（软约束，只影响 P1 报告）
     double hardClearance = 2.0;    // 绝对安全距离（硬约束，低于它才回退）
@@ -1288,6 +1473,9 @@ struct Params {
     // 目标是让 |θ5| 留够 jointMarginMin 余量。见 robot_safety.h 里 RS_POSE_TILT_J5 的说明。
     // 与 tiltPerPoint 同时置位时优先本模式。
     bool tiltJ5 = false;
+    bool geometryFirst = false;
+    bool reachAssist = false;
+    bool shapeShift = false;
     // 点云系里的「重力向上」单位向量。**默认 (0,0,1) = 旧口径，逐字节不变**。
     //
     // 为什么需要显式给：倾角口径里"正位置/朝上"是相对**重力**定义的，而点云是相机系，
@@ -1375,10 +1563,13 @@ public:
         baseR_ = base.R;
         baseRT_ = m3T(base.R);
         baseT_ = base.t;
-        sz_ = sizingFrom(kReach);
+        sz_ = sizingFrom(p.model->reach);
+        const Sizing gunSize = sizingFrom(kVs087.reach);
+        sz_.gripR = gunSize.gripR;
+        sz_.toolPipeR = gunSize.toolPipeR;
         double z0[6] = {0, 0, 0, 0, 0, 0};
         FkOut f;
-        fk(z0, p.toolLen, f);
+        fk(z0, p.toolLen, f, *p.model);
         std::vector<Seg> segs;
         buildSegments(f, sz_, p.includeBase, segs);
         buildSelfPairs(segs, pairs_);
@@ -1453,7 +1644,7 @@ public:
         }
 
         M3 Rc = frameFromZ(zTool);
-        if (refX) {
+        if (!p_.geometryFirst && refX) {
             // refX 来自上一点 fk() 的工具 x 轴，是**基座系**的；zTool 是**点云系**的。
             // 不转坐标系直接投影 = 拿两个不同坐标系的向量做正交分解，工具 x 轴每步都会被
             // 额外偏转一份「基座偏航」的角量，并且逐点累加 → 手腕绕枪轴持续自旋。
@@ -1472,12 +1663,15 @@ public:
         IkSol sol;
         {
             Prof::Scope _p(g_prof.on, g_prof.nsIk);
-            sol = ik(toBaseP(pC), toBaseR(Rc), p_.toolLen, seed);
+            M3 target = p_.geometryFirst ? exportedToolFrame(toBaseV(zTool), refX) : toBaseR(Rc);
+            if (p_.gunRollRad != 0.0)
+                target = m3mul(target, rotAxis(V3(0, 0, 1), p_.gunRollRad));
+            sol = ik(toBaseP(pC), target, p_.toolLen, seed, *p_.model);
         }
         if (!sol.ok) return false;
 
         FkOut f;
-        fk(sol.theta, p_.toolLen, f);
+        fk(sol.theta, p_.toolLen, f, *p_.model);
         std::vector<Seg> segs;
         {
             Prof::Scope _p(g_prof.on, g_prof.nsBuild);
@@ -1533,7 +1727,7 @@ public:
         out.ikOk = true;
         out.over = sol.over;
         out.margin = sol.margin;
-        out.cond = condNumber(f);      // 只对最终入选的这个解算一次
+        out.cond = condNumber(f, 500.0 * p_.model->reach / kVs087.reach);
         for (int i = 0; i < 6; ++i) out.theta[i] = sol.theta[i];
         out.pos = pC;
         out.gun = -d;
@@ -2103,6 +2297,7 @@ const char* robot_safety_rule_name(unsigned int bit) {
         case RS_VIOL_LINK_HIT: return "LINK_HIT";
         case RS_VIOL_TOOL_HIT: return "TOOL_HIT";
         case RS_VIOL_STEP_JUMP: return "STEP_JUMP";
+        case RS_VIOL_AIM_MISS: return "AIM_MISS";
         default: return nullptr;
     }
 }
@@ -2124,13 +2319,13 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                                                  const double* cloudXyz, int cloudCount,
                                                  const double* basePose16,
                                                  const RobotSafetyParams* paramsIn,
-                                                 const double* upCloud);
+                                                 const double* upCloud, int modelId, double rollDeg = 0.0);
 
 RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                      const double* cloudXyz, int cloudCount,
                                      const double* basePose16,
                                      const RobotSafetyParams* paramsIn) {
-    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, nullptr);
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, nullptr, RS_MODEL_VS087);
 }
 
 RobotSafetyResult robot_safety_check_up(const SprayTrajPoint* pts, int n,
@@ -2138,14 +2333,29 @@ RobotSafetyResult robot_safety_check_up(const SprayTrajPoint* pts, int n,
                                         const double* basePose16,
                                         const RobotSafetyParams* paramsIn,
                                         const double* upCloud) {
-    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud);
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud, RS_MODEL_VS087);
+}
+
+RobotSafetyResult robot_safety_check_up_model(const SprayTrajPoint* pts, int n,
+                                             const double* cloudXyz, int cloudCount,
+                                             const double* basePose16,
+                                             const RobotSafetyParams* paramsIn,
+                                             const double* upCloud, int modelId) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud, modelId);
+}
+
+RobotSafetyResult robot_safety_check_g20_roll(const SprayTrajPoint* pts, int n,
+    const double* cloudXyz, int cloudCount, const double* basePose16,
+    const RobotSafetyParams* paramsIn, const double* upCloud, double rollDeg) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud,
+                                   RS_MODEL_CGXI_G20, rollDeg);
 }
 
 static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int n,
                                                  const double* cloudXyz, int cloudCount,
                                                  const double* basePose16,
                                                  const RobotSafetyParams* paramsIn,
-                                                 const double* upCloud) {
+                                                 const double* upCloud, int modelId, double rollDeg) {
     RobotSafetyResult R;
     std::memset(&R, 0, sizeof(R));
     R.minClearanceMm = std::numeric_limits<double>::infinity();
@@ -2164,7 +2374,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     if (!pts || n <= 0) return fail("轨迹为空");
     if (!cloudXyz || cloudCount <= 0) return fail("点云为空");
 
+    if (modelId != RS_MODEL_VS087 && modelId != RS_MODEL_CGXI_G20) return fail("未知安全评估机型");
     Params p;
+    p.model = modelId == RS_MODEL_CGXI_G20 ? &kG20 : &kVs087;
     {
         const RobotSafetyParams d = robot_safety_default_params();
         const RobotSafetyParams& s = paramsIn ? *paramsIn : d;
@@ -2195,8 +2407,20 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         p.azStance = (s.azMode != 1);
         p.fastPose = (s.fastPose & RS_POSE_FAST) != 0;
         p.tiltPerPoint = (s.fastPose & RS_POSE_TILT_PERP) != 0;
-        p.tiltJ5 = (s.fastPose & RS_POSE_TILT_J5) != 0;
+        p.tiltJ5 = p.model->densoWrist && (s.fastPose & RS_POSE_TILT_J5) != 0;
         p.tiltSideX = s.tiltSideX;
+        p.geometryFirst = (s.fastPose & RS_POSE_GEOMETRY_FIRST) != 0;
+        p.reachAssist = (s.fastPose & RS_POSE_REACH_ASSIST) != 0;
+        p.shapeShift = (s.fastPose & RS_POSE_SHAPE_SHIFT) != 0;
+    }
+    if (!std::isfinite(rollDeg) || std::fabs(rollDeg) > 180.0 ||
+        (rollDeg != 0.0 && (!p.geometryFirst || !p.requireReach || p.model != &kG20)))
+        return fail("滚转试验要求 G20 几何优先模式及机器人复核，角度范围 ±180°");
+    p.gunRollRad = rollDeg * kDeg;
+    const bool checkRobot = p.requireReach;
+    if (p.geometryFirst) {
+        p.requireReach = false;
+        p.tiltJ5 = false;
     }
 
     // ---- 重力向上方向（点云系）
@@ -2286,7 +2510,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (norm(h) < 0.2) h = V3(1, 0, 0) - p.upW * dot(V3(1, 0, 0), p.upW);
         if (norm(h) < 1e-6) h = V3(0, 1, 0) - p.upW * dot(V3(0, 1, 0), p.upW);
         h = unit(h);
-        V3 origin = cloud.centroid - h * (0.50 * kReach) - p.upW * (0.35 * kReach);
+        V3 origin = cloud.centroid - h * (0.50 * p.model->reach) - p.upW * (0.35 * p.model->reach);
         V3 x = unit(cloud.centroid - origin);
         V3 z = p.upW;                                // 基座 +Z = 重力向上
         V3 y = unit(cross(z, x));
@@ -2390,7 +2614,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             // 不解 IK、不试方位、不留缓存。代价是"这个倾角到底解不解得出来"要等阶段 3 才知道；
             // 收益是这里一次 IK 都不花。这一句就是 fast 模式省掉 60% 时间的全部原因
             // （阶段 1 原本占 58.4s/83s）。tiltPerPoint 走同一条：它的倾角同样与 IK 无关。
-            if (p.fastPose || p.tiltPerPoint) {
+            if (p.fastPose || p.tiltPerPoint || p.geometryFirst) {
                 need[i] = tiltNeedDeg(t.normal(i), p.tiltRefW, p);
                 azOf[i] = 0.0;
                 continue;
@@ -2408,7 +2632,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
                 hasSeed = true;
                 FkOut f;
-                fk(pr.theta, p.toolLen, f);
+                fk(pr.theta, p.toolLen, f, *p.model);
                 prevX = f.tcp.R.col(0);
                 hasRefX = true;
             }
@@ -2491,6 +2715,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (!t.spray[i]) finalTilt[i] = 0.0;
     std::vector<double> azRow(rows.size(), 0.0);
     std::vector<double> faceTilt(groups.size(), 0.0), faceAz(groups.size(), 0.0);
+    const bool fixedFace = p.geometryFirst && !p.tiltPerPoint;
+    std::vector<V3> faceNormals(groups.size());
     if (p.tiltPerPoint) {
         // ---- 逐点连续口径（RS_POSE_TILT_PERP）
         //
@@ -2514,6 +2740,13 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             for (int r = groups[g].first; r <= groups[g].second; ++r)
                 for (int i = rows[r].first; i <= rows[r].second; ++i)
                     if (t.spray[i]) gp[g].push_back(i);
+        if (fixedFace) {
+            for (size_t g = 0; g < gp.size(); ++g) {
+                V3 sum(0, 0, 0);
+                for (int i : gp[g]) sum = sum + t.normal(i);
+                faceNormals[g] = unit(sum);
+            }
+        }
 
         struct FaceScore {
             int hit = 0;        // 枪体/连杆 穿透点云（P0）
@@ -2547,12 +2780,12 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             bool hasSeed = false;
             for (int k = 0; k < S; ++k) {
                 int i = P[(S <= 1) ? 0 : (size_t)k * (len - 1) / (S - 1)];
-                V3 n = t.normal(i);
-                V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                V3 n = fixedFace ? faceNormals[g] : t.normal(i);
                 V3 axis, uUp;
                 tiltAxisAndDir(n, p.tiltRefW, axis, uUp);
-                if (norm(uUp) < 1e-6) continue;
+                if (!fixedFace && norm(uUp) < 1e-6) continue;
                 V3 d = dirOf(n, uUp, axis, tilt, az);
+                V3 face = t.pos[i] + (fixedFace ? -d : t.gun[i]) * p.standoff;
                 PR pr;
                 // 抽样本来就少，连杆一起查：抽错一次就是整面选错，省这点时间不划算
                 if (!ev.eval(face, d, nullptr, hasSeed ? seed : nullptr, tilt, az, true, pr)) {
@@ -2648,12 +2881,12 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     bool hasRefX = false;
                     for (int k = 0; k < K; ++k) {
                         int i = P[K > 1 ? (int)((long long)(P.size() - 1) * k / (K - 1)) : 0];
-                        V3 nrm = t.normal(i);
-                        V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                        V3 nrm = fixedFace ? faceNormals[g] : t.normal(i);
                         V3 axis, uUp;
                         tiltAxisAndDir(nrm, p.tiltRefW, axis, uUp);
                         if (norm(uUp) < 1e-6) { axis = V3(0, 0, 0); uUp = V3(0, 0, 0); }
                         V3 d = dirOf(nrm, uUp, axis, cand[c], 0.0);
+                        V3 face = t.pos[i] + (fixedFace ? -d : t.gun[i]) * p.standoff;
                         PR pr;
                         if (!ev.eval(face, d, hasRefX ? &prevX : nullptr,
                                      hasSeed ? seed : nullptr, cand[c], 0.0, true, pr)) {
@@ -2666,7 +2899,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                         for (int q = 0; q < 6; ++q) seed[q] = pr.theta[q];
                         hasSeed = true;
                         FkOut f;
-                        fk(pr.theta, p.toolLen, f);
+                        fk(pr.theta, p.toolLen, f, *p.model);
                         prevX = f.tcp.R.col(0);
                         hasRefX = true;
                     }
@@ -2858,12 +3091,12 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     bool has2 = false;
                     for (int k = a2; k <= b2; ++k) {
                         int i = Q[k];
-                        V3 n = t.normal(i);
-                        V3 face = t.pos[i] + t.gun[i] * p.standoff;
+                        V3 n = fixedFace ? faceNormals[g] : t.normal(i);
                         V3 axis, uUp;
                         tiltAxisAndDir(n, p.tiltRefW, axis, uUp);
-                        if (norm(uUp) < 1e-6) continue;
+                        if (!fixedFace && norm(uUp) < 1e-6) continue;
                         V3 d = dirOf(n, uUp, axis, vt, vz);
+                        V3 face = t.pos[i] + (fixedFace ? -d : t.gun[i]) * p.standoff;
                         PR pr;
                         if (!ev.eval(face, d, nullptr, has2 ? seed2 : nullptr, vt, vz, true, pr)) {
                             ++fails;
@@ -2998,7 +3231,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     Params pTool = p;
     pTool.requireReach = 0;
     Evaluator evTool(cloud, base, pTool);
-    if (std::getenv("RS_NO_CONT") == nullptr) {
+    if (!p.geometryFirst && std::getenv("RS_NO_CONT") == nullptr) {
         // 喷涂连续段：**全局**按 spray 序列切，不能按行切。
         // onepass 模式下整条轨迹是一条连续喷涂路径（行与行之间没有空移点），
         // 按行切会把一条连续线切成 17 段，于是每段首尾各做一次 ramp ——
@@ -3303,6 +3536,28 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
     };
 
+    auto evalGeometryPose = [&](int i, const V3& outward, double tilt, double az) {
+        PR pr;
+        evTool.eval(t.pos[i] - outward * p.standoff, outward, nullptr, nullptr,
+                    tilt, az, false, pr);
+        pr.idx = i;
+        pr.pos = t.pos[i];
+        pr.sprayAngle = angleBetweenDeg(outward, t.normal(i));
+        setViolBits(pr, t.spray[i] != 0);
+        return pr;
+    };
+
+    // 在名义喷距附近核对枪轴是否指向扫描表面。间距自适应容差用于处理离散采样。
+    const double aimDepth = std::min(0.5 * p.standoff, std::max(8.0, 0.15 * p.standoff));
+    const double aimNear = p.standoff - aimDepth;
+    const double aimFar = p.standoff + aimDepth;
+    const double aimTolerance = clampd(3.0 * spacing, 3.0, 5.0);
+    auto aimHits = [&](const V3& pos, const V3& gun) {
+        return cloud.hasPointNearSegment(pos + gun * aimNear, pos + gun * aimFar, aimTolerance);
+    };
+    const double maxAimAngle = std::min(89.0, p.maxSprayAngleDeg);
+    const double aimSearchRadius = std::min(p.search, aimFar * std::tan(maxAimAngle * kDeg));
+
     // 救援/加档能用的倾角上界（见 tiltSearchHi：基准倾角可以超过 tiltMax）
     auto tiltHi = [&](double t0) { return tiltSearchHi(p, t0); };
 
@@ -3313,10 +3568,49 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         bool hasRefX = false;
         for (int i = a; i <= b; ++i) {
             V3 nrm = t.normal(i);
-            V3 face = t.pos[i] + t.gun[i] * p.standoff;
             double tilt = finalTilt[i];
             double az = azAt(i);
-
+            if (p.geometryFirst) {
+                const bool spray = t.spray[i] != 0;
+                const V3 normal = fixedFace && spray && rowOf[i] >= 0
+                    ? faceNormals[groupOfRow[rowOf[i]]] : nrm;
+                V3 axis, up;
+                basisAt(normal, axis, up);
+                PR pr = evalGeometryPose(i, spray ? dirOf(normal, up, axis, tilt, az) : nrm, tilt, az);
+                if (spray && !fixedFace && pr.clearance < 0.0) {
+                    const double hi = std::min(tiltHi(tilt), std::max(tilt, p.maxSprayAngleDeg));
+                    const double span = p.fastPose ? p.tiltStepDeg : std::max(tilt, hi - tilt);
+                    for (double delta = p.tiltStepDeg; delta <= span + 1e-9 && pr.clearance < 0.0;
+                         delta += p.tiltStepDeg) {
+                        for (double tt : {std::max(0.0, tilt - delta), std::min(hi, tilt + delta)}) {
+                            PR trial = evalGeometryPose(i, dirOf(normal, up, axis, tt, az), tt, az);
+                            if (trial.clearance >= p.hardClearance) { pr = trial; break; }
+                        }
+                    }
+                    if (pr.clearance < 0.0) {
+                        PR normalPose = evalGeometryPose(i, nrm, 0.0, az);
+                        if (normalPose.clearance > pr.clearance) pr = normalPose;
+                    }
+                }
+                if (spray && !fixedFace && !aimHits(pr.pos, pr.gun)) {
+                    const V3& pos = t.pos[i];
+                    const V3& rawGun = t.gun[i];
+                    V3 target;
+                    if (cloud.nearestToSegment(pos + rawGun * aimNear, pos + rawGun * aimFar,
+                                               aimSearchRadius, target)) {
+                        const V3 aimed = unit(target - pos);
+                        const double angle = angleBetweenDeg(aimed, rawGun);
+                        if (angle <= maxAimAngle && aimHits(pos, aimed)) {
+                            PR candidate = evalGeometryPose(i, -aimed, angle, az);
+                            if (candidate.clearance >= p.hardClearance) pr = candidate;
+                        }
+                    }
+                }
+                results[i] = pr;
+                hasResult[i] = 1;
+                continue;
+            }
+            V3 face = t.pos[i] + t.gun[i] * p.standoff;
             V3 axis, uUp;
             basisAt(nrm, axis, uUp);
             if (norm(uUp) < 1e-6) {
@@ -3650,7 +3944,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             for (int k = 0; k < 6; ++k) prevTheta[k] = pr.theta[k];
             hasSeed = true;
             FkOut f;
-            fk(pr.theta, p.toolLen, f);
+            fk(pr.theta, p.toolLen, f, *p.model);
             prevX = f.tcp.R.col(0);
             hasRefX = true;
         }
@@ -3746,7 +4040,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     //   · 姿态也救不回来 → 如实报不可达，交给面级姿态/站位解决，绝不滑轨迹。
     // 行首/行尾够不着不算孤岛（那是边界条件问题，不是"中间够不着"），不动它们。
     int islandFixed = 0, islandLeft = 0, islandSegs = 0;
-    {
+    if (!p.geometryFirst) {
         auto okAt = [&](int k) { return hasResult[k] != 0 && results[k].ikOk; };
         int i = 0;
         while (i < n) {
@@ -3993,7 +4287,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     // 整行统一因此不再必要；留 RS_ROW_UNIFORM=1 只用于 A/B 复现历史数据。
     const bool rowUniOn = (std::getenv("RS_ROW_UNIFORM") != nullptr);
     int rowUniRows = 0, rowUniPts = 0, rowUniRej = 0;
-    if (rowUniOn && std::getenv("RS_NO_RAMP") == nullptr && !rampOnly) {
+    if (!p.geometryFirst && rowUniOn && std::getenv("RS_NO_RAMP") == nullptr && !rampOnly) {
         for (size_t ri = 0; ri < rows.size(); ++ri) {
             const int a = std::max(0, rows[ri].first);
             const int b = std::min(n - 1, rows[ri].second);
@@ -4079,7 +4373,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     // 为什么只做下包络（只往低倾角摊）：倾角救援的主方向是压低（枪更贴法向、更好解），
     // 抬高多半是为了让开枪体，而阶段 2.5 的边界斜坡已经把段首尾的抬高处理过了。
     // 把必要的抬高硬压回去等于用碰撞换平滑；抬高的孤立点仍由下面的跳变判据如实报出来。
-    if (std::getenv("RS_NO_RAMP") == nullptr) {
+    if (!p.geometryFirst && std::getenv("RS_NO_RAMP") == nullptr) {
         const double Sw = p.standoff > 1e-6 ? p.standoff : 100.0;
         // 每步允许的额外 TCP 位移。默认 1mm ≈ 1/4 个点距：斜坡每走一步只横挪 1mm，
         // 画出来是一条弧而不是折角（实测 p004 尖刺：预算 4mm 转角还有 50.6°，
@@ -4508,41 +4802,45 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     // ---- 过渡点抬升（spray=0 ⇒ 位置可改，只求不撞）
     g_prof.mark("阶段3 重解");
     int lifted = 0;
-    if (p.fixTransit) {
+    if (p.fixTransit && !p.geometryFirst) {
         // 逐点独立抬升会把空移线抬成锯齿：开口盒子实测 A1 段 139 个点的 lift 在
         // 45~56mm 之间逐点跳，z 每步变 2~4mm，整段像波浪；相邻点 lift 差最大 57.5mm
         // （一步之内垂直跳 57mm）。空移是关枪过渡，同一段内应该用**同一个抬升量**：
         // 路径仍是原来那条折线，只是整体抬高，机器人不会上下抖。
-        // 做法：先算出每点需要的 lift，再把"连续被抬的点串"统一到串内最大值。
-        std::vector<double> need(n, 0.0);
-        for (int i = 0; i < n; ++i) {
-            PR& pr = results[i];
-            if (!hasResult[i] || t.spray[i] != 0) continue;
-            if (!std::isfinite(pr.clearance) || pr.clearance >= p.safety) continue;
-            need[i] = std::min(p.transitLiftMax, p.safety - pr.clearance + 5.0);
-        }
-        for (int i = 0; i < n;) {
-            if (need[i] <= 0.0) { ++i; continue; }
-            int j = i;
-            double mx = need[i];
-            while (j + 1 < n && need[j + 1] > 0.0) { ++j; mx = std::max(mx, need[j]); }
-            for (int k = i; k <= j; ++k) need[k] = mx;
-            i = j + 1;
-        }
-        for (int i = 0; i < n; ++i) {
-            if (need[i] <= 0.0) continue;
-            PR& pr = results[i];
-            // 抬升沿重力反向（远离地面/工件），不是沿点云 +Z —— 相机系里 +Z 是光轴，
-            // 沿它抬等于把空移点横着推出工件，间隙数字变好了但实际没抬离。
-            pr.pos = pr.pos + p.upW * need[i];
-            pr.lifted = need[i];
-            pr.clearance += need[i];
-            // 分组距离必须同步抬升，否则总结论（已避开）与"连杆最小距离"（还是抬升前）
-            // 会自相矛盾 —— curved 上就出现过 clearance=20.02 而 clrTool=11.39。
-            if (pr.clrTool < 1e299) pr.clrTool += need[i];
-            if (pr.clrLink < 1e299) pr.clrLink += need[i];
-            pr.viol &= ~(RS_VIOL_COLLISION | RS_VIOL_CLEARANCE | RS_VIOL_LINK_HIT | RS_VIOL_TOOL_HIT);
-            ++lifted;
+        // 对连续空移点统一抬升，并用抬升后的位姿复核整段。
+        auto liftNeeded = [&](int i) {
+            return hasResult[i] && !t.spray[i] && std::isfinite(results[i].clearance)
+                && results[i].clearance < (p.geometryFirst ? 0.0 : p.safety);
+        };
+        for (int a = 0; a < n;) {
+            if (!liftNeeded(a)) { ++a; continue; }
+            int b = a;
+            double minClearance = results[a].clearance;
+            while (b + 1 < n && liftNeeded(b + 1))
+                minClearance = std::min(minClearance, results[++b].clearance);
+            const double height = std::min(p.transitLiftMax, p.safety - minClearance + 5.0);
+            std::vector<PR> trial;
+            trial.reserve(b - a + 1);
+            for (int i = a; i <= b; ++i) {
+                const PR& original = results[i];
+                const V3 outward = -original.gun;
+                const V3 face = original.pos + p.upW * height - outward * p.standoff;
+                const double* seed = trial.empty()
+                    ? (original.ikOk ? original.theta : nullptr)
+                    : (trial.back().ikOk ? trial.back().theta : nullptr);
+                PR q;
+                if (!ev.eval(face, outward, nullptr, seed, 0.0, 0.0, true, q) || !hardOk(q, p))
+                    break;
+                q.idx = i;
+                q.lifted = height;
+                setViolBits(q, false);
+                trial.push_back(q);
+            }
+            if ((int)trial.size() == b - a + 1) {
+                std::copy(trial.begin(), trial.end(), results.begin() + a);
+                lifted += (int)trial.size();
+            }
+            a = b + 1;
         }
     }
 
@@ -4762,8 +5060,157 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     }
     const double thrStep = std::max(15.0, 3.0 * medGap);
 
-    if (p.tiltRateDeg > 0) {
-        const double thrTilt = std::max(3.0 * p.tiltRateDeg, 10.0);
+    const double thrTilt = p.geometryFirst ? p.tiltRateDeg : std::max(3.0 * p.tiltRateDeg, 10.0);
+    if (p.geometryFirst && p.tiltPerPoint && thrTilt > 0.0) {
+        // 从两侧预摆枪轴，目标点前后都能分担姿态变化。
+        for (int step : {-1, 1}) {
+            for (int i = step < 0 ? n - 2 : 1; i >= 0 && i < n; i += step) {
+                const int neighbor = i - step;
+                if (!t.spray[i] || !t.spray[neighbor]) continue;
+                PR& curr = results[i];
+                const V3 a = -results[neighbor].gun, b = -curr.gun;
+                const double turn = angleBetweenDeg(a, b);
+                if (turn <= thrTilt + 1e-8 || turn >= 179.999) continue;
+                const double omega = turn * kDeg;
+                const double limit = thrTilt * kDeg;
+                const V3 outward = unit(a * std::sin(omega - limit) + b * std::sin(limit));
+                const double sprayAngle = angleBetweenDeg(outward, t.normal(i));
+                if (sprayAngle >= 89.0 || sprayAngle > std::max(curr.sprayAngle, p.maxSprayAngleDeg) + 1e-8)
+                    continue;
+                PR trial = evalGeometryPose(i, outward, sprayAngle, curr.azDeg);
+                if (trial.clearance >= p.hardClearance &&
+                    (aimHits(trial.pos, trial.gun) || !aimHits(curr.pos, curr.gun))) curr = trial;
+            }
+        }
+    }
+    std::vector<PR> unassisted;
+    if (p.geometryFirst && p.reachAssist && p.tiltPerPoint && checkRobot && basePose16) {
+        Params robotParams = p;
+        robotParams.requireReach = true;
+        Evaluator reachEval(cloud, base, robotParams);
+        const V3 shoulder = reachEval.toCloudP(p.model->shoulderCenter);
+        const double tiltLimit = std::min(maxAimAngle, p.tiltMaxDeg);
+
+        auto turnToward = [](const V3& from, const V3& to, double fraction) {
+            const double omega = angleBetweenDeg(from, to) * kDeg;
+            if (omega <= 1e-9 || kPi - omega <= 1e-9) return from;
+            return unit(from * std::sin((1.0 - fraction) * omega)
+                      + to * std::sin(fraction * omega));
+        };
+        struct Candidate {
+            V3 gun;
+            double cost = 1e300;
+        };
+        constexpr int steps = 24;
+        constexpr int count = 1 + 3 * steps;
+        constexpr double blockedCost = 1e5;
+        using Candidates = std::array<Candidate, count>;
+        using Costs = std::array<double, count>;
+        using Parents = std::array<int, count>;
+
+        // 所有候选共用同一输入 TCP，搜索只调整枪轴方向。
+        std::vector<Candidates> options(n);
+        std::vector<Parents> parents(n);
+        std::array<std::array<double, 6>, count> seeds{};
+        std::array<bool, count> seedOk{};
+        Costs previous;
+        previous.fill(1e300);
+        int canRepair = 0;
+        V3 nominalX;
+        for (int i = 0; i < n; ++i) {
+            const PR& nominal = results[i];
+            nominalX = exportedToolFrame(reachEval.toBaseV(nominal.gun), i > 0 ? &nominalX : nullptr).col(0);
+            const bool spray = t.spray[i] != 0;
+            const V3 raw = t.gun[i];
+            const V3 radial = unit(t.pos[i] - shoulder);
+            V3 lateral = radial - raw * dot(radial, raw);
+            if (norm(lateral) < 1e-6) lateral = frameFromZ(raw).col(0);
+            lateral = unit(lateral);
+            const V3 side = unit(cross(raw, lateral));
+            const double tilt = tiltLimit * kDeg;
+            const V3 center = raw * std::cos(tilt);
+            const V3 lateralPull = lateral * std::sin(tilt);
+            const V3 sidePull = side * (std::sin(tilt) * std::sin(kPi / 3.0));
+            const std::array<V3, 3> goals{{unit(center + lateralPull),
+                unit(center + lateralPull * 0.5 + sidePull),
+                unit(center + lateralPull * 0.5 - sidePull)}};
+
+            const bool nominalAims = !spray || aimHits(t.pos[i], nominal.gun);
+            bool nominalSolved = false, repairable = false;
+            Candidates& row = options[i];
+            for (int j = 0; j < count; ++j) {
+                const V3 gun = j == 0 ? nominal.gun : turnToward(nominal.gun,
+                    goals[(j - 1) / steps], ((j - 1) % steps + 1) / double(steps));
+                const double angle = angleBetweenDeg(gun, raw);
+                if (j != 0 && (tiltLimit <= 0.0 || angle > tiltLimit + 1e-8 ||
+                               (spray && !aimHits(t.pos[i], gun)))) continue;
+                const V3 face = t.pos[i] + gun * p.standoff;
+                PR trial;
+                const bool solved = reachEval.eval(face, -gun, &nominalX,
+                    seedOk[j] ? seeds[j].data() : nullptr, angle, 0.0, true, trial);
+                if (j == 0) nominalSolved = solved;
+                if (solved) {
+                    std::copy_n(trial.theta, 6, seeds[j].data());
+                    seedOk[j] = !trial.over;
+                }
+                const bool executable = solved && hardOk(trial, robotParams);
+                if (j != 0 && !executable) {
+                    if (solved || nominalSolved) continue;
+                    PR toolOnly;
+                    evTool.eval(face, -gun, nullptr, nullptr, angle, 0.0, false, toolOnly);
+                    if (toolOnly.clrTool < p.hardClearance) continue;
+                }
+                repairable |= !nominalSolved && executable;
+                const double change = angleBetweenDeg(gun, nominal.gun);
+                const double lowMargin = executable ? std::max(0.0, 5.0 - trial.margin) : 0.0;
+                const double aimPenalty = j == 0 && !nominalAims ? 2000.0 : 0.0;
+                row[j] = {gun, change * change + 4.0 * lowMargin * lowMargin + aimPenalty
+                             + (executable ? 0.0 : blockedCost)};
+            }
+            if (repairable) ++canRepair;
+
+            Costs costs;
+            costs.fill(1e300);
+            parents[i].fill(-1);
+            const double edgeLimit = i > 0
+                ? std::max(thrTilt, angleBetweenDeg(results[i - 1].gun, nominal.gun)) : 0.0;
+            const double minDot = std::cos(edgeLimit * kDeg) - 1e-10;
+            for (int j = 0; j < count; ++j) {
+                if (row[j].cost >= 1e300) continue;
+                if (i == 0) { costs[j] = row[j].cost; continue; }
+                for (int h = 0; h < count; ++h) {
+                    if (previous[h] >= 1e300) continue;
+                    const double dotStep = dot(options[i - 1][h].gun, row[j].gun);
+                    if ((j != 0 || h != 0) && dotStep < minDot) continue;
+                    const double rampCost = 2000.0 * std::max(0.0, 1.0 - dotStep);
+                    const double cost = previous[h] + row[j].cost + rampCost;
+                    if (cost < costs[j]) {
+                        costs[j] = cost;
+                        parents[i][j] = h;
+                    }
+                }
+            }
+            previous = costs;
+        }
+
+        int corrected = 0;
+        int chosen = int(std::min_element(previous.begin(), previous.end()) - previous.begin());
+        for (int i = n - 1; i >= 0; --i) {
+            if (chosen != 0) {
+                if (unassisted.empty()) unassisted = results;
+                const V3 gun = options[i][chosen].gun;
+                const double angle = angleBetweenDeg(gun, t.gun[i]);
+                results[i] = evalGeometryPose(i, -gun, angle, 0.0);
+                ++corrected;
+            }
+            chosen = parents[i][chosen];
+        }
+        if (g_prof.on)
+            std::fprintf(stderr, "  [reach assist] %d 个原不可达点有候选，连续规划调整 %d 点\n",
+                         canRepair, corrected);
+    }
+    auto markJumps = [&](std::vector<PR>& path) {
+        if (p.tiltRateDeg <= 0.0) return;
         for (int i = 1; i < n; ++i) {
             // 没有位姿的点（IK 失败）谈跳变没有意义，别让它再刷一条违规。
             // 注意判 hasResult 而不是 ikOk：不要求可达时 ikOk 恒为 0，但位姿是有的，
@@ -4772,11 +5219,11 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             // 姿态：用枪轴 3D 夹角。只比 tiltDeg 会漏掉整类问题 —— 逐点口径下
             // 方位翻转时倾角可以一个字都不变（垃圾桶桶底小坑那段全程 42.1~42.2°，
             // 方位绕满一圈，相邻枪轴夹角却有 18~58°）。
-            if (angleBetweenDeg(results[i].gun, results[i - 1].gun) > thrTilt)
-                results[i].viol |= RS_VIOL_TILT_JUMP;
+            if (angleBetweenDeg(path[i].gun, path[i - 1].gun) > thrTilt + 1e-8)
+                path[i].viol |= RS_VIOL_TILT_JUMP;
             // 位置：直线步长。换段处不抬枪、不补偿，是这条判据的主战场。
-            if (norm(results[i].pos - results[i - 1].pos) > thrStep)
-                results[i].viol |= RS_VIOL_STEP_JUMP;
+            if (norm(path[i].pos - path[i - 1].pos) > thrStep)
+                path[i].viol |= RS_VIOL_STEP_JUMP;
         }
 
         // ---- 折角（尖刺）：步子不大，但方向猛地折出去又折回来
@@ -4794,19 +5241,22 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                 if (!(hasResult[i] && hasResult[i - 1] && hasResult[i + 1])) continue;
                 if (!(t.spray[i] && t.spray[i - 1] && t.spray[i + 1])) continue;
                 if (!(t.spray[i - 2] && t.spray[i + 2])) continue;   // 离段端太近，跳过
-                const V3 mid = (results[i - 1].pos + results[i + 1].pos) * 0.5;
-                if (norm(results[i].pos - mid) > devThr)
-                    results[i].viol |= RS_VIOL_STEP_JUMP;
+                const V3 mid = (path[i - 1].pos + path[i + 1].pos) * 0.5;
+                if (norm(path[i].pos - mid) > devThr)
+                    path[i].viol |= RS_VIOL_STEP_JUMP;
             }
         }
-    }
+    };
+    std::vector<PR> assisted;
+    if (!unassisted.empty()) assisted = results;
+    markJumps(results);
 
     // ---- L0 输入层自检（这一层不通，后面所有几何结论都是废的）
     int l0Issues = 0;
-    if (p.requireReach) {
+    if (checkRobot) {
         // 只有要求可达时，"法兰→面点"的总长才必须落在臂展内
         double reachNeed = p.standoff + p.toolLen;
-        double limit = kReach * 0.90;
+        double limit = p.model->reach * 0.90;
         if (reachNeed > limit) ++l0Issues;
     }
     double standoffMedian = -1.0;
@@ -4853,15 +5303,46 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     emitSrc.reserve((size_t)n + 64);
     emitSpray.reserve((size_t)n + 64);
     int insertedPts = 0, densifiedSegs = 0, densifyGiveUp = 0, dupDropped = 0;
+    const double SwD = p.standoff > 1e-6 ? p.standoff : 100.0;
+    auto toolClrOf = [&](const V3& pos, const V3& gunDir) {
+        const V3 g = unit(gunDir);
+        PR pr;
+        evTool.eval(pos + g * SwD, g * -1.0, nullptr, nullptr, 0.0, 0.0, false, pr);
+        return pr.clearance;   // requireReach=0 口径 = 枪体最小表面距离
+    };
+    auto sampleLockedSegment = [&](std::vector<PR>& path, int i, bool measureMinimum = false) {
+        if (i == 0) return;
+        PR& q = path[i];
+        const PR& a = path[i - 1];
+        const double length = norm(q.pos - a.pos);
+        const double turn = angleBetweenDeg(a.gun, q.gun);
+        if (turn >= 179.999 || (length <= 1e-6 && turn <= 1e-6)) return;
+        // 在原始线段内采样复核枪体净空，检查点不加入输出轨迹。
+        const int samples = (int)std::ceil(clampd(std::max(length / 4.0, turn / 3.0), 2.0, 256.0));
+        const double omega = turn * kDeg;
+        for (int j = 1; j < samples; ++j) {
+            const double s = double(j) / samples;
+            const V3 gun = omega < 1e-9 ? a.gun :
+                unit(a.gun * std::sin((1.0 - s) * omega) + q.gun * std::sin(s * omega));
+            const double clearance = toolClrOf(a.pos + (q.pos - a.pos) * s, gun);
+            if (clearance < 0.0) q.viol |= RS_VIOL_TOOL_HIT;
+            if (measureMinimum || clearance < 0.0) {
+                q.clrTool = std::min(q.clrTool, clearance);
+                q.clearance = std::min(q.clearance, clearance);
+            }
+        }
+    };
     {
-        const double SwD = p.standoff > 1e-6 ? p.standoff : 100.0;
-        auto toolClrOf = [&](const V3& pos, const V3& gunDir) {
-            const V3 g = unit(gunDir);
-            PR pr;
-            evTool.eval(pos + g * SwD, g * -1.0, nullptr, nullptr, 0.0, 0.0, false, pr);
-            return pr.clearance;   // requireReach=0 口径 = 枪体最小表面距离
-        };
         for (int i = 0; i < n; ++i) {
+            if (p.geometryFirst) {
+                PR& q = results[i];
+                q.pos = t.pos[i];
+                sampleLockedSegment(results, i);
+                emit.push_back(q);
+                emitSrc.push_back(i);
+                emitSpray.push_back(t.spray[i] ? 1 : 0);
+                continue;
+            }
             if (i > 0 && hasResult[i] && hasResult[i - 1]) {
                 const PR& A = results[i - 1];
                 const PR& B = results[i];
@@ -4871,7 +5352,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                     const double omega =
                         std::acos(std::max(-1.0, std::min(1.0, dot(a, b))));
                     auto slerp = [&](double s) -> V3 {
-                        if (omega < 1e-9) return unit(a + (b - a) * s);
+                        if (omega < 1e-9 || kPi - omega < 1e-9)
+                            return (s < 0.5 || omega < 1e-9) ? a : b;
                         const double w1 = std::sin((1.0 - s) * omega) / std::sin(omega);
                         const double w2 = std::sin(s * omega) / std::sin(omega);
                         return unit(a * w1 + b * w2);
@@ -4946,6 +5428,475 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
             emitSpray.push_back(t.spray[i] ? 1 : 0);
         }
     }
+    auto markAim = [&](std::vector<PR>& path) {
+        for (size_t i = 0; i < path.size(); ++i) {
+            if (emitSpray[i] && !aimHits(path[i].pos, path[i].gun)) path[i].viol |= RS_VIOL_AIM_MISS;
+        }
+    };
+    if (p.geometryFirst) markAim(emit);
+    auto measureKinematics = [&](std::vector<PR>& path) {
+        Params robotParams = p;
+        robotParams.requireReach = true;
+        Evaluator evRobot(cloud, base, robotParams);
+        double seed[6] = {};
+        V3 refX;
+        bool hasSeed = false, hasFrame = false;
+        for (PR& pr : path) {
+            PR measuredPose;
+            const V3 outward = -pr.gun;
+            refX = exportedToolFrame(evRobot.toBaseV(pr.gun), hasFrame ? &refX : nullptr).col(0);
+            hasFrame = true;
+            if (!evRobot.eval(pr.pos - outward * p.standoff, outward,
+                              &refX, hasSeed ? seed : nullptr,
+                              pr.tiltDeg, pr.azDeg, true, measuredPose)) {
+                pr.viol |= RS_VIOL_IK_FAIL;
+                continue;
+            }
+            pr.ikOk = true;
+            pr.margin = measuredPose.margin;
+            pr.cond = measuredPose.cond;
+            pr.selfGap = measuredPose.selfGap;
+            pr.clrLink = measuredPose.clrLink;
+            pr.linkKind = measuredPose.linkKind;
+            pr.linkJ0 = measuredPose.linkJ0;
+            pr.linkJ1 = measuredPose.linkJ1;
+            if (pr.clrLink < pr.clearance) {
+                pr.clearance = pr.clrLink;
+                pr.partKind = pr.linkKind;
+                pr.partJ0 = pr.linkJ0;
+                pr.partJ1 = pr.linkJ1;
+            }
+            if (pr.clrLink < 0.0) pr.viol |= RS_VIOL_LINK_HIT;
+            if (pr.selfGap < 0.0) pr.viol |= RS_VIOL_SELF_COLLISION;
+            if (pr.margin < p.jointMarginMin) pr.viol |= RS_VIOL_JOINT_LIMIT;
+            if (pr.cond > p.condMax) pr.viol |= RS_VIOL_NEAR_SINGULAR;
+            std::copy_n(measuredPose.theta, 6, pr.theta);
+            std::copy_n(pr.theta, 6, seed);
+            hasSeed = true;
+        }
+    };
+    if (p.geometryFirst && checkRobot) {
+        measureKinematics(emit);
+        if (!unassisted.empty()) {
+            const std::vector<PR> baselineGeometry = unassisted;
+            markJumps(unassisted);
+            for (int i = 1; i < n; ++i) sampleLockedSegment(unassisted, i);
+            markAim(unassisted);
+            measureKinematics(unassisted);
+            constexpr unsigned observed = RS_VIOL_IK_FAIL | RS_VIOL_TOOL_HIT | RS_VIOL_LINK_HIT
+                | RS_VIOL_SELF_COLLISION | RS_VIOL_AIM_MISS | RS_VIOL_TILT_JUMP | RS_VIOL_STEP_JUMP;
+            for (int attempt = 0; ; ++attempt) {
+                int firstRisk = -1;
+                std::vector<char> restore(n, 0);
+                int lastAdjusted = -1;
+                for (int i = 0; i < n; ++i) {
+                    if (dot(assisted[i].gun, baselineGeometry[i].gun) < 1.0 - 1e-12)
+                        lastAdjusted = i;
+                    const bool newRisk = (emit[i].viol & observed & ~unassisted[i].viol) != 0;
+                    const bool newOver = emit[i].margin < 0.0 && unassisted[i].margin >= 0.0;
+                    if (!newRisk && !newOver) continue;
+                    if (firstRisk < 0) firstRisk = i;
+                    if (lastAdjusted < 0 || restore[lastAdjusted]) continue;
+                    // 恢复整个连续修正段，段首尾仍与原枪轴相接，再检验实际执行解支。
+                    for (int j = lastAdjusted; j >= 0 &&
+                         dot(assisted[j].gun, baselineGeometry[j].gun) < 1.0 - 1e-12; --j) restore[j] = 1;
+                    for (int j = lastAdjusted + 1; j < n &&
+                         dot(assisted[j].gun, baselineGeometry[j].gun) < 1.0 - 1e-12; ++j) restore[j] = 1;
+                }
+                if (firstRisk < 0) break;
+                if (attempt >= 3 || std::find(restore.begin(), restore.end(), 1) == restore.end()) {
+                    emit.swap(unassisted);
+                    if (g_prof.on)
+                        std::fprintf(stderr, "  [reach assist] 最终复核点 %d 仍有新增风险，保留基线枪轴\n", firstRisk);
+                    break;
+                }
+                for (int i = 0; i < n; ++i)
+                    if (restore[i]) assisted[i] = baselineGeometry[i];
+                emit = assisted;
+                markJumps(emit);
+                for (int i = 1; i < n; ++i) sampleLockedSegment(emit, i);
+                markAim(emit);
+                measureKinematics(emit);
+            }
+        }
+    }
+    g_prof.mark("固定 TCP 姿态与复核");
+    if (p.geometryFirst && p.shapeShift && p.tiltPerPoint && checkRobot && basePose16 && !emit.empty()) {
+        // 整体平移、等比缩放 TCP，保留直线、圆弧、点序和开关枪。
+        // 枪轴在原点云上重新找落点，同时受喷距、喷角和相邻转角限制。
+        const double tiltLimit = std::min(maxAimAngle, p.tiltMaxDeg);
+        const V3 shoulder = evTool.toCloudP(p.model->shoulderCenter);
+        const double wristOffset = p.toolLen + p.model->wristOffset;
+        auto blocked = [](const PR& pose) { return !pose.ikOk || pose.margin < 0.0; };
+        V3 meanGun, pull, center;
+        int sprayCount = 0;
+        for (int i = 0; i < n; ++i) {
+            if (!emitSpray[i]) continue;
+            meanGun = meanGun + t.gun[i];
+            center = center + emit[i].pos;
+            ++sprayCount;
+            if (blocked(emit[i]))
+                pull = pull + unit(shoulder - (emit[i].pos - emit[i].gun * wristOffset));
+        }
+
+        if (tiltLimit > 0.0 && norm(meanGun) > kEps && norm(pull) > kEps) {
+            center = center * (1.0 / sprayCount);
+            double radius = 0.0;
+            for (const PR& q : emit) radius = std::max(radius, norm(q.pos - center));
+            const V3 normal = unit(meanGun);
+            V3 side = unit(pull - normal * dot(pull, normal));
+            if (norm(side) < kEps) side = frameFromZ(normal).col(0);
+            const V3 across = unit(cross(normal, side));
+            const double maxSide = aimFar * std::sin(tiltLimit * kDeg);
+
+            struct Anchor {
+                V3 nominal, reference, hit;
+                bool supported = false;
+            };
+            constexpr std::array<double, 7> blend{{0.0, 1.0 / 6, 2.0 / 6, 0.5, 4.0 / 6, 5.0 / 6, 1.0}};
+            std::vector<std::array<Anchor, blend.size()>> anchors(n);
+            for (int i = 0; i < n; ++i) {
+                for (size_t j = 0; j < blend.size(); ++j) {
+                    Anchor& a = anchors[i][j];
+                    const V3 ray = unit(t.gun[i] * (1.0 - blend[j]) + emit[i].gun * blend[j]);
+                    a.nominal = t.pos[i] + ray * p.standoff;
+                    if (!emitSpray[i]) continue;
+                    a.supported = cloud.nearestToSegment(t.pos[i] + ray * aimNear, t.pos[i] + ray * aimFar,
+                                                         aimTolerance, a.hit);
+                    const double depth = a.supported ? clampd(dot(a.hit - t.pos[i], ray), aimNear, aimFar)
+                                                     : p.standoff;
+                    a.reference = t.pos[i] + ray * depth;
+                }
+            }
+
+            const double cosTiltLimit = std::cos(tiltLimit * kDeg);
+            auto directionTo = [&](const V3& pos, const V3& target, int i, V3& gun, double& distance) {
+                const V3 delta = target - pos;
+                distance = norm(delta);
+                if (distance <= kEps) return false;
+                gun = delta * (1.0 / distance);
+                return !emitSpray[i] || dot(gun, t.gun[i]) >= cosTiltLimit - 1e-10;
+            };
+
+            struct Shift {
+                V3 offset;
+                size_t family;
+                double scale;
+                int badGeometry = 0, reachPenalty = 0;
+                double meanWrist = 0.0;
+            };
+            std::vector<Shift> choices;
+            auto moveTcp = [&](const Shift& trial, int i) {
+                return emit[i].pos + (emit[i].pos - center) * (trial.scale - 1.0) + trial.offset;
+            };
+            const double roughReach = p.model->roughWristReach;
+            for (int az = 0; az < 12; ++az) {
+                const double a = az * kPi / 6.0;
+                const V3 dir = side * std::cos(a) + across * std::sin(a);
+                for (double fraction : {0.075, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0}) {
+                    const double lateral = maxSide * fraction;
+                    for (double depth : {-0.5 * aimDepth, 0.0, 0.5 * aimDepth,
+                                         p.standoff * (1.0 - std::cos(tiltLimit * fraction * kDeg))}) {
+                        for (size_t j : {size_t(0), blend.size() / 2, blend.size() - 1})
+                            choices.push_back({dir * lateral + normal * depth, j, 1.0});
+                    }
+                }
+            }
+
+            // 对全路径作等比缩放，直线仍为直线、圆弧仍为圆弧，可让不同端减少不同的伸臂量。
+            const double maxScaleChange = std::min(0.18, maxSide / std::max(radius, 1.0));
+            const std::array<V3, 9> shifts{{V3{}, side * (0.2 * maxSide), side * (0.45 * maxSide),
+                -side * (0.2 * maxSide), -side * (0.45 * maxSide), across * (0.2 * maxSide),
+                across * (0.45 * maxSide), -across * (0.2 * maxSide), -across * (0.45 * maxSide)}};
+            constexpr std::array<double, 6> scaleFractions{{0.1875, 0.375, 0.5625, 0.75, 0.875, 1.0}};
+            for (double fraction : scaleFractions) {
+                const double scale = 1.0 - maxScaleChange * fraction;
+                for (const V3& lateral : shifts) {
+                    for (double depth : {-0.4 * aimDepth, 0.0, 0.4 * aimDepth}) {
+                        for (size_t j : {size_t(0), blend.size() - 1})
+                            choices.push_back({lateral + normal * depth, j, scale});
+                    }
+                }
+            }
+
+            // 先用相同喷点抽样比较，之后逐点复核各偏置和缩放档位。
+            const int stride = std::max(1, n / 96);
+            for (Shift& trial : choices) {
+                for (int i = 0; i < n; i += stride) {
+                    if (!emitSpray[i]) continue;
+                    const V3 pos = moveTcp(trial, i);
+                    V3 gun;
+                    double distance;
+                    bool canAim = false;
+                    for (size_t j : {trial.family, blend.size() - 1, size_t(0)}) {
+                        const Anchor& a = anchors[i][j];
+                        canAim = directionTo(pos, a.nominal, i, gun, distance) ||
+                            (a.supported && (directionTo(pos, a.reference, i, gun, distance) ||
+                                             directionTo(pos, a.hit, i, gun, distance)));
+                        if (canAim) break;
+                    }
+                    if (!canAim || distance < aimNear || distance > aimFar) {
+                        ++trial.badGeometry;
+                        continue;
+                    }
+                    const double wrist = norm(pos - gun * wristOffset - shoulder);
+                    trial.meanWrist += wrist;
+                    if (wrist > roughReach) ++trial.reachPenalty;
+                }
+            }
+            std::stable_sort(choices.begin(), choices.end(), [](const Shift& a, const Shift& b) {
+                if (a.badGeometry != b.badGeometry) return a.badGeometry < b.badGeometry;
+                if (a.reachPenalty != b.reachPenalty) return a.reachPenalty < b.reachPenalty;
+                return a.meanWrist < b.meanWrist;
+            });
+
+            auto usable = [&](const PR& pose) {
+                constexpr unsigned bad = RS_VIOL_TOOL_HIT | RS_VIOL_LINK_HIT | RS_VIOL_SELF_COLLISION
+                    | RS_VIOL_SPRAY_ANGLE | RS_VIOL_AIM_MISS | RS_VIOL_STEP_JUMP | RS_VIOL_TILT_JUMP;
+                return !blocked(pose) && pose.clearance >= p.hardClearance && !(pose.viol & bad);
+            };
+            auto usableCount = [&](const std::vector<PR>& path) {
+                return std::count_if(path.begin(), path.end(), usable);
+            };
+            auto branchJumps = [&](const std::vector<PR>& path) {
+                int jumps = 0;
+                const PR* previous = nullptr;
+                for (const PR& q : path) {
+                    if (blocked(q)) continue;
+                    if (previous) {
+                        for (int k = 0; k < 6; ++k) {
+                            if (std::fabs(q.theta[k] - previous->theta[k]) <= 30.0) continue;
+                            ++jumps;
+                            break;
+                        }
+                    }
+                    previous = &q;
+                }
+                return jumps;
+            };
+
+            const auto baselineCount = usableCount(emit);
+            const int baselineBranches = branchJumps(emit);
+            auto bestCount = baselineCount;
+            double bestShift = 0.0, bestDepthError = 0.0;
+            std::vector<PR> best;
+            int fullChecks = 0, geometryChecks = 0, badRay = 0, badClearance = 0, badRobot = 0;
+            double bestScale = 1.0;
+            int firstBadRay = -1, lastBadRay = -1, noRayAlone = 0;
+            struct AimOption {
+                V3 gun;
+                double distance = 0.0, cost = std::numeric_limits<double>::infinity();
+                int parent = -1;
+            };
+            constexpr size_t directOptions = 3 * blend.size();
+            constexpr size_t optionsPerPoint = directOptions + 18;
+            using AimOptions = std::array<AimOption, optionsPerPoint>;
+            std::array<V3, 8> rimDirections;
+            for (size_t k = 0; k < rimDirections.size(); ++k) {
+                const double a = k * kPi / 4.0;
+                rimDirections[k] = side * std::cos(a) + across * std::sin(a);
+            }
+            std::vector<double> cosTurn(n, -1.0);
+            if (p.tiltRateDeg > 0.0) {
+                for (int i = 1; i < n; ++i) {
+                    const double limit = std::max(thrTilt, angleBetweenDeg(emit[i - 1].gun, emit[i].gun));
+                    cosTurn[i] = std::cos(limit * kDeg) - 1e-10;
+                }
+            }
+            auto planAim = [&](const Shift& trial, std::vector<PR>& candidate, int& failedPoint, bool& noRay) {
+                std::vector<AimOptions> aiming(n);
+                for (int i = 0; i < n; ++i) {
+                    AimOptions& row = aiming[i];
+                    row.fill(AimOption{});
+                    const V3 pos = moveTcp(trial, i);
+                    const bool spray = emitSpray[i] != 0;
+                    bool hasRay = false;
+                    auto addAim = [&](size_t index, const V3& target, double cost) {
+                        AimOption& o = row[index];
+                        if (!directionTo(pos, target, i, o.gun, o.distance)) return;
+                        const bool aims = !spray || aimHits(pos, o.gun);
+                        if (!aims && (!(emit[i].viol & RS_VIOL_AIM_MISS) ||
+                                     o.distance < aimNear || o.distance > aimFar)) return;
+                        hasRay = true;
+                        const double wrist = norm(pos - o.gun * wristOffset - shoulder);
+                        cost += 0.005 * std::max(0.0, wrist - roughReach + 25.0) + (aims ? 0.0 : 1.0);
+                        if (i == 0) { o.cost = cost; return; }
+                        const AimOptions& previous = aiming[i - 1];
+                        for (size_t h = 0; h < optionsPerPoint; ++h) {
+                            if (!std::isfinite(previous[h].cost)) continue;
+                            const double d = dot(o.gun, previous[h].gun);
+                            if (d < cosTurn[i]) continue;
+                            const double pathCost = previous[h].cost + cost + 800.0 * std::max(0.0, 1.0 - d);
+                            if (pathCost < o.cost) {
+                                o.cost = pathCost;
+                                o.parent = static_cast<int>(h);
+                            }
+                        }
+                    };
+                    for (size_t j = 0; j < blend.size(); ++j) {
+                        const Anchor& a = anchors[i][j];
+                        const double cost = 0.2 * std::fabs(blend[j] - blend[trial.family]);
+                        addAim(3 * j, a.nominal, cost);
+                        if (a.supported) {
+                            addAim(3 * j + 1, a.reference, cost + 0.03);
+                            addAim(3 * j + 2, a.hit, cost + 0.06);
+                        }
+                    }
+                    // 在原射线附近留一个采样容差，用来连续穿过稀疏点、喷涂端点和关枪过渡。
+                    for (size_t j : {size_t(0), blend.size() - 1}) {
+                        const size_t start = directOptions + (j == 0 ? 0 : 9);
+                        const V3 nominal = anchors[i][j].nominal;
+                        addAim(start, nominal + (pos - emit[i].pos), 0.15);
+                        const double radius = spray ? 1.25 * aimTolerance : aimDepth;
+                        for (size_t k = 0; k < rimDirections.size(); ++k)
+                            addAim(start + 1 + k, nominal + rimDirections[k] * radius, 0.18);
+                    }
+                    if (std::none_of(row.begin(), row.end(),
+                                     [](const AimOption& o) { return std::isfinite(o.cost); })) {
+                        failedPoint = i;
+                        noRay = !hasRay;
+                        return false;
+                    }
+                }
+                candidate.resize(n);
+                const AimOptions& end = aiming.back();
+                auto k = std::min_element(end.begin(), end.end(),
+                                         [](const AimOption& a, const AimOption& b) { return a.cost < b.cost; })
+                       - end.begin();
+                for (int i = n - 1; i >= 0; --i) {
+                    const AimOption& chosen = aiming[i][k];
+                    PR& q = candidate[i];
+                    q = PR{};
+                    q.pos = moveTcp(trial, i);
+                    q.gun = chosen.gun;
+                    if (emitSpray[i]) {
+                        V3 hit;
+                        const double distance = cloud.nearestToSegment(q.pos + q.gun * aimNear,
+                            q.pos + q.gun * aimFar, aimTolerance, hit)
+                            ? dot(hit - q.pos, q.gun) : chosen.distance;
+                        q.standoffErr = std::fabs(distance - p.standoff);
+                    }
+                    k = chosen.parent;
+                }
+                return true;
+            };
+            constexpr unsigned protectedFlags = RS_VIOL_TOOL_HIT | RS_VIOL_LINK_HIT | RS_VIOL_SELF_COLLISION
+                | RS_VIOL_SPRAY_ANGLE | RS_VIOL_AIM_MISS | RS_VIOL_TILT_JUMP | RS_VIOL_STEP_JUMP;
+            auto introducesRisk = [&](const PR& pose, int i) {
+                return (pose.viol & protectedFlags & ~emit[i].viol) ||
+                    (pose.clearance < p.hardClearance && emit[i].clearance >= p.hardClearance) ||
+                    (pose.ikOk && pose.margin < 0.0 && emit[i].margin >= 0.0);
+            };
+            struct TrialCheck {
+                std::vector<PR> path;
+                int failedPoint = -1, usable = 0, branches = 0;
+                bool noRay = false, full = false, robotRisk = false;
+                double depthError = 0.0;
+            };
+            auto checkShift = [&](const Shift& trial) {
+                TrialCheck result;
+                auto& candidate = result.path;
+                if (!planAim(trial, candidate, result.failedPoint, result.noRay)) return result;
+                for (int i = 0; i < n; ++i) {
+                    PR& q = candidate[i];
+                    const V3 pos = q.pos, gun = q.gun;
+                    const double err = q.standoffErr;
+                    result.depthError = std::max(result.depthError, err);
+                    const double angle = angleBetweenDeg(gun, t.gun[i]);
+                    evTool.eval(pos + gun * p.standoff, -gun, nullptr, nullptr, angle, 0.0, false, q);
+                    q.idx = i;
+                    q.pos = pos;
+                    q.sprayAngle = angle;
+                    q.standoffErr = err;
+                    setViolBits(q, emitSpray[i] != 0);
+                    if (introducesRisk(q, i)) return result;
+                }
+                markJumps(candidate);
+                for (int i = 1; i < n; ++i) sampleLockedSegment(candidate, i, true);
+                markAim(candidate);
+                for (int i = 0; i < n; ++i)
+                    if (introducesRisk(candidate[i], i)) return result;
+
+                result.full = true;
+                measureKinematics(candidate);
+                for (int i = 0; i < n; ++i) result.robotRisk |= introducesRisk(candidate[i], i);
+                result.usable = (int)usableCount(candidate);
+                result.branches = branchJumps(candidate);
+                return result;
+            };
+
+            // 候选之间独立，单条候选的连续瞄准和逆解仍按点序推进。
+            // 按原排名收取结果，保持复核预算和同分时的选择规则。
+            std::vector<const Shift*> ranked;
+            std::array<int, scaleFractions.size()> perScale{};
+            int perTranslation[4] = {};
+            for (const Shift& trial : choices) {
+                if (trial.badGeometry > 4 || ranked.size() >= 140) break;
+                if (trial.scale < 1.0) {
+                    const double fraction = (1.0 - trial.scale) / maxScaleChange;
+                    const size_t group = std::lower_bound(scaleFractions.begin(), scaleFractions.end(),
+                        fraction - 1e-8) - scaleFractions.begin();
+                    if (perScale[group] >= 16) continue;
+                    ++perScale[group];
+                } else {
+                    const int group = std::clamp((int)(norm(trial.offset) / maxSide * 4.0), 0, 3);
+                    if (perTranslation[group] >= 20) continue;
+                    ++perTranslation[group];
+                }
+                ranked.push_back(&trial);
+            }
+            const size_t bytesPerTrial = static_cast<size_t>(n) * (sizeof(AimOptions) + sizeof(PR));
+            const size_t memoryWorkers = std::max<size_t>(1, (96u * 1024 * 1024) / bytesPerTrial);
+            const size_t workers = std::min({static_cast<size_t>(nThreads), memoryWorkers, size_t(4)});
+            const auto policy = workers == 1 ? std::launch::deferred : std::launch::async | std::launch::deferred;
+            auto done = [&] { return fullChecks >= 24 || bestCount == n; };
+            for (size_t begin = 0; begin < ranked.size() && !done(); begin += workers) {
+                const size_t end = std::min(begin + workers, ranked.size());
+                std::vector<std::future<TrialCheck>> batch;
+                batch.reserve(end - begin);
+                for (size_t i = begin; i < end; ++i)
+                    batch.push_back(std::async(policy, [&, i] { return checkShift(*ranked[i]); }));
+                for (size_t i = begin; i < end && !done(); ++i) {
+                    const Shift& trial = *ranked[i];
+                    TrialCheck result = batch[i - begin].get();
+                    ++geometryChecks;
+                    if (result.failedPoint >= 0) {
+                        ++badRay;
+                        if (firstBadRay < 0) firstBadRay = result.failedPoint;
+                        lastBadRay = std::max(lastBadRay, result.failedPoint);
+                        if (result.noRay) ++noRayAlone;
+                        continue;
+                    }
+                    if (!result.full) { ++badClearance; continue; }
+                    ++fullChecks;
+                    if (g_prof.on)
+                        std::fprintf(stderr, "  [shape trial] TCP %.1f mm scale %.4f · usable %d · risk %d · branches %d/%d\n",
+                                     norm(trial.offset), trial.scale, result.usable, result.robotRisk,
+                                     result.branches, baselineBranches);
+                    if (result.robotRisk || result.branches > baselineBranches) { ++badRobot; continue; }
+                    const double displacement = norm(trial.offset) + (1.0 - trial.scale) * radius;
+                    if (result.usable > bestCount ||
+                        (result.usable == bestCount && result.usable > baselineCount && displacement < bestShift)) {
+                        best.swap(result.path);
+                        bestCount = result.usable;
+                        bestShift = displacement;
+                        bestScale = trial.scale;
+                        bestDepthError = result.depthError;
+                    }
+                }
+            }
+            if (!best.empty()) {
+                emit.swap(best);
+                standoffMaxErr = bestDepthError;
+            }
+            if (g_prof.on)
+                std::fprintf(stderr, "  [shape shift] geometry %d (no continuous aim %d from %d through %d, no ray %d, clearance %d) · full %d (robot %d) · usable %d -> %d · TCP extent %.2f mm · scale %.4f\n",
+                             geometryChecks, badRay, firstBadRay, lastBadRay, noRayAlone, badClearance, fullChecks, badRobot, (int)baselineCount, (int)bestCount, bestShift, bestScale);
+        }
+    }
+    g_prof.mark("保形调轨");
+    for (const PR& pr : emit)
+        if (pr.viol & RS_VIOL_AIM_MISS) ++R.aimMissPoints;
     const int nOut = (int)emit.size();
     if (g_prof.on && (densifiedSegs || densifyGiveUp || dupDropped)) {
         std::fprintf(stderr,
@@ -5026,7 +5977,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         if (pr.sprayAngle > 0.5) ++tilted;
         // 可达率按**输出的点**（含插补点）重算：插补点 ikOk = 两端与，
         // 分子分母才是同一个口径。
-        if (!p.requireReach || pr.ikOk) ++reachableOut;
+        if (!checkRobot || pr.ikOk) ++reachableOut;
     }
 
     double sum = 0.0;

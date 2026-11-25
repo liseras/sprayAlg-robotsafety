@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Runtime.InteropServices;
 
 namespace SprayTrajViewer
@@ -160,6 +160,21 @@ namespace SprayTrajViewer
         public double tiltSideX;
     }
 
+    public enum RobotSafetyModel
+    {
+        Vs087 = 0,
+        CgxiG20 = 1,
+    }
+
+    public static class RobotSafetyPose
+    {
+        public const int Fast = 1 << 0;
+        public const int PerPoint = 1 << 1;
+        public const int GeometryFirst = 1 << 3;
+        public const int ReachAssist = 1 << 4;
+        public const int ShapeShift = 1 << 5;
+    }
+
     // 违规位（与 RS_VIOL_* 一致）
     public static class RobotSafetyRule
     {
@@ -174,6 +189,7 @@ namespace SprayTrajViewer
         public const uint LinkHit = 1u << 8;    // 连杆/关节/底座撞点云
         public const uint ToolHit = 1u << 9;    // 枪体/细管/喷嘴撞点云
         public const uint StepJump = 1u << 10;  // 相邻 TCP 步长跳变（跨行/跨换段也查）
+        public const uint AimMiss = 1u << 11;   // 名义喷距窗口内缺少点云支撑
         // Collision 是旧版汇总位，本层已由 LinkHit/ToolHit 细分，不再置位（保留位序不破坏兼容）
     }
 
@@ -234,7 +250,7 @@ namespace SprayTrajViewer
         public int    tiltedPoints;
         public int    poseReverted;
         public int    violations;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 10)]
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 11)]
         public int[]  byRule;
         public double minClearanceMm;      // 全部碰撞体
         public double minClearanceToolMm;  // 仅枪体
@@ -251,6 +267,7 @@ namespace SprayTrajViewer
         public int    azRows;        // 方位角决策单元数（= 轨迹行数）
         public int    azStanceRows;  // 其中实际改用「站位侧」的行数（azMode=1 时恒为 0）
         public int    l0Issues;
+        public int    aimMissPoints;
         public double standoffMedianMm;
         public IntPtr error;         // const char*
     }
@@ -298,6 +315,17 @@ namespace SprayTrajViewer
             [In] double[]? basePose16,
             ref RobotSafetyParams p,
             [In] double[]? upCloud);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern RobotSafetyResult robot_safety_check_up_model(
+            [In] SprayTrajPoint[] pts, int n, [In] double[] cloudXyz, int cloudCount,
+            [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud,
+            RobotSafetyModel model);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern RobotSafetyResult robot_safety_check_g20_roll(
+            [In] SprayTrajPoint[] pts, int n, [In] double[] cloudXyz, int cloudCount,
+            [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud, double rollDeg);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void robot_safety_free(ref RobotSafetyResult res);
