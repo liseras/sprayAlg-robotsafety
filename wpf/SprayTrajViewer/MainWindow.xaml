@@ -257,6 +257,10 @@
                                     </ComboBox>
                                 </DockPanel>
 
+                                <CheckBox x:Name="ChkG20Bent" Margin="0,8,0,0"
+                                          Content="G20 使用 90° 折弯枪"
+                                          ToolTip="使用 DensoArmKine 的 65 mm 短颈折弯枪模型。枪长从折点到喷嘴量。"
+                                          Checked="G20Bent_Changed" Unchecked="G20Bent_Changed"/>
                                 <DockPanel Margin="0,14,0,0">
                                     <TextBlock Text="G20 滚转试验 (°)" Width="150" VerticalAlignment="Center"/>
                                     <TextBox x:Name="TxtG20Roll" Text="0" Padding="4"

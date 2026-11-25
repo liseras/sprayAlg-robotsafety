@@ -440,6 +440,10 @@ struct SafetyModel {
     double wristOffset;
     double roughWristReach;
     bool densoWrist;
+    bool bentGun = false;
+    Pose elbowMount{};
+    Pose gunMount{};
+    Pose wristGunMount{};
 };
 
 const SafetyModel kVs087{kJoints, 905.0, poseTrans(0, 0, 0),
@@ -452,6 +456,15 @@ const SafetyModel kG20{kG20Joints, 1800.0,
     V3(0, 0, kG20Joints[0].oz), kG20FlangeFace,
     kG20Joints[1].ox + kG20Joints[2].oz + std::fabs(kG20Joints[3].ox)
         + kG20Joints[4].oz + std::hypot(kG20Joints[5].ox, kG20Joints[5].oz), false};
+// DensoArmKine CGXiG20 默认折弯枪：-Y 旋转 90°，枪长从折点起量。
+const SafetyModel kG20Bent = [] {
+    SafetyModel m = kG20;
+    m.bentGun = true;
+    m.elbowMount = poseTrans(-2.21, 6.77, 65.0);
+    m.gunMount = poseMul(m.elbowMount, poseRot(V3(0, 1, 0), -90.0 * kDeg));
+    m.wristGunMount = poseMul(m.flangeMount, m.gunMount);
+    return m;
+}();
 constexpr double kDefaultToolLen = 150.0;
 
 struct FkOut {
@@ -459,6 +472,7 @@ struct FkOut {
     V3 origins[7];
     V3 axes[6];
     Pose flange;
+    V3 gunElbow;
     Pose tcp;
 };
 
@@ -474,7 +488,8 @@ void fk(const double thetaDeg[6], const double toolLen, FkOut& out, const Safety
     }
     out.flange = model.densoWrist ? out.frames[6] : poseMul(out.frames[6], model.flangeMount);
     Pose tool = poseTrans(0.0, 0.0, toolLen);   // 法兰 +Z 指向喷嘴出口
-    out.tcp = poseMul(out.flange, tool);
+    out.gunElbow = model.bentGun ? poseMul(out.flange, model.elbowMount).t : out.flange.t;
+    out.tcp = poseMul(model.bentGun ? poseMul(out.flange, model.gunMount) : out.flange, tool);
     for (int i = 0; i < 7; ++i) out.origins[i] = out.frames[i].t;
 }
 
@@ -813,9 +828,11 @@ IkSol ikG20(const V3& target, const M3& rotation, double toolLen, const double* 
         if (valid(best) && maxJointDelta(best.theta, seed) <= kBranchContinuityTrigDeg) return best;
     }
 
-    const M3 wrist = m3mul(rotation, m3T(model.flangeMount.R));
+    const M3 wrist = m3mul(rotation, m3T(model.bentGun ? model.wristGunMount.R : model.flangeMount.R));
     const V3 forearm = wrist.col(2);
-    const V3 joint6 = target - rotation.col(2) * (toolLen + model.wristOffset);
+    const V3 joint6 = model.bentGun
+        ? target - rotation.col(2) * toolLen - m3mul(wrist, model.wristGunMount.t)
+        : target - rotation.col(2) * (toolLen + model.wristOffset);
     const V3 elbowCenter = joint6 - forearm * (j[4].oz + j[5].oz) - model.shoulderCenter;
     const double shoulderSide = j[1].ox, upper = j[2].oz, elbowSide = -j[3].ox;
     // J4 必须同时落在腕部偏置圆和肩部回转所能到达的距离带内。
@@ -1093,7 +1110,9 @@ void buildSegments(const FkOut& f, const Sizing& sz, bool includeBase, std::vect
     // 工具段：法兰→TCP 的方向就是工具 +Z，展开成握把/细管/喷嘴三段
     if (norm(f.flange.t - f.origins[6]) > kEps)
         out.push_back({f.origins[6], f.flange.t, sz.wristLinkR, SG_LINK, 6, 6, "腕部法兰", RS_SEG_LINK});
-    buildToolSegs(f.flange.t, f.tcp.t, sz, out);
+    if (norm(f.gunElbow - f.flange.t) > kEps)
+        out.push_back({f.flange.t, f.gunElbow, 30.0, SG_TOOL, -1, -1, "折弯枪短颈", RS_SEG_GRIP});
+    buildToolSegs(f.gunElbow, f.tcp.t, sz, out);
 }
 
 // 部位名（含关节号），给控制台/CSV/界面用
@@ -1610,7 +1629,13 @@ public:
             // 这里踩过一次：直接把点云系的 TCP/枪轴喂进 buildToolSegs，再被 toCloudP
             // 变换一次，等于整根枪被平移了一个基座偏移（自动基座是 −252,150,−197），
             // 于是"枪体撞了 1512 点、最深 −21.2mm"，全是假的。
-            buildToolSegs(toBaseP(pC) - toBaseV(zTool) * p_.toolLen, toBaseP(pC), sz_, segs);
+            const V3 tcp = toBaseP(pC);
+            const V3 elbow = tcp - toBaseV(zTool) * p_.toolLen;
+            buildToolSegs(elbow, tcp, sz_, segs);
+            // 只有枪轴、尚未确定滚转时，用覆盖所有短颈位置的包络检验点间枪体。
+            if (p_.model->bentGun)
+                segs.push_back({elbow, elbow, norm(p_.model->elbowMount.t) + 30.0,
+                                SG_TOOL, -1, -1, "折弯枪短颈包络", RS_SEG_GRIP});
             double worstTool = 1e300;
             const Seg* segTool = nullptr;
             Prof::Scope _p(g_prof.on, g_prof.nsSeg);
@@ -2351,6 +2376,13 @@ RobotSafetyResult robot_safety_check_g20_roll(const SprayTrajPoint* pts, int n,
                                    RS_MODEL_CGXI_G20, rollDeg);
 }
 
+RobotSafetyResult robot_safety_check_g20_bent(const SprayTrajPoint* pts, int n,
+    const double* cloudXyz, int cloudCount, const double* basePose16,
+    const RobotSafetyParams* paramsIn, const double* upCloud, double rollDeg) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud,
+                                   RS_MODEL_CGXI_G20_BENT, rollDeg);
+}
+
 static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int n,
                                                  const double* cloudXyz, int cloudCount,
                                                  const double* basePose16,
@@ -2374,9 +2406,11 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     if (!pts || n <= 0) return fail("轨迹为空");
     if (!cloudXyz || cloudCount <= 0) return fail("点云为空");
 
-    if (modelId != RS_MODEL_VS087 && modelId != RS_MODEL_CGXI_G20) return fail("未知安全评估机型");
+    if (modelId != RS_MODEL_VS087 && modelId != RS_MODEL_CGXI_G20 && modelId != RS_MODEL_CGXI_G20_BENT)
+        return fail("未知安全评估机型");
     Params p;
-    p.model = modelId == RS_MODEL_CGXI_G20 ? &kG20 : &kVs087;
+    p.model = modelId == RS_MODEL_CGXI_G20_BENT ? &kG20Bent :
+              modelId == RS_MODEL_CGXI_G20 ? &kG20 : &kVs087;
     {
         const RobotSafetyParams d = robot_safety_default_params();
         const RobotSafetyParams& s = paramsIn ? *paramsIn : d;
@@ -2414,7 +2448,7 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         p.shapeShift = (s.fastPose & RS_POSE_SHAPE_SHIFT) != 0;
     }
     if (!std::isfinite(rollDeg) || std::fabs(rollDeg) > 180.0 ||
-        (rollDeg != 0.0 && (!p.geometryFirst || !p.requireReach || p.model != &kG20)))
+        (rollDeg != 0.0 && (!p.geometryFirst || !p.requireReach || p.model->densoWrist)))
         return fail("滚转试验要求 G20 几何优先模式及机器人复核，角度范围 ±180°");
     p.gunRollRad = rollDeg * kDeg;
     const bool checkRobot = p.requireReach;

@@ -368,6 +368,7 @@ namespace SprayTrajViewer
             if (o.TryGetValue("tiltmode", out v)) ChkTiltPerPoint.IsChecked = int.TryParse(v, out var tm) && tm != 0;
             if (o.TryGetValue("reach-assist", out v)) ChkReachAssist.IsChecked = v != "0";
             if (o.TryGetValue("shape-shift", out v)) ChkShapeShift.IsChecked = v != "0";
+            if (o.TryGetValue("g20-bent", out v)) ChkG20Bent.IsChecked = v != "0";
             // --tiltk 60：倾角系数（δ=90° 侧壁时给多少度）。不传 = 库默认 60，等价 spray_safety -tilt。
             // 做"系数扫一遍"的 A/B 时用它，不必改代码重编。
             if (o.TryGetValue("tiltk", out v) &&
@@ -2491,6 +2492,7 @@ namespace SprayTrajViewer
             string root = ResolveExportRoot();
             if (SelectedSafetyModel != RobotSafetyModel.CgxiG20) return root;
             root = System.IO.Path.Combine(root, "CGXi-G20");
+            if (UseG20Bent) root = System.IO.Path.Combine(root, "bent-90");
             double roll = ReadG20Roll();
             return double.IsFinite(roll) && roll != 0 && Math.Abs(roll) <= 180
                 ? System.IO.Path.Combine(root, "roll-" + roll.ToString("R", System.Globalization.CultureInfo.InvariantCulture))
@@ -2826,6 +2828,7 @@ namespace SprayTrajViewer
               .Append("\"Source\": \"").Append(useSafe ? "safe" : "raw").Append("\", ")
               .Append("\"SourceText\": \"").Append(useSafe ? "修正后轨迹（安全层输出）" : "算法原始轨迹（未修正）").Append("\", ")
               .Append(useSafe ? $"\"PosePolicy\": \"geometry-first\", \"RobotModel\": \"{SafetyModelId(_evaluatedModel)}\", " : "")
+              .Append(useSafe && _evaluatedBentGun ? "\"ToolPreset\": \"G20-bent-90\", " : "")
               .Append(useSafe && _evaluatedGunRoll != 0 ? "\"GunRollDeg\": " + F6(_evaluatedGunRoll, ci) + ", " : "")
               .Append("\"TiltMode\": \"").Append(ChkTiltPerPoint.IsChecked == true ? "per-point" : "face").Append("\", ")
               .Append("\"Pose\": \"").Append(ChkFastPose.IsChecked == true ? "onepass" : "search").Append("\", ")
@@ -3037,6 +3040,8 @@ namespace SprayTrajViewer
         private RobotSafetyPoint[] _safetyPts = Array.Empty<RobotSafetyPoint>();
         private RobotSafetyModel _evaluatedModel = RobotSafetyModel.Vs087;
         private double _evaluatedGunRoll;
+        private bool _evaluatedBentGun;
+        bool UseG20Bent => SelectedSafetyModel == RobotSafetyModel.CgxiG20 && ChkG20Bent?.IsChecked == true;
         private readonly List<Visual3D> _riskVisuals = new();
         // 修正后轨迹分两条画：喷涂青、空移紫。LinesVisual3D 只有一个 Color，
         // 合成一条的话空移段就会跟喷涂段同色，"哪一段是空走"在修正层就看不出来了。
@@ -3067,6 +3072,20 @@ namespace SprayTrajViewer
             }
         }
 
+        void G20Bent_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!IsLoaded || SelectedSafetyModel != RobotSafetyModel.CgxiG20) return;
+            UpdateG20PresetLength();
+            CmbSafetyModel_Changed(sender, null!);
+        }
+
+        void UpdateG20PresetLength()
+        {
+            double length = ParseDouble(TxtToolLen.Text, 450);
+            if (UseG20Bent && length == 450) TxtToolLen.Text = "453.08";
+            else if (!UseG20Bent && length == 453.08) TxtToolLen.Text = "450";
+        }
+
         void G20Roll_LostFocus(object sender, RoutedEventArgs e)
         {
             if (!IsLoaded || SelectedSafetyModel != RobotSafetyModel.CgxiG20) return;
@@ -3083,6 +3102,7 @@ namespace SprayTrajViewer
         void CmbSafetyModel_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
         {
             if (!IsLoaded) return;
+            UpdateG20PresetLength();
             ShowOutDir();
             if (_safetyPts.Length == 0) return;
             _safetyPts = Array.Empty<RobotSafetyPoint>();
@@ -3334,6 +3354,7 @@ namespace SprayTrajViewer
             // 要不要按"这台机器人够不够得着"判死。取消勾选 = 只查几何（喷距/倾角/枪体），
             // 适用于点云本来就不是给当前机器人型号/站位用的场合。
             p.requireReach = ChkRequireReach.IsChecked == true ? 1 : 0;
+            bool bentGun = UseG20Bent;
             double gunRoll = model == RobotSafetyModel.CgxiG20 ? ReadG20Roll() : 0.0;
             if (!double.IsFinite(gunRoll) || Math.Abs(gunRoll) > 180 || (gunRoll != 0 && p.requireReach == 0))
             {
@@ -3367,6 +3388,7 @@ namespace SprayTrajViewer
             BtnSafety.IsEnabled = false;
             CmbSafetyModel.IsEnabled = false;
             TxtG20Roll.IsEnabled = false;
+            ChkG20Bent.IsEnabled = false;
             TxtHint.Text = $"{SafetyModelId(model)} 安全评估中…（轨迹 {pts.Length} 点 / 点云 {_cloud.Count} 点）";
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -3385,6 +3407,9 @@ namespace SprayTrajViewer
                 st = await Task.Run(() => model == RobotSafetyModel.Vs087
                     ? Native.robot_safety_check_up(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
                                                   basePose, ref p, upVec)
+                    : bentGun
+                        ? Native.robot_safety_check_g20_bent(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
+                                                            basePose, ref p, upVec, gunRoll)
                     : gunRoll == 0.0
                         ? Native.robot_safety_check_up_model(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
                                                             basePose, ref p, upVec, model)
@@ -3414,6 +3439,7 @@ namespace SprayTrajViewer
                 try { Native.robot_safety_free(ref st); } catch { }
                 CmbSafetyModel.IsEnabled = true;
                 TxtG20Roll.IsEnabled = true;
+                ChkG20Bent.IsEnabled = true;
                 BtnSafety.IsEnabled = true;
             }
 
@@ -3471,6 +3497,7 @@ namespace SprayTrajViewer
             // 可达率只在"要求可达"时才是真测出来的；关掉运动学后绝不能打 100%，
             // 那只是记账口径（R.reachable 被填成 n），会让人以为测过了。
             sb.AppendLine($"机器人 {SafetyModelId(model)}");
+            if (bentGun) sb.AppendLine($"折弯枪 90° · 短颈 65 mm · 枪身 {p.toolLen:F2} mm");
             if (gunRoll != 0) sb.AppendLine($"固定枪身滚转 {gunRoll:G}°（试验）");
             sb.AppendLine($"轨迹与枪姿 · 枪体干涉 {Rule(9)} · 喷角超限 {Rule(5)} · 枪轴跳变 {Rule(7)} · TCP 步长异常 {Rule(10)}");
             sb.AppendLine($"落点缺少点云支撑 {sum.aimMissPoints} 点（名义喷距附近）");
@@ -3554,6 +3581,7 @@ namespace SprayTrajViewer
             _safetyPts = got;
             _evaluatedModel = model;
             _evaluatedGunRoll = gunRoll;
+            _evaluatedBentGun = bentGun;
             _safetyExportClearanceMm = p.hardClearance;
             // 是否画修正层交给「显示修正后轨迹」复选框，不再用 tiltedPoints>0 判。
             // 原来只有"有点被倾斜"才画，可空移点**只抬枪不改倾角**，于是"只抬了枪"的件
@@ -3584,7 +3612,7 @@ namespace SprayTrajViewer
                 $"tilt(mean/p95/max)={sum.tiltMeanDeg:F1}/{sum.tiltP95Deg:F1}/{sum.tiltMaxDeg:F1} " +
                 $"tilted={sum.tiltedPoints} reverted={sum.poseReverted} standoffErr={sum.standoffMaxErrMm:E2} " +
                 $"baseAuto={sum.baseAuto} cloudPts={sum.cloudPoints} l0={sum.l0Issues} " +
-                $"threads={p.threads} voxel={p.voxelMm:F1} model={SafetyModelId(model)} roll={gunRoll:G} elapsed={sw.ElapsedMilliseconds}ms");
+                $"threads={p.threads} voxel={p.voxelMm:F1} model={SafetyModelId(model)} bent={bentGun} roll={gunRoll:G} elapsed={sw.ElapsedMilliseconds}ms");
         }
 
         void ShowSafetyCard(string verdict, Color color, string cost, string body)

@@ -328,6 +328,11 @@ namespace SprayTrajViewer
             [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud, double rollDeg);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern RobotSafetyResult robot_safety_check_g20_bent(
+            [In] SprayTrajPoint[] pts, int n, [In] double[] cloudXyz, int cloudCount,
+            [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud, double rollDeg);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void robot_safety_free(ref RobotSafetyResult res);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]

@@ -312,6 +312,7 @@ SPRAYTRAJ_API RobotSafetyResult robot_safety_check_up(
 // 机型由调用方显式指定，旧入口继续使用 VS-087。
 #define RS_MODEL_VS087 0
 #define RS_MODEL_CGXI_G20 1
+#define RS_MODEL_CGXI_G20_BENT 2
 SPRAYTRAJ_API RobotSafetyResult robot_safety_check_up_model(
     const SprayTrajPoint* pts, int n,
     const double* cloudXyz, int cloudCount,
@@ -322,6 +323,10 @@ SPRAYTRAJ_API RobotSafetyResult robot_safety_check_up_model(
 
 // G20 固定工具滚转试验（度），保持 TCP 与枪轴定义不变。
 SPRAYTRAJ_API RobotSafetyResult robot_safety_check_g20_roll(
+    const SprayTrajPoint* pts, int n, const double* cloudXyz, int cloudCount,
+    const double* basePose16, const RobotSafetyParams* params, const double upCloud[3], double rollDeg);
+
+SPRAYTRAJ_API RobotSafetyResult robot_safety_check_g20_bent(
     const SprayTrajPoint* pts, int n, const double* cloudXyz, int cloudCount,
     const double* basePose16, const RobotSafetyParams* params, const double upCloud[3], double rollDeg);
 
