@@ -1,0 +1,4 @@
+14:29:02.605 [OUTDIR] D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\GeometryFirstAim\traj_out
+14:29:02.605 [LOAD] D:\Code\cloudepoint\现场悬挂\p047-20261114-174117-cam.ply -> 226114 点，读取耗时 52 ms
+14:29:13.345 [AUTOEXPORT] 自动导出 → D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\GeometryFirstAim\traj_out（p047-20261114-174117-cam_traj.csv、p047-20261114-174117-cam_base.ply、p047-20261114-174117-cam_traj.plan.json、p047-20261114-174117-cam_safe.csv、p047-20261114-174117-cam_safe.plan.json） · 修正后轨迹
+14:29:13.345 [SAFETY] verdict=REJECT p0=457 p1=31 p2=35 count=1212 reachable=755 minClr=37.60 hardClr=2.00 tool=37.60 link=77.01 linkSeg=关节J1 77.01mm tilt(mean/p95/max)=5.3/11.2/17.3 tilted=1041 reverted=0 standoffErr=0.00E+000 baseAuto=0 cloudPts=226114 l0=0 threads=8 voxel=0.0 elapsed=219ms

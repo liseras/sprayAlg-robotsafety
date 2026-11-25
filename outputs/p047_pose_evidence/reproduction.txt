@@ -1,0 +1,11 @@
+p047 audit | 2026-11-24
+viewer plan = p047-20261114-174117-cam_safe.plan.json
+viewer plan SHA256 = D3B47EBDBF2C06686B9EEF6A49095AF6F6FD9FA9973347D953F098FC1FFBC17C
+base cloud SHA256 = 12C391DD42DFC9E614892BCFB1628C649454D1ECDF3F9E17FD65B9CA5860A5B7
+checked DLL SHA256 = 8B568D953E99F4B25E0FDCDCF94A997E6790D8D08B4080DCCC371B41A0231CCB
+safety argv = -geometry-first 1 -tiltmode <0|1> -standoff 100 -tool 450 -threads 1 -reach 1 -base 0 0 0 0 0 0
+DENSO argv = --traj-run --model VS-087 --frame tcp --traj-frame base
+pointwise.csv indices are zero-based.
+Fixed/flexible X,Y,Z and spray columns matched for all 1212 points. UI and flexible CLI AIM_MISS matched pointwise.
+DENSO skipped point flags use every skip interval in denso-current.txt (416 points).
+Shifted comparison uses the identical exported plan with DENSO --shift 60,500,0.
