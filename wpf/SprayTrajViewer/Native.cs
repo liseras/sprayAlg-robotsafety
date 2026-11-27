@@ -164,6 +164,7 @@ namespace SprayTrajViewer
     {
         Vs087 = 0,
         CgxiG20 = 1,
+        CgxiG20Bent = 2,
     }
 
     public static class RobotSafetyPose
@@ -239,6 +240,30 @@ namespace SprayTrajViewer
         public int    worstJ0, worstJ1;
         public int    linkKind;      // 连杆/关节里最近的那一段
         public int    linkJ0, linkJ1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RobotMotionLimits
+    {
+        public double StraightSpeed, TurnSpeed;
+        public double TcpAcceleration, TcpJerk, GunAxisSpeed;
+        public double JointSpeed, JointAcceleration, JointJerk;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RobotMotionPoint
+    {
+        public double Time, Speed, IncomingSpeedCap;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+        public double[] JointVelocity;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+        public double[] JointAccelerationAtPoint;
+        public double JointSpeed, JointAcceleration, JointJerk;
+        public uint Flags;
+
+        public const uint StopForTurn = 1;
+        public const uint JointUnchecked = 2;
+        public const uint JointBranchJump = 4;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -331,6 +356,16 @@ namespace SprayTrajViewer
         public static extern RobotSafetyResult robot_safety_check_g20_bent(
             [In] SprayTrajPoint[] pts, int n, [In] double[] cloudXyz, int cloudCount,
             [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud, double rollDeg);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern RobotSafetyResult robot_safety_check_rounded(
+            [In] SprayTrajPoint[] pts, int n, [In] double[] cloudXyz, int cloudCount,
+            [In] double[]? basePose16, ref RobotSafetyParams p, [In] double[]? upCloud,
+            RobotSafetyModel model, double rollDeg, double cornerWindowMm, double outputSpacingMm);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int robot_safety_plan_motion(IntPtr points, int count,
+            in RobotMotionLimits limits, [Out] RobotMotionPoint[] timed);
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         public static extern void robot_safety_free(ref RobotSafetyResult res);

@@ -1,0 +1,2 @@
+P047 X+1200: points=1212 within=1212 jumps30=0 maxJumpDeg=5.510595 maxPosMm=0.000000000 maxRotDeg=0.000000000
+Synthetic straight and bent FK/IK: 8192/8192 within limits, 0 failures

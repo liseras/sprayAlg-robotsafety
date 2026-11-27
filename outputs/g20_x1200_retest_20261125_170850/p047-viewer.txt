@@ -1,0 +1,47 @@
+17:13:43.792 [BOOT] args: --model CGXi-G20 --g20-bent 1 --g20-roll -60 --ply D:/Code/cloudepoint/现场悬挂/p047-20261114-174117-cam.ply --handeye D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20Bent\traj_out\G20_P047_Replan_1795588681018\X+1200\test_cam2base.txt --no-placement --row 120 --pt 4 --voxel 5 --standoff 100 --minw 18 --flat 40 --curv 5 --fill 300 --lift +X --auto --safety --reach 1 --tiltmode 1 --reach-assist 1 --shape-shift 1 --fast 0 --auto-export 0 --tab 1 --export-fixed D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\outputs\g20_x1200_retest_20261125_170850\p047-viewer-fixed-roll.csv --log D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\outputs\g20_x1200_retest_20261125_170850\p047-viewer.txt --shot-win D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20AxisSync\p047-viewer.png --exit
+17:13:43.798 [BOOT] base=D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20AxisSync\
+17:13:43.798 [BOOT] runtime=10.0.14
+17:13:44.378 [ABI] Plane=18664 Point=64 Result=298744 Params=192 | SafetyParams=160 SafetyPoint=224 SafetyResult=304 safety@8 hardClearance@16
+17:13:44.585 [CLI] ply=D:/Code/cloudepoint/现场悬挂/p047-20261114-174117-cam.ply
+17:13:44.585 [CLI] flat=40 minw=18 curv=5 fill=300 row=120 pt=4 standoff=100 gc=20 ee=-1 ea=-1 st=0 dir=0 flip=0
+17:13:44.586 [CLI] show: cloud=True traj=True plane=False
+17:13:44.586 [CLI] safetyGap=20 hardClr=2 requireReach=True
+17:13:44.586 [CLI] fastPose=False autoExport=False
+17:13:44.730 [VIEW] 取景(等轴) dist=1583.4 水平半宽=476.5 竖直半高=248.0 前沿=449.7
+17:13:44.738 [VIEW] 场景包围盒 710.6x639.8x111.0mm，中心=(648.8,79.7,1347.2)
+17:13:44.759 [AXIS] 场景坐标轴：原点=(250.9,-282.9,1249.0) 臂长=156.3mm （工件跨度=710.6mm，显示系：点云原坐标系（相机系））
+17:13:44.760 [CLOUD] 绘制 113057/226114 点（等距抽样 step=2，点径=1.8）
+17:13:44.761 [OUTDIR] D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20AxisSync\traj_out\CGXi-G20\bent-90\roll--60
+17:13:44.763 [LOAD] D:/Code/cloudepoint/现场悬挂/p047-20261114-174117-cam.ply -> 226114 点，读取耗时 46 ms
+17:13:44.772 [HANDEYE/M] D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20Bent\traj_out\G20_P047_Replan_1795588681018\X+1200\test_cam2base.txt src=text |RR^T-I|max=9.981E-07 det=1.000000 t=(749.38,-595.05,711.65)
+17:13:44.772 [HANDEYE/UP] 重力向上(点云系) = R 第3行 = (0.0017, 1.0000, 0.0014)
+17:13:44.775 [HANDEYE/BOX] 跳过可达位平移：基座系包围盒 X[2004,2133] Y[-244,467] Z[475,1114] 尺寸 129×711×640 位移(0,0,0)（纯手眼结果）
+17:13:44.776 [HANDEYE/CHK] basePose·exportPose 与单位阵最大偏差 = 9.99E-007 ✓（残差来自标定矩阵非严格正交）
+17:13:44.820 [VIEW] 取景(等轴) dist=1569.9 水平半宽=267.0 竖直半高=425.5 前沿=426.4
+17:13:44.821 [VIEW] 场景包围盒 128.6x711.3x639.8mm，中心=(2068.6,111.2,794.6)
+17:13:44.834 [AXIS] 场景坐标轴：原点=(1961.6,-287.1,432.0) 臂长=156.5mm （工件跨度=711.3mm，显示系：机器人基座系）
+17:13:44.835 [CLOUD] 绘制 113057/226114 点（等距抽样 step=2，点径=1.8）
+17:13:44.846 [AXIS] 场景坐标轴：原点=(1961.6,-287.1,432.0) 臂长=156.5mm （工件跨度=711.3mm，显示系：机器人基座系）
+17:13:44.846 [DISPFRAME] 显示坐标系 → 机器人基座系（手眼标定生效）
+17:13:44.847 [HANDEYE] 点云保持相机系，生成层口径不变；安全层用 basePose + upCloud 换算到基座系
+17:13:44.973 [GEN] 空移让开方向(点云系) = (-0.042, -0.001, 0.999)，界面口径 = 基座 +X（机器人正面）
+17:13:44.995 [GEN] 可喷侧方向 up=-Z（相机系恒定）
+17:13:46.204 [GEN] 算法耗时 1209 ms（226114 点）
+17:13:46.251 [VIEW] 取景(保持方向) dist=1651.2 水平半宽=306.7 竖直半高=444.1 前沿=456.6
+17:13:46.253 [VIEW] 场景包围盒 228.7x711.3x652.7mm，中心=(2018.6,111.2,788.1)
+17:13:46.255 [TRAJ] 段数=3（喷涂 2 / 换面 0 / 空移 1，换面点 0 / 空移点 23/1212）
+17:13:46.255 [GEN] 内部点距 4.00 mm · 导出点距 4.00 mm
+17:13:46.255 [GEN] plane_count=2 rows=5 points=1212 rms=4.608 inlier=155938 seg=3.974/7.448
+17:13:46.256 [PLANE] #0 顶点=4 三角=2 尺寸=602.2x337.2x49.8 内点=155938 与Z夹角=8.1° 质心=(663.6,-47.3,1318.1) 法向=(-0.003,-0.141,-0.990) 真实=(-0.003,-0.141,-0.990) 分类=1 内壁=否 依据=2
+17:13:46.256 [PLANE] #1 顶点=10 三角=8 尺寸=733.8x419.4x70.1 内点=66123 与Z夹角=8.7° 质心=(856.2,23.2,1357.7) 法向=(-0.010,-0.152,-0.988) 真实=(-0.010,-0.152,-0.988) 分类=1 内壁=是 依据=2
+17:13:46.259 [FACES] 面级法向清单：窗口内 2 面 —— 全部是单层壳（每个面只有一层点、没有壁厚，点云里不含第二层；要按板的两面出轨迹，把「薄板双面壁厚」填上板厚）；分割共 2 面
+17:13:46.259 [CLOUD] 生成后自动隐藏原始点云（可在显示控制里重新勾选）
+17:13:46.262 [CLI] auto-generate 完成
+17:13:46.292 [SAFETY] 竖直向上 = 基座 +Z（由基座位姿给出，忽略「重力向上」下拉）
+17:13:46.882 [SAFETY/DRAW] 风险点 红=0 橙=0 黄=37/37（抽稀）；修正轨迹线段 喷涂=1187 空移=24 过渡=0 过滤=0 · showFixed=True arrLen=1212 收集喷=1187 空=24 max步=7.4
+17:13:46.882 [SAFETY] verdict=PASS WITH WARNINGS p0=0 p1=33 p2=4 count=1212 reachable=1212 minClr=24.61 hardClr=2.00 tool=24.61 link=62.50 linkSeg=关节J1 62.50mm tilt(mean/p95/max)=5.6/11.3/16.7 tilted=1159 reverted=0 standoffErr=0.00E+000 baseAuto=0 cloudPts=14935 l0=0 threads=8 voxel=5.0 model=CGXi-G20 bent=True roll=-60 elapsed=580ms
+17:13:46.897 [CLI] auto-safety 完成
+17:13:46.906 [CLI] export-fixed -> D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\outputs\g20_x1200_retest_20261125_170850\p047-viewer-fixed-roll.csv（1212 点）
+17:13:47.776 [SHOT-WIN] D:\Code\喷涂算法自研_robot-safety\喷涂算法自研_robot-safety\wpf\SprayTrajViewer\bin\RobotSafetyG20AxisSync\p047-viewer.png (1280x820)
+17:13:47.776 [CLI] shot 完成，退出
+17:13:47.785 [EXIT] code=0

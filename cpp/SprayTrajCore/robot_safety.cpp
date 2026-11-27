@@ -172,6 +172,8 @@ inline V3 unit(const V3& a) {
     return n > kEps ? a * (1.0 / n) : a;
 }
 
+#include "corner_blend.inl"
+
 struct M3 {
     double m[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
     static M3 I() {
@@ -426,10 +428,10 @@ const JointDef kJoints[6] = {
 const JointDef kG20Joints[6] = {
     {"J1",    0.0, 0.0, 227.0,  0.0, 0.0, 1.0, -360.0, 360.0},
     {"J2",  234.0, 0.0,   0.0,  1.0, 0.0, 0.0, -360.0, 360.0},
-    {"J3",    0.0, 0.0, 872.3,  0.0, 0.0, 1.0, -165.0, 165.0},
-    {"J4", -168.3, 0.0,   0.0,  1.0, 0.0, 0.0, -360.0, 360.0},
-    {"J5",    0.0, 0.0, 793.5,  0.0, 0.0, 1.0, -360.0, 360.0},
-    {"J6",  134.2, 0.0, 134.2,  0.0, 0.0, 1.0, -360.0, 360.0},
+    {"J3", -168.3, 0.0, 872.3,  1.0, 0.0, 0.0, -165.0, 165.0},
+    {"J4",    0.0, 0.0, 793.5,  1.0, 0.0, 0.0, -360.0, 360.0},
+    {"J5",  134.2, 0.0,   0.0,  0.0, 0.0, 1.0, -360.0, 360.0},
+    {"J6",  124.2, 0.0, 134.2,  1.0, 0.0, 0.0, -360.0, 360.0},
 };
 
 struct SafetyModel {
@@ -450,12 +452,10 @@ const SafetyModel kVs087{kJoints, 905.0, poseTrans(0, 0, 0),
     V3(0, 0, kJoints[0].oz + kJoints[1].oz), kJoints[5].oz,
     std::hypot(kJoints[2].oz + kJoints[3].oz + kJoints[4].oz, std::fabs(kJoints[3].ox)) + kJoints[1].ox,
     true};
-constexpr double kG20FlangeFace = 124.2;
 const SafetyModel kG20{kG20Joints, 1800.0,
-    poseMul(poseRot(V3(0, 1, 0), 90.0 * kDeg), poseTrans(0, 0, kG20FlangeFace)),
-    V3(0, 0, kG20Joints[0].oz), kG20FlangeFace,
-    kG20Joints[1].ox + kG20Joints[2].oz + std::fabs(kG20Joints[3].ox)
-        + kG20Joints[4].oz + std::hypot(kG20Joints[5].ox, kG20Joints[5].oz), false};
+    poseRot(V3(0, 1, 0), 90.0 * kDeg),
+    V3(0, 0, kG20Joints[0].oz), kG20Joints[5].ox,
+    kG20Joints[1].ox + kG20Joints[2].oz + kG20Joints[3].oz + kG20Joints[4].ox + kG20Joints[5].oz, false};
 // DensoArmKine CGXiG20 默认折弯枪：-Y 旋转 90°，枪长从折点起量。
 const SafetyModel kG20Bent = [] {
     SafetyModel m = kG20;
@@ -463,6 +463,8 @@ const SafetyModel kG20Bent = [] {
     m.elbowMount = poseTrans(-2.21, 6.77, 65.0);
     m.gunMount = poseMul(m.elbowMount, poseRot(V3(0, 1, 0), -90.0 * kDeg));
     m.wristGunMount = poseMul(m.flangeMount, m.gunMount);
+    m.wristOffset = 0.0;
+    m.roughWristReach += kG20Joints[5].ox + norm(m.elbowMount.t);
     return m;
 }();
 constexpr double kDefaultToolLen = 150.0;
@@ -797,109 +799,88 @@ constexpr int kOverSweepMax = 8;
 // 所以定为 0：解析段全灭就直接返回失败，一组固定种子都不跑。
 // 真遇到"闭式解漏了、固定种子能捞回来"的件，把它调大即可（0 → 12 = 旧行为）。
 constexpr int kFixedSeedAfterAnaFail = 0;
-// G20 的 J5/J6 轴方向相同而中心错开。沿腕部偏置圆周构造初值，再用完整 TCP 位姿求逆解。
+// J2/J3/J4 绕平行 X 轴。先用横向偏置解 J1，再把腕部 X-Z-X 分解为
+// J2+J3+J4、J5、J6，最后用肩肘平面内的两连杆解拆开 J2 和 J3。
 IkSol ikG20(const V3& target, const M3& rotation, double toolLen, const double* seed,
             const SafetyModel& model) {
-    const auto* j = model.joints;
+    const JointDef* j = model.joints;
     const double zero[6] = {};
     const double* reference = seed ? seed : zero;
-    auto solve = [&](const double* initial) {
-        if (g_prof.on) ++g_prof.ikOnceN;
-        IkSol sol = ikOnce(target, rotation, toolLen, initial, model);
-        for (int i = 0; i < 6; ++i) {
-            if (!std::isfinite(sol.theta[i])) { sol.ok = false; return sol; }
-            const double lo = std::ceil((j[i].lo - sol.theta[i]) / 360.0 - 1e-12);
-            const double hi = std::floor((j[i].hi - sol.theta[i]) / 360.0 + 1e-12);
-            if (lo <= hi) {
-                const double nearest = std::round((reference[i] - sol.theta[i]) / 360.0);
-                sol.theta[i] += 360.0 * clampd(nearest, lo, hi);
-            }
-        }
-        sol.over = overLimit(sol.theta, model);
-        sol.margin = limitMarginMin(sol.theta, model);
-        return sol;
-    };
-    auto valid = [](const IkSol& sol) {
-        return sol.ok && !sol.over && sol.posErr < kIkValidPosMM && sol.rotErrDeg < kIkValidRotDeg;
-    };
-    IkSol best;
-    if (seed) {
-        best = solve(seed);
-        if (valid(best) && maxJointDelta(best.theta, seed) <= kBranchContinuityTrigDeg) return best;
-    }
+    IkSol best{};
+    double bestDistance = std::numeric_limits<double>::infinity();
 
-    const M3 wrist = m3mul(rotation, m3T(model.bentGun ? model.wristGunMount.R : model.flangeMount.R));
-    const V3 forearm = wrist.col(2);
-    const V3 joint6 = model.bentGun
-        ? target - rotation.col(2) * toolLen - m3mul(wrist, model.wristGunMount.t)
-        : target - rotation.col(2) * (toolLen + model.wristOffset);
-    const V3 elbowCenter = joint6 - forearm * (j[4].oz + j[5].oz) - model.shoulderCenter;
-    const double shoulderSide = j[1].ox, upper = j[2].oz, elbowSide = -j[3].ox;
-    // J4 必须同时落在腕部偏置圆和肩部回转所能到达的距离带内。
-    const double axial = dot(elbowCenter, forearm);
-    const double lateralRadius = norm(elbowCenter - forearm * axial);
-    const double elbowReach = std::hypot(upper, elbowSide);
-    const double nearestElbow = std::hypot(axial, lateralRadius - j[5].ox);
-    const double farthestElbow = std::hypot(axial, lateralRadius + j[5].ox);
-    if (!best.ok && (nearestElbow > elbowReach + shoulderSide + 1.0 ||
-                     farthestElbow < elbowReach - shoulderSide - 1.0)) return best;
-    struct Seed { std::array<double, 6> theta; double score; };
-    constexpr int sectors = 24;
-    std::array<Seed, sectors * 4> starts;
-    size_t count = 0;
-    for (int i = 0; i < sectors; ++i) {
-        const double az = i * 2.0 * kPi / sectors;
-        const V3 lateral = wrist.col(0) * std::cos(az) + wrist.col(1) * std::sin(az);
-        const V3 elbow = elbowCenter - lateral * j[5].ox;
-        const double radial = std::hypot(elbow.x, elbow.y);
-        const double projection = (dot(elbow, elbow) + sq(shoulderSide) - sq(upper) - sq(elbowSide))
-                                / (2.0 * shoulderSide);
-        const double bearing = std::atan2(elbow.y, elbow.x);
-        const double turn = std::acos(clampd(projection / std::max(radial, kEps), -1.0, 1.0));
-        for (double q1 : {bearing + turn, bearing - turn}) {
-            const M3 base = rotAxis(V3(0, 0, 1), q1);
-            const double elbowX = dot(elbow, base.col(0)) - shoulderSide;
-            const double q3abs = std::acos(clampd(-elbowX / elbowSide, -1.0, 1.0));
-            for (double q3 : {q3abs, -q3abs}) {
-                const double q2 = std::atan2(-dot(elbow, base.col(1)), elbow.z)
-                                - std::atan2(elbowSide * std::sin(q3), upper);
-                const M3 shoulder = m3mul(base, rotAxis(V3(1, 0, 0), q2));
-                const M3 elbowFrame = m3mul(shoulder, rotAxis(V3(0, 0, 1), q3));
-                const double q4 = std::atan2(-dot(forearm, elbowFrame.col(1)), dot(forearm, elbowFrame.col(2)));
-                const M3 arm = m3mul(elbowFrame, rotAxis(V3(1, 0, 0), q4));
-                const double q5 = std::atan2(dot(lateral, arm.col(1)), dot(lateral, arm.col(0)));
-                const double q56 = std::atan2(dot(wrist.col(0), arm.col(1)), dot(wrist.col(0), arm.col(0)));
-                const double radialError = std::fabs(norm(elbow - base.col(0) * shoulderSide)
-                                                     - elbowReach);
-                const double limits = std::max(0.0, std::fabs(q3) * kRad - j[2].hi);
-                starts[count++] = {{q1*kRad, q2*kRad, q3*kRad, q4*kRad, q5*kRad, (q56-q5)*kRad},
-                    radialError + std::fabs(dot(forearm, elbowFrame.col(0))) * j[4].oz + limits * 2.0};
-            }
-        }
-    }
-    constexpr size_t attempts = 12;
-    std::partial_sort(starts.begin(), starts.begin() + attempts, starts.end(),
-                     [](const Seed& a, const Seed& b) { return a.score < b.score; });
-    bool hasValid = valid(best);
-    double bestDistance = hasValid ? jointDist2(best.theta, reference) : 1e300;
-    for (size_t i = 0; i < attempts; ++i) {
-        IkSol trial = solve(starts[i].theta.data());
-        if (valid(trial)) {
-            if (!seed) return trial;
-            const double dist = jointDist2(trial.theta, reference);
-            if (!hasValid || dist < bestDistance) {
+    const Pose& mount = model.bentGun ? model.wristGunMount : model.flangeMount;
+    const M3 wrist = m3mul(rotation, m3T(mount.R));
+    const V3 joint6 = target - rotation.col(2) * toolLen - m3mul(wrist, mount.t);
+    const V3 wristCenter = joint6 - wrist.col(0) * j[5].ox - model.shoulderCenter;
+    const double side = j[1].ox + j[2].ox + j[4].ox;
+    const double radius = std::hypot(wristCenter.x, wristCenter.y);
+    if (radius < side - kEps) return best;
+    const double bearing = std::atan2(wristCenter.y, wristCenter.x);
+    const double turn = std::acos(clampd(side / radius, -1.0, 1.0));
+    const double upper = j[2].oz, forearm = j[3].oz;
+
+    for (double q1 : {bearing + turn, bearing - turn}) {
+        const M3 baseInv = rotAxis(V3(0, 0, 1), -q1);
+        const M3 local = m3mul(baseInv, wrist);
+        const V3 center = m3mul(baseInv, wristCenter);
+        auto solveElbow = [&](double pitch, double q5, double q6) {
+            const double y = center.y + j[5].oz * std::sin(pitch);
+            const double z = center.z - j[5].oz * std::cos(pitch);
+            const double cosElbow = (sq(y) + sq(z) - sq(upper) - sq(forearm)) / (2.0 * upper * forearm);
+            if (std::fabs(cosElbow) > 1.0 + kEps) return;
+            const double elbow = std::acos(clampd(cosElbow, -1.0, 1.0));
+            for (double q3 : {elbow, -elbow}) {
+                const double q2 = std::atan2(-y, z) -
+                    std::atan2(forearm * std::sin(q3), upper + forearm * std::cos(q3));
+                IkSol trial{{q1 * kRad, q2 * kRad, q3 * kRad, (pitch - q2 - q3) * kRad,
+                             q5 * kRad, q6 * kRad}};
+                for (int i = 0; i < 6; ++i) {
+                    const double lo = std::ceil((j[i].lo - trial.theta[i]) / 360.0 - 1e-12);
+                    const double hi = std::floor((j[i].hi - trial.theta[i]) / 360.0 + 1e-12);
+                    const double nearest = std::round((reference[i] - trial.theta[i]) / 360.0);
+                    if (lo <= hi) trial.theta[i] += 360.0 * clampd(nearest, lo, hi);
+                    else trial.theta[i] = std::remainder(trial.theta[i], 360.0);
+                }
+                const double distance = jointDist2(trial.theta, reference);
+                trial.over = overLimit(trial.theta, model);
+                if (best.ok && (trial.over != best.over ? trial.over : distance >= bestDistance)) continue;
+
+                FkOut check;
+                fk(trial.theta, toolLen, check, model);
+                trial.posErr = norm(target - check.tcp.t);
+                trial.rotErrDeg = norm(matToRotvec(m3mul(rotation, m3T(check.tcp.R)))) * kRad;
+                trial.ok = trial.posErr < kIkValidPosMM && trial.rotErrDeg < kIkValidRotDeg;
+                if (!trial.ok) continue;
+                trial.margin = limitMarginMin(trial.theta, model);
                 best = trial;
-                hasValid = true;
-                bestDistance = dist;
+                bestDistance = distance;
             }
-            if (maxJointDelta(trial.theta, seed) <= kBranchContinuityTrigDeg) break;
-        } else if (!hasValid && rankCmp(trial, best) < 0) {
-            best = trial;
+        };
+
+        const double sinQ5 = std::hypot(local.m[1][0], local.m[2][0]);
+        if (sinQ5 < kEps) {
+            // J5 为 0 或 180° 时腕部只约束两段 X 旋转的组合。先试上一点的俯仰，
+            // 再试两连杆所需伸展量最小/最大的俯仰，覆盖奇异位形的可达边界。
+            const double q5 = local.m[0][0] >= 0 ? 0.0 : kPi;
+            const double aligned = std::atan2(-center.y, center.z);
+            const double previousPitch = (reference[1] + reference[2] + reference[3]) * kDeg;
+            for (double pitch : {previousPitch, aligned, aligned + kPi}) {
+                const M3 remainder = m3mul(m3T(m3mul(rotAxis(V3(1, 0, 0), pitch),
+                                                       rotAxis(V3(0, 0, 1), q5))), local);
+                solveElbow(pitch, q5, std::atan2(remainder.m[2][1], remainder.m[1][1]));
+            }
+        } else {
+            for (double sign : {1.0, -1.0}) {
+                const double q5 = std::atan2(sign * sinQ5, local.m[0][0]);
+                const double pitch = std::atan2(sign * local.m[2][0], sign * local.m[1][0]);
+                const double q6 = std::atan2(sign * local.m[0][2], -sign * local.m[0][1]);
+                solveElbow(pitch, q5, q6);
+            }
         }
     }
     return best;
 }
-
 IkSol ik(const V3& pTarget, const M3& RTarget, double toolLen, const double* seed,
          const SafetyModel& model) {
     if (!model.densoWrist) {
@@ -2269,6 +2250,8 @@ bool rayStandoff(const CloudIndex& cloud, const V3& p, const V3& gun, double tub
 
 }  // namespace
 
+#include "motion_timing.inl"
+
 // ================================================================ C ABI
 
 // 编译戳放在 stamp.cpp：那个文件每次都重编，增量构建下也不会落后于实际链接。
@@ -2344,7 +2327,8 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
                                                  const double* cloudXyz, int cloudCount,
                                                  const double* basePose16,
                                                  const RobotSafetyParams* paramsIn,
-                                                 const double* upCloud, int modelId, double rollDeg = 0.0);
+                                                 const double* upCloud, int modelId, double rollDeg = 0.0,
+                                                 double cornerWindow = 0.0, double outputSpacing = 0.0);
 
 RobotSafetyResult robot_safety_check(const SprayTrajPoint* pts, int n,
                                      const double* cloudXyz, int cloudCount,
@@ -2383,11 +2367,20 @@ RobotSafetyResult robot_safety_check_g20_bent(const SprayTrajPoint* pts, int n,
                                    RS_MODEL_CGXI_G20_BENT, rollDeg);
 }
 
+RobotSafetyResult robot_safety_check_rounded(const SprayTrajPoint* pts, int n,
+    const double* cloudXyz, int cloudCount, const double* basePose16,
+    const RobotSafetyParams* paramsIn, const double* upCloud, int modelId, double rollDeg,
+    double cornerWindow, double outputSpacing) {
+    return robot_safety_check_impl(pts, n, cloudXyz, cloudCount, basePose16, paramsIn, upCloud,
+                                   modelId, rollDeg, cornerWindow, outputSpacing);
+}
+
 static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int n,
                                                  const double* cloudXyz, int cloudCount,
                                                  const double* basePose16,
                                                  const RobotSafetyParams* paramsIn,
-                                                 const double* upCloud, int modelId, double rollDeg) {
+                                                 const double* upCloud, int modelId, double rollDeg,
+                                                 double cornerWindow, double outputSpacing) {
     RobotSafetyResult R;
     std::memset(&R, 0, sizeof(R));
     R.minClearanceMm = std::numeric_limits<double>::infinity();
@@ -2450,6 +2443,9 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
     if (!std::isfinite(rollDeg) || std::fabs(rollDeg) > 180.0 ||
         (rollDeg != 0.0 && (!p.geometryFirst || !p.requireReach || p.model->densoWrist)))
         return fail("滚转试验要求 G20 几何优先模式及机器人复核，角度范围 ±180°");
+    if (!std::isfinite(cornerWindow) || cornerWindow < 0.0 ||
+        (cornerWindow > 0.0 && (!p.geometryFirst || !std::isfinite(outputSpacing) || outputSpacing < 0.5)))
+        return fail("转角平滑要求几何优先模式，且输出点距至少 0.5 mm");
     p.gunRollRad = rollDeg * kDeg;
     const bool checkRobot = p.requireReach;
     if (p.geometryFirst) {
@@ -5929,6 +5925,148 @@ static RobotSafetyResult robot_safety_check_impl(const SprayTrajPoint* pts, int 
         }
     }
     g_prof.mark("保形调轨");
+    if (cornerWindow > 0.0 && emit.size() >= 3) {
+        std::vector<CornerPoint> rounded;
+        rounded.reserve(emit.size());
+        for (size_t i = 0; i < emit.size(); ++i) {
+            const int src = emitSrc[i];
+            const int kind = std::max(t.kind[src], t.kind[src > 0 ? src - 1 : src]);
+            rounded.push_back({emit[i].pos, emit[i].gun, t.speed[src], emitSpray[i], kind, (int)i});
+        }
+        constexpr unsigned geometryFlags = RS_VIOL_TOOL_HIT | RS_VIOL_SPRAY_ANGLE | RS_VIOL_AIM_MISS;
+        auto evaluateCornerPoint = [&](const CornerPoint& point) {
+            const PR& original = emit[point.source];
+            const int src = emitSrc[point.source];
+            const double angle = angleBetweenDeg(point.gun, t.gun[src]);
+            PR q;
+            evTool.eval(point.pos + point.gun * SwD, -point.gun, nullptr, nullptr,
+                        angle, original.azDeg, false, q);
+            q.idx = src;
+            q.pos = point.pos;
+            q.gun = point.gun;
+            q.sprayAngle = angle;
+            q.lifted = original.lifted;
+            q.reverted = original.reverted;
+            setViolBits(q, point.spray != 0);
+            if (point.spray) {
+                V3 hit;
+                if (cloud.nearestToSegment(q.pos + q.gun * aimNear, q.pos + q.gun * aimFar,
+                                           aimTolerance, hit))
+                    q.standoffErr = std::fabs(dot(hit - q.pos, q.gun) - p.standoff);
+                else
+                    q.viol |= RS_VIOL_AIM_MISS;
+            }
+            return q;
+        };
+        auto exceedsGeometry = [&](const PR& q, int source) {
+            const PR& old = emit[source];
+            return (q.viol & geometryFlags & ~old.viol) ||
+                q.clrTool < std::min(p.hardClearance, old.clrTool) - 1e-6;
+        };
+        auto worsensAxisJump = [&](const PR& a, const PR& b, int srcA, int srcB) {
+            return thrTilt > 0.0 && angleBetweenDeg(a.gun, b.gun) >
+                std::max(thrTilt, angleBetweenDeg(emit[srcA].gun, emit[srcB].gun)) + 1e-6;
+        };
+        auto geometryPasses = [&](const std::vector<CornerPoint>& run) {
+            std::vector<PR> checked;
+            checked.reserve(run.size());
+            for (size_t i = 0; i < run.size(); ++i) {
+                const CornerPoint& point = run[i];
+                checked.push_back(evaluateCornerPoint(point));
+                sampleLockedSegment(checked, (int)i, true);
+                if (exceedsGeometry(checked.back(), point.source) ||
+                    (i > 0 && worsensAxisJump(checked[i - 1], checked[i], run[i - 1].source, point.source))) {
+                    return point.source;
+                }
+            }
+            return -1;
+        };
+        const double outStep = outputSpacing;
+        if (roundAndSampleTrajectory(rounded, medGap, outStep, cornerWindow,
+                                     p.standoff, geometryPasses)) {
+            std::vector<PR> checked;
+            checked.reserve(rounded.size());
+            for (const CornerPoint& point : rounded) checked.push_back(evaluateCornerPoint(point));
+            bool accepted = true;
+            for (size_t i = 0; i < checked.size(); ++i) {
+                PR& q = checked[i];
+                const int src = rounded[i].source;
+                if (i > 0) {
+                    const PR& prev = checked[i - 1];
+                    const int prevSrc = rounded[i - 1].source;
+                    if (worsensAxisJump(prev, q, prevSrc, src)) {
+                        accepted = false;
+                        break;
+                    }
+                    // Same consecutive original points retain their prior segment checks.
+                    if (src != prevSrc + 1 || norm(q.pos - emit[src].pos) > 1e-6 ||
+                        norm(prev.pos - emit[prevSrc].pos) > 1e-6 ||
+                        norm(q.gun - emit[src].gun) > 1e-8 ||
+                        norm(prev.gun - emit[prevSrc].gun) > 1e-8)
+                        sampleLockedSegment(checked, (int)i, true);
+                    else {
+                        q.clrTool = std::min(q.clrTool, emit[src].clrTool);
+                        q.clearance = q.clrTool;
+                        q.viol |= emit[src].viol & RS_VIOL_TOOL_HIT;
+                    }
+                    if (p.tiltRateDeg > 0.0) {
+                        if (angleBetweenDeg(prev.gun, q.gun) > thrTilt + 1e-8)
+                            q.viol |= RS_VIOL_TILT_JUMP;
+                        if (norm(q.pos - prev.pos) > std::max(thrStep, outStep) + 1e-6)
+                            q.viol |= RS_VIOL_STEP_JUMP;
+                    }
+                }
+                if (exceedsGeometry(q, src)) {
+                    accepted = false;
+                    break;
+                }
+            }
+            if (accepted && checkRobot) {
+                measureKinematics(checked);
+                constexpr unsigned robotFlags = RS_VIOL_IK_FAIL | RS_VIOL_LINK_HIT |
+                    RS_VIOL_SELF_COLLISION | RS_VIOL_JOINT_LIMIT | RS_VIOL_NEAR_SINGULAR;
+                auto jointJump = [](const PR& a, const PR& b) {
+                    if (!a.ikOk || !b.ikOk) return false;
+                    for (int k = 0; k < 6; ++k)
+                        if (std::fabs(a.theta[k] - b.theta[k]) > 30.0) return true;
+                    return false;
+                };
+                for (size_t i = 0; i < checked.size(); ++i) {
+                    const PR& q = checked[i];
+                    const PR& old = emit[rounded[i].source];
+                    if ((q.viol & robotFlags & ~old.viol) ||
+                        q.clearance < std::min(p.hardClearance, old.clearance) - 1e-6 ||
+                        (q.ikOk && q.margin < 0.0 && old.margin >= 0.0) ||
+                        (i > 0 && jointJump(checked[i - 1], q) &&
+                         !jointJump(emit[rounded[i - 1].source], old))) {
+                        std::fprintf(stderr, "[安全层转角] 机器人复核未通过（第 %zu 点，原第 %d 点）\n",
+                                     i + 1, rounded[i].source + 1);
+                        accepted = false;
+                        break;
+                    }
+                }
+            }
+            if (accepted) {
+                std::vector<int> sources;
+                std::vector<char> spray;
+                sources.reserve(rounded.size());
+                spray.reserve(rounded.size());
+                standoffMaxErr = 0.0;
+                for (size_t i = 0; i < rounded.size(); ++i) {
+                    sources.push_back(emitSrc[rounded[i].source]);
+                    spray.push_back(static_cast<char>(rounded[i].spray));
+                    standoffMaxErr = std::max(standoffMaxErr, checked[i].standoffErr);
+                }
+                emit.swap(checked);
+                emitSrc.swap(sources);
+                emitSpray.swap(spray);
+                std::fprintf(stderr, "[安全层转角] 复核通过，采用 %zu 点\n", emit.size());
+            } else {
+                std::fprintf(stderr, "[安全层转角] 保留原安全轨迹，共 %zu 点\n", emit.size());
+            }
+        }
+    }
+    g_prof.mark("安全转角");
     for (const PR& pr : emit)
         if (pr.viol & RS_VIOL_AIM_MISS) ++R.aimMissPoints;
     const int nOut = (int)emit.size();

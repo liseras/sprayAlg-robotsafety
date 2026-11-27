@@ -105,7 +105,8 @@
                                 <DockPanel Margin="0,4">
                                     <TextBlock Text="轨迹点距 (mm)" Width="150" VerticalAlignment="Center"/>
                                     <TextBox x:Name="TxtPointSpacing" Text="4" Padding="4"
-                                             ToolTip="设置导出点距。安全层保留更细的内部检查点，转弯、姿态变化、开关枪和风险点会加密保留。"/>
+                                             LostFocus="SafetySampling_LostFocus"
+                                             ToolTip="设置导出点距。启用转角平滑时，安全层按此间距重采样。工艺段端点和需保留的安全点优先。"/>
                                 </DockPanel>
                                 <DockPanel Margin="0,4">
                                     <TextBlock Text="离面距离 (mm)" Width="150" VerticalAlignment="Center"/>
@@ -462,6 +463,31 @@
                                           Margin="0,8,0,0" VerticalAlignment="Center" IsChecked="True"
                                           ToolTip="启用灵活姿态和机器人复核时，可平移或等比缩放整条喷嘴路径，直线仍是直线，圆弧仍是圆弧。枪轴重新寻找落点，候选通过喷距、喷角、净空和连续性复核后才采用。"/>
 
+                                <DockPanel Margin="0,8,0,0">
+                                    <TextBlock Text="转角过渡 (mm)" Width="150" VerticalAlignment="Center"/>
+                                    <TextBox x:Name="TxtCornerWindow" Text="24" Padding="4"
+                                             LostFocus="SafetySampling_LostFocus"
+                                             ToolTip="安全评估时沿轨迹圆滑转角，并复核喷射方向、净空及启用的机器人约束。0 关闭。"/>
+                                </DockPanel>
+
+                                <CheckBox x:Name="ChkMotionTiming" Content="规划运动时间与转弯限速"
+                                          IsChecked="True" Margin="0,10,0,4"
+                                          Checked="MotionTimingOption_Changed" Unchecked="MotionTimingOption_Changed"/>
+                                <UniformGrid Columns="2">
+                                    <StackPanel Margin="0,0,6,0">
+                                        <TextBlock Text="直线速度上限 (mm/s)"/>
+                                        <TextBox x:Name="TxtMotionStraight" Text="200" Padding="4"
+                                                 LostFocus="MotionTimingOption_Changed"
+                                                 ToolTip="安全层的速度上限，逐段仍受生成层给出的工艺速度约束。"/>
+                                    </StackPanel>
+                                    <StackPanel Margin="6,0,0,0">
+                                        <TextBlock Text="转弯速度上限 (mm/s)"/>
+                                        <TextBox x:Name="TxtMotionTurn" Text="60" Padding="4"
+                                                 LostFocus="MotionTimingOption_Changed"
+                                                 ToolTip="在圆滑后的 TCP 路径上提前减速、出弯提速。有剩余尖角时降到零速。"/>
+                                    </StackPanel>
+                                </UniformGrid>
+
                                 <CheckBox x:Name="ChkAutoExport" Content="自动导出（点云同名 + 模拟平台 JSON）"
                                           Margin="0,8,0,0" VerticalContentAlignment="Center" IsChecked="True"
                                           ToolTip="生成轨迹后自动写「点云目录\traj_out\点云名_traj.csv」与「点云名.plan.json」；安全评估后再写「点云名_safe.csv」并把 plan.json 换成修正后的轨迹。&#x0a;plan.json 是 DensoArmKine 的 spray_plan 格式，导入时选「轨迹口径=TCP、坐标系=基座系、姿态翻转=不翻」。"/>
@@ -489,7 +515,7 @@
                                         Click="BtnSafety_Click"/>
                                 <Button x:Name="BtnExportFixed" Content="导出修正后轨迹 (CSV)" Padding="0,7"
                                         Margin="0,8,0,0" Background="#F3F4F6" BorderBrush="#D1D5DB"
-                                        ToolTip="含倾斜后的 TCP、枪轴、关节角与逐点间隙，可直接给机器人执行"
+                                        ToolTip="含修正后的 TCP、枪轴、关节角、逐点间隙及启用的运动时间。"
                                         Click="BtnExportFixed_Click"/>
 
                                 <TextBlock Text="结论" FontWeight="SemiBold" Margin="0,16,0,4" Foreground="#2563EB"/>
@@ -615,6 +641,23 @@
                             Background="#FF374151" Foreground="White" BorderThickness="0"
                             ToolTip="切回固定的等轴方向（每次看到同一面），并按场景包围盒重新取景。&#x0a;快捷键：I"/>
                 </StackPanel>
+
+                <Border x:Name="MotionPlaybackPanel" Visibility="Collapsed" Background="#DD1F2937"
+                        Padding="8" CornerRadius="6" Width="335" Margin="0,0,0,6" HorizontalAlignment="Left">
+                    <StackPanel>
+                        <DockPanel>
+                            <Button x:Name="BtnMotionPlay" Content="播放轨迹" Click="BtnMotionPlay_Click"
+                                    Padding="8,2" Margin="0,0,8,0" DockPanel.Dock="Left"/>
+                            <TextBlock x:Name="TxtMotionCursor" Foreground="White" FontSize="12"
+                                       VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        </DockPanel>
+                        <Slider x:Name="MotionTimeSlider" Minimum="0" Maximum="0" SmallChange="0.1"
+                                LargeChange="1" IsMoveToPointEnabled="True" Margin="0,6,0,0"
+                                PreviewMouseLeftButtonDown="MotionTimeSlider_PreviewMouseLeftButtonDown"
+                                ValueChanged="MotionTimeSlider_ValueChanged"
+                                ToolTip="拖动查看对应时刻的 TCP、枪轴、开关枪和速度"/>
+                    </StackPanel>
+                </Border>
 
                 <Border Background="#66000000" Padding="10" CornerRadius="6" HorizontalAlignment="Left">
                     <TextBlock x:Name="TxtHint" Text="加载点云后点击「生成轨迹」" Foreground="White" FontSize="13" TextWrapping="Wrap"/>

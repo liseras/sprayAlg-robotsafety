@@ -330,6 +330,41 @@ SPRAYTRAJ_API RobotSafetyResult robot_safety_check_g20_bent(
     const SprayTrajPoint* pts, int n, const double* cloudXyz, int cloudCount,
     const double* basePose16, const RobotSafetyParams* params, const double upCloud[3], double rollDeg);
 
+// 在几何优先安全评估后圆滑连续工艺段，并按指定弧长间距取点复核。
+// cornerWindowMm 为 0 时沿用原安全流程。工艺段端点和未通过复核的原段会保留。
+SPRAYTRAJ_API RobotSafetyResult robot_safety_check_rounded(
+    const SprayTrajPoint* pts, int n, const double* cloudXyz, int cloudCount,
+    const double* basePose16, const RobotSafetyParams* params, const double upCloud[3],
+    int modelId, double rollDeg, double cornerWindowMm, double outputSpacingMm);
+
+typedef struct RobotMotionLimits {
+    double straightSpeedMmSec, turnSpeedMmSec;
+    double tcpAccelMmSec2, tcpJerkMmSec3;
+    double gunAxisSpeedDegSec;
+    double jointSpeedDegSec, jointAccelDegSec2, jointJerkDegSec3;
+} RobotMotionLimits;
+
+#define RS_MOTION_STOP_TURN         (1u << 0)  // 该点规划为零速衔接
+#define RS_MOTION_JOINT_UNCHECKED   (1u << 1)  // 进入该点的段缺少有效的连续关节解
+#define RS_MOTION_JOINT_BRANCH_JUMP (1u << 2)  // 进入该点的逆解跳支
+
+typedef struct RobotMotionPoint {
+    double timeSec, tcpSpeedMmSec;
+    double incomingSpeedCapMmSec;
+    double jointVelocityDegSec[6];           // 六轴节点速度、加速度
+    double jointAccelerationDegSec2[6];
+    double incomingJointSpeedDegSec;        // 进入该点的段内上界，取六轴最大
+    double incomingJointAccelDegSec2;
+    double incomingJointJerkDegSec3;
+    unsigned int flags;
+} RobotMotionPoint;
+
+// 对已评估的 TCP 点列独立排时，不改坐标、点距、开关枪或原安全结论。
+// timed 由调用方提供 count 个元素。成功返回 1，参数无效或无可计时运动返回 0。
+SPRAYTRAJ_API int robot_safety_plan_motion(
+    const RobotSafetyPoint* points, int count, const RobotMotionLimits* limits,
+    RobotMotionPoint* timed);
+
 SPRAYTRAJ_API void robot_safety_free(RobotSafetyResult* res);
 
 // 违规位 -> 规则名（"COLLISION" 等），未知返回 NULL

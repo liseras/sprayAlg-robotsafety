@@ -86,6 +86,7 @@ namespace SprayTrajViewer
         {
             InitializeComponent();
             InstallSafeCopyCommand();
+            Closed += (_, _) => StopMotionPlayback();
             // 左上角坐标轴指示器随视角转：相机一动就重投影三个世界轴。
             // 订阅 CameraChanged 而不是每帧渲染回调 —— 后者在拖拽时每帧都触发，
             // 会把 WPF 布局线程拖住（这个 Canvas 每帧重建几十个 Shape）。
@@ -346,6 +347,10 @@ namespace SprayTrajViewer
             if (o.TryGetValue("xface", out v)) TxtCrossFaceGunOn.Text = v;
             if (o.TryGetValue("speed", out v)) TxtSpeed.Text = v;
             if (o.TryGetValue("turn", out v)) TxtTurnFactor.Text = v;
+            if (o.TryGetValue("corner", out v)) TxtCornerWindow.Text = v;
+            if (o.TryGetValue("motion-timing", out v)) ChkMotionTiming.IsChecked = v != "0";
+            if (o.TryGetValue("straight-speed", out v)) TxtMotionStraight.Text = v;
+            if (o.TryGetValue("turn-speed", out v)) TxtMotionTurn.Text = v;
             if (o.TryGetValue("flat", out v)) TxtFlatness.Text = v;
             if (o.TryGetValue("minw", out v)) TxtMinFaceWidth.Text = v;
             if (o.TryGetValue("curv", out v)) TxtCurvature.Text = v;
@@ -528,6 +533,14 @@ namespace SprayTrajViewer
                                 WriteFixedCsv(fx);
                                 App.Log("CLI", null, $"export-fixed -> {fx}（{_safetyPts.Length} 点）");
                             }
+                            if (o.TryGetValue("export-plan", out var plan) && _safetyPts.Length > 0)
+                                WriteDensoPlanJson(plan, CloudBaseName() + "_safe", true, SelectExportIndices(true));
+                            if (_motionProfile.Length > 1 && o.TryGetValue("seek-time", out var seek))
+                            {
+                                MotionTimeSlider.Value = Math.Clamp(ParseDouble(seek, 0), 0, MotionTimeSlider.Maximum);
+                                RenderMotionFrame(MotionTimeSlider.Value);
+                            }
+                            if (o.ContainsKey("play")) BtnMotionPlay_Click(this, new RoutedEventArgs());
                         }
                     }
                     catch (Exception ex)
@@ -1455,6 +1468,7 @@ namespace SprayTrajViewer
         /// </summary>
         void InvalidateTrajectory(string reason)
         {
+            if (_motionProfile.Length != 0) SetMotionProfile(Array.Empty<RobotMotionPoint>());
             CardSafety.Visibility = Visibility.Collapsed;
             TxtResult.Text = "";
             TxtSafetyInline.Text = $"尚未评估（{reason}，请重新生成轨迹）";
@@ -1546,9 +1560,7 @@ namespace SprayTrajViewer
 
             InvalidateTrajectory("正在重新生成轨迹");
 
-            double requestedSpacing = ParseDouble(TxtPointSpacing.Text, PlanningPointSpacingMm);
-            _exportPointSpacingMm = double.IsFinite(requestedSpacing) && requestedSpacing > 0.0
-                ? requestedSpacing : PlanningPointSpacingMm;
+            _exportPointSpacingMm = ReadPointSpacing();
             SprayTrajParams p = new()
             {
                 scanRowSpacing = ParseDouble(TxtRowSpacing.Text, 12),
@@ -2077,6 +2089,7 @@ namespace SprayTrajViewer
         /// <summary>只合并可以用同一根插补弦线表示的点，原始和修正轨迹共用索引。</summary>
         IReadOnlyList<int>? SelectExportIndices(bool withSafety)
         {
+            if (withSafety && (_evaluatedCornerWindow > 0 || _motionProfile.Length > 0)) return null;
             if (_exportPointSpacingMm <= PlanningPointSpacingMm || _lastTraj.Count < 3) return null;
             RobotSafetyPoint[]? safe = withSafety ? _safetyPts : null;
             if (safe != null && safe.Length != _lastTraj.Count) return null;
@@ -2635,9 +2648,10 @@ namespace SprayTrajViewer
                 var wrote = new List<string>();
 
                 bool useSafe = withSafety && _safetyPts.Length > 0;
-                var indices = SelectExportIndices(useSafe);
+                var rawIndices = SelectExportIndices(false);
+                var safeIndices = useSafe ? SelectExportIndices(true) : null;
                 string fTraj = System.IO.Path.Combine(dir, bas + "_traj.csv");
-                WriteTrajCsv(fTraj, ExportTraj(), indices);
+                WriteTrajCsv(fTraj, ExportTraj(), rawIndices);
                 wrote.Add(System.IO.Path.GetFileName(fTraj));
 
                 // 基座系点云：手眼生效时必须有，否则两份基座系 CSV 旁边没有工件可对照
@@ -2670,17 +2684,17 @@ namespace SprayTrajViewer
                 // 算法原始轨迹那份 json 就没了；想对比"安全层到底改了什么"只能翻 CSV。
                 // 现在固定拆成两个名字，两份都能直接导进 DensoArmKine 对比着跑。
                 string fJsonRaw = System.IO.Path.Combine(dir, bas + "_traj.plan.json");
-                WriteDensoPlanJson(fJsonRaw, bas + "_traj", false, indices);
+                WriteDensoPlanJson(fJsonRaw, bas + "_traj", false, rawIndices);
                 wrote.Add(System.IO.Path.GetFileName(fJsonRaw));
 
                 if (useSafe)
                 {
                     string fSafe = System.IO.Path.Combine(dir, bas + "_safe.csv");
-                    WriteFixedCsv(fSafe, indices);
+                    WriteFixedCsv(fSafe, safeIndices);
                     wrote.Add(System.IO.Path.GetFileName(fSafe));
 
                     string fJsonSafe = System.IO.Path.Combine(dir, bas + "_safe.plan.json");
-                    WriteDensoPlanJson(fJsonSafe, bas + "_safe", true, indices);
+                    WriteDensoPlanJson(fJsonSafe, bas + "_safe", true, safeIndices);
                     wrote.Add(System.IO.Path.GetFileName(fJsonSafe));
                 }
                 else
@@ -2693,9 +2707,11 @@ namespace SprayTrajViewer
 
                 EnsureExportReadme(dir);
 
+                var exportedIndices = useSafe ? safeIndices : rawIndices;
+                int plannedCount = useSafe ? _safetyPts.Length : _lastTraj.Count;
                 string msg = $"自动导出 → {dir}（{string.Join("、", wrote)}）"
                            + (useSafe ? " · 修正后轨迹" : " · 未修正（算法轨迹）")
-                           + (indices == null ? "" : $" · 导出 {indices.Count}/{_lastTraj.Count} 点");
+                           + (exportedIndices == null ? "" : $" · 导出 {exportedIndices.Count}/{plannedCount} 点");
                 TxtHint.Text = TxtHint.Text.Split('\n')[0] + "\n" + msg;
                 if (TxtOutDir != null) TxtOutDir.Text = "导出目录：" + dir + "（已写入）";
                 App.Log("AUTOEXPORT", null, msg);
@@ -2804,6 +2820,7 @@ namespace SprayTrajViewer
             var trajBase = ExportTraj();
             var safeBase = ExportSafetyPts();
             int n = useSafe ? safeBase.Length : trajBase.Count;
+            bool timed = useSafe && _motionProfile.Length > 1 && _motionProfile.Length == n;
             // 违规标记：useSafe 时按安全层结果打标，但**不删点**。
             // （2026-11-10 用户要求"不安全先不拦"：违规大概率是判定代码的问题，
             //  需要把几何原样交给 DensoArmKine 看清楚，再回头定位是谁算错了。）
@@ -2830,6 +2847,7 @@ namespace SprayTrajViewer
               .Append(useSafe ? $"\"PosePolicy\": \"geometry-first\", \"RobotModel\": \"{SafetyModelId(_evaluatedModel)}\", " : "")
               .Append(useSafe && _evaluatedBentGun ? "\"ToolPreset\": \"G20-bent-90\", " : "")
               .Append(useSafe && _evaluatedGunRoll != 0 ? "\"GunRollDeg\": " + F6(_evaluatedGunRoll, ci) + ", " : "")
+              .Append(timed ? "\"MotionTimeSec\": " + F6(_motionProfile[^1].Time, ci) + ", " : "")
               .Append("\"TiltMode\": \"").Append(ChkTiltPerPoint.IsChecked == true ? "per-point" : "face").Append("\", ")
               .Append("\"Pose\": \"").Append(ChkFastPose.IsChecked == true ? "onepass" : "search").Append("\", ")
               // 倾角口径的三个数必须落盘：同一件用 k=30 和 k=90 导出的 json，点数/GunOpen 完全一致，
@@ -2986,16 +3004,18 @@ namespace SprayTrajViewer
                 //
                 // 字段格式与 traj_to_denso_plan.py 完全一致（Joints/Cartesian/SpeedPercent/
                 // GunOpen/Label/IsValid），不多不少。
-                // 用户要求「不安全先不拦」，所以这里**不引入**任何新字段（Risk 之类）：
-                // 多了字段下游不认识，反而让人怀疑文件是不是被改坏了。
                 // IsValid 恒 true —— 和生成器口径一致，违规信息只留在 *_safe.csv 里诊断。
+                string timingJson = timed
+                    ? ", \"TimeSec\": " + F6(_motionProfile[i].Time, ci) +
+                      ", \"TcpSpeedMmSec\": " + F6(_motionProfile[i].Speed, ci)
+                    : "";
                 rows.Add("    { \"Joints\": null, \"Cartesian\": ["
                   + F6(x, ci) + ", " + F6(y, ci) + ", " + F6(z, ci) + ", "
                   + F6(rx, ci) + ", " + F6(ry, ci) + ", " + F6(rz, ci) + ", 0], "
                   + "\"SpeedPercent\": 30, "
                   + "\"GunOpen\": " + (gunOn ? "true" : "false") + ", "
                   + "\"Label\": \"v" + (int)Math.Round(speed, MidpointRounding.AwayFromZero) + "\", "
-                  + "\"IsValid\": true" + seedJson + " }");
+                  + "\"IsValid\": true" + seedJson + timingJson + " }");
             }
 
             sb.Append(string.Join(",\n", rows)).Append("\n  ]\n}\n");
@@ -3040,6 +3060,8 @@ namespace SprayTrajViewer
         private RobotSafetyPoint[] _safetyPts = Array.Empty<RobotSafetyPoint>();
         private RobotSafetyModel _evaluatedModel = RobotSafetyModel.Vs087;
         private double _evaluatedGunRoll;
+        private double _evaluatedCornerWindow;
+        private double _evaluatedSafetySpacing;
         private bool _evaluatedBentGun;
         bool UseG20Bent => SelectedSafetyModel == RobotSafetyModel.CgxiG20 && ChkG20Bent?.IsChecked == true;
         private readonly List<Visual3D> _riskVisuals = new();
@@ -3098,6 +3120,24 @@ namespace SprayTrajViewer
         }
 
         double ReadG20Roll() => ParseDouble(TxtG20Roll?.Text ?? "0", double.NaN);
+
+        double ReadPointSpacing()
+        {
+            double spacing = ParseDouble(TxtPointSpacing.Text, PlanningPointSpacingMm);
+            return double.IsFinite(spacing) && spacing > 0 ? spacing : PlanningPointSpacingMm;
+        }
+
+        void SafetySampling_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (!IsLoaded || _safetyPts.Length == 0) return;
+            double cornerWindow = ParseDouble(TxtCornerWindow.Text, double.NaN);
+            if (cornerWindow == _evaluatedCornerWindow &&
+                (cornerWindow == 0 || ReadPointSpacing() == _evaluatedSafetySpacing)) return;
+            _safetyPts = Array.Empty<RobotSafetyPoint>();
+            CardSafety.Visibility = Visibility.Collapsed;
+            TxtSafetyInline.Text = "转角过渡或点距已修改，请重新评估";
+            RenderSafetyOverlay(_safetyPts, false);
+        }
 
         void CmbSafetyModel_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
         {
@@ -3375,6 +3415,27 @@ namespace SprayTrajViewer
             p.tiltSideX = CmbTiltSide.SelectedIndex switch { 1 => 1.0, 2 => -1.0, _ => 0.0 };
 
             double[]? basePose = BuildBasePose();
+            double cornerWindow = ParseDouble(TxtCornerWindow.Text, double.NaN);
+            if (!double.IsFinite(cornerWindow) || cornerWindow < 0)
+            {
+                TxtHint.Text = "转角过渡需填写非负数，填 0 关闭";
+                return;
+            }
+            double outputSpacing = ReadPointSpacing();
+            if (cornerWindow > 0 && outputSpacing < 0.5)
+            {
+                TxtHint.Text = "启用转角平滑时，轨迹点距需至少 0.5 mm";
+                return;
+            }
+            bool planMotion = ChkMotionTiming.IsChecked == true;
+            RobotMotionLimits motionLimits = ReadMotionLimits();
+            if (planMotion && (!double.IsFinite(motionLimits.StraightSpeed) || motionLimits.StraightSpeed <= 0 ||
+                !double.IsFinite(motionLimits.TurnSpeed) || motionLimits.TurnSpeed <= 0 ||
+                motionLimits.TurnSpeed > motionLimits.StraightSpeed))
+            {
+                TxtHint.Text = "请填写正的速度上限，转弯速度不得超过直线速度";
+                return;
+            }
             var trajectory = _lastTraj;
             var pts = trajectory.ToArray();
             var cloudXyz = new double[_cloud.Count * 3];
@@ -3389,10 +3450,16 @@ namespace SprayTrajViewer
             CmbSafetyModel.IsEnabled = false;
             TxtG20Roll.IsEnabled = false;
             ChkG20Bent.IsEnabled = false;
+            TxtCornerWindow.IsEnabled = false;
+            TxtPointSpacing.IsEnabled = false;
+            ChkMotionTiming.IsEnabled = TxtMotionStraight.IsEnabled = TxtMotionTurn.IsEnabled = false;
+            if (_motionProfile.Length != 0) SetMotionProfile(Array.Empty<RobotMotionPoint>());
             TxtHint.Text = $"{SafetyModelId(model)} 安全评估中…（轨迹 {pts.Length} 点 / 点云 {_cloud.Count} 点）";
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             RobotSafetyPoint[] got = Array.Empty<RobotSafetyPoint>();
+            RobotMotionPoint[] timed = Array.Empty<RobotMotionPoint>();
+            string? timingError = null;
             RobotSafetyResult st = default;
             RobotSafetyResult sum = default;   // free 会把 st.count 清 0，标量先留一份副本
             string? err = null;
@@ -3404,7 +3471,11 @@ namespace SprayTrajViewer
                 App.Log("SAFETY", null, basePose != null
                     ? "竖直向上 = 基座 +Z（由基座位姿给出，忽略「重力向上」下拉）"
                     : "竖直向上 = 「重力向上」下拉（基座为自动假设，没有基座系可用）");
-                st = await Task.Run(() => model == RobotSafetyModel.Vs087
+                st = await Task.Run(() => cornerWindow > 0
+                    ? Native.robot_safety_check_rounded(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
+                        basePose, ref p, upVec, bentGun ? RobotSafetyModel.CgxiG20Bent : model,
+                        gunRoll, cornerWindow, outputSpacing)
+                    : model == RobotSafetyModel.Vs087
                     ? Native.robot_safety_check_up(pts, pts.Length, cloudXyz, cloudXyz.Length / 3,
                                                   basePose, ref p, upVec)
                     : bentGun
@@ -3428,6 +3499,23 @@ namespace SprayTrajViewer
                     int sz = Marshal.SizeOf<RobotSafetyPoint>();
                     for (int i = 0; i < st.count; i++)
                         got[i] = Marshal.PtrToStructure<RobotSafetyPoint>(IntPtr.Add(st.points, i * sz));
+                    if (planMotion)
+                    {
+                        try
+                        {
+                            var timing = new RobotMotionPoint[st.count];
+                            IntPtr safePoints = st.points;
+                            if (await Task.Run(() => Native.robot_safety_plan_motion(safePoints, timing.Length,
+                                in motionLimits, timing)) == 1)
+                                timed = timing;
+                            else
+                                timingError = "当前轨迹无法生成运动时间";
+                        }
+                        catch (EntryPointNotFoundException)
+                        {
+                            timingError = "算法库缺少运动时间规划入口";
+                        }
+                    }
                 }
             }
             catch (EntryPointNotFoundException)
@@ -3439,6 +3527,9 @@ namespace SprayTrajViewer
                 try { Native.robot_safety_free(ref st); } catch { }
                 CmbSafetyModel.IsEnabled = true;
                 TxtG20Roll.IsEnabled = true;
+                TxtCornerWindow.IsEnabled = true;
+                TxtPointSpacing.IsEnabled = true;
+                ChkMotionTiming.IsEnabled = TxtMotionStraight.IsEnabled = TxtMotionTurn.IsEnabled = true;
                 ChkG20Bent.IsEnabled = true;
                 BtnSafety.IsEnabled = true;
             }
@@ -3499,6 +3590,38 @@ namespace SprayTrajViewer
             sb.AppendLine($"机器人 {SafetyModelId(model)}");
             if (bentGun) sb.AppendLine($"折弯枪 90° · 短颈 65 mm · 枪身 {p.toolLen:F2} mm");
             if (gunRoll != 0) sb.AppendLine($"固定枪身滚转 {gunRoll:G}°（试验）");
+            if (cornerWindow > 0)
+            {
+                double maxTurn = 0;
+                for (int i = 1; i + 1 < got.Length; i++)
+                {
+                    var a = got[i - 1];
+                    var b0 = got[i];
+                    var c = got[i + 1];
+                    var before = new Vector3D(b0.x - a.x, b0.y - a.y, b0.z - a.z);
+                    var after = new Vector3D(c.x - b0.x, c.y - b0.y, c.z - b0.z);
+                    if (before.LengthSquared > 1e-12 && after.LengthSquared > 1e-12)
+                        maxTurn = Math.Max(maxTurn, Vector3D.AngleBetween(before, after));
+                }
+                sb.AppendLine($"转角过渡 {cornerWindow:F1} mm · 目标点距 {outputSpacing:F1} mm · 输出最大 TCP 转角 {maxTurn:F1}°");
+            }
+            if (timed.Length > 1)
+            {
+                int sharpStops = timed.Count(q => (q.Flags & RobotMotionPoint.StopForTurn) != 0);
+                int sprayStops = Enumerable.Range(1, timed.Length - 1).Count(i =>
+                    (timed[i].Flags & RobotMotionPoint.StopForTurn) != 0 && got[i].spray != 0 &&
+                    got[i - 1].spray != 0 && i + 1 < got.Length && got[i + 1].spray != 0);
+                int uncheckedSpans = timed.Count(q => (q.Flags & RobotMotionPoint.JointUnchecked) != 0);
+                int branchJumps = timed.Count(q => (q.Flags & RobotMotionPoint.JointBranchJump) != 0);
+                sb.AppendLine($"规划运动时间 {timed[^1].Time:F2} s · 直线/转弯限速 {motionLimits.StraightSpeed:F0}/{motionLimits.TurnSpeed:F0} mm/s");
+                sb.AppendLine($"尖角零速衔接 {sharpStops} 处（喷涂中 {sprayStops} 处） · 关节未计时校核 {uncheckedSpans} 段 · 跳支 {branchJumps} 段");
+                App.Log("MOTION", null, $"duration={timed[^1].Time:F6} points={timed.Length} stops={sharpStops} sprayStops={sprayStops} jointUnchecked={uncheckedSpans} branchJumps={branchJumps}");
+            }
+            else if (timingError != null)
+            {
+                sb.AppendLine(timingError);
+                App.Log("MOTION", null, timingError);
+            }
             sb.AppendLine($"轨迹与枪姿 · 枪体干涉 {Rule(9)} · 喷角超限 {Rule(5)} · 枪轴跳变 {Rule(7)} · TCP 步长异常 {Rule(10)}");
             sb.AppendLine($"落点缺少点云支撑 {sum.aimMissPoints} 点（名义喷距附近）");
             if (p.requireReach != 0)
@@ -3521,7 +3644,7 @@ namespace SprayTrajViewer
                                (RobotSafetyPose.ShapeShift | RobotSafetyPose.PerPoint)
                                && p.requireReach != 0 && sum.baseAuto == 0;
             bool shapeShifted = false;
-            if (shapeSearch && got.Length == pts.Length && got.Length > 0)
+            if (shapeSearch && cornerWindow == 0 && got.Length == pts.Length && got.Length > 0)
             {
                 double maxShift = 0.0, inputSpan = 0.0, outputSpan = 0.0;
                 for (int i = 0; i < got.Length; ++i)
@@ -3547,7 +3670,7 @@ namespace SprayTrajViewer
             sb.AppendLine(p.azMode == 1
                 ? $"进刀侧：全部向上（旧口径，{sum.azRows} 行）"
                 : $"进刀侧：{sum.azRows} 行中 {sum.azStanceRows} 行按站位侧（其余沿法向上）");
-            sb.AppendLine(shapeShifted
+            sb.AppendLine(shapeShifted || cornerWindow > 0
                 ? $"匹配落点的最大喷距偏差 {sum.standoffMaxErrMm:F1} mm"
                 : $"喷距守恒偏差 {sum.standoffMaxErrMm:E2} mm");
             sb.AppendLine($"姿态修正净空下限 {p.hardClearance:F1} mm · 喷涂净空告警 {Rule(2)} 点");
@@ -3579,8 +3702,12 @@ namespace SprayTrajViewer
             ShowSafetyCard(verdict, vColor, $"耗时 {sw.ElapsedMilliseconds} ms", sb.ToString().TrimEnd());
 
             _safetyPts = got;
+            _evaluatedMotionLimits = motionLimits;
+            SetMotionProfile(timed);
             _evaluatedModel = model;
             _evaluatedGunRoll = gunRoll;
+            _evaluatedCornerWindow = cornerWindow;
+            _evaluatedSafetySpacing = outputSpacing;
             _evaluatedBentGun = bentGun;
             _safetyExportClearanceMm = p.hardClearance;
             // 是否画修正层交给「显示修正后轨迹」复选框，不再用 tiltedPoints>0 判。
@@ -3638,6 +3765,7 @@ namespace SprayTrajViewer
         /// </summary>
         void RenderSafetyOverlay(RobotSafetyPoint[] arr, bool showFixed)
         {
+            if (arr.Length == 0 && _motionProfile.Length != 0) SetMotionProfile(Array.Empty<RobotMotionPoint>());
             foreach (var v in _riskVisuals) Viewport.Children.Remove(v);
             _riskVisuals.Clear();
             if (_fixedSprayVisual != null) { Viewport.Children.Remove(_fixedSprayVisual); _fixedSprayVisual = null; }
@@ -3947,10 +4075,18 @@ namespace SprayTrajViewer
         {
             var pts = ExportSafetyPts();
             var ok = BuildExecutableMask(pts);
+            bool timed = _motionProfile.Length > 1 && _motionProfile.Length == pts.Length;
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
             var sb = new System.Text.StringBuilder();
             // sprayable 是诊断掩码。CSV 与 plan.json 都保留完整轨迹。
             sb.Append("X,Y,Z,I,J,K,speed,spray,kind,tilt_deg,clearance_mm,self_gap_mm,margin_deg,")
-              .Append("standoff_err_mm,lifted_mm,cond,reverted,J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation,sprayable\n");
+              .Append("standoff_err_mm,lifted_mm,cond,reverted,J1_deg,J2_deg,J3_deg,J4_deg,J5_deg,J6_deg,violation,sprayable");
+            if (timed)
+                sb.Append(",time_s,tcp_speed_mm_s,incoming_tcp_speed_cap_mm_s,motion_flags,")
+                  .Append("J1_vel_deg_s,J2_vel_deg_s,J3_vel_deg_s,J4_vel_deg_s,J5_vel_deg_s,J6_vel_deg_s,")
+                  .Append("J1_acc_deg_s2,J2_acc_deg_s2,J3_acc_deg_s2,J4_acc_deg_s2,J5_acc_deg_s2,J6_acc_deg_s2,")
+                  .Append("incoming_joint_speed_bound_deg_s,incoming_joint_accel_bound_deg_s2,incoming_joint_jerk_bound_deg_s3");
+            sb.Append('\n');
             foreach (int i in indices ?? Enumerable.Range(0, pts.Length))
             {
                 var q = pts[i];
@@ -3960,7 +4096,20 @@ namespace SprayTrajViewer
                 var th = q.theta ?? new double[6];
                 for (int k = 0; k < 6; k++)
                     sb.Append($",{(k < th.Length ? th[k] : 0.0):F3}");
-                sb.Append($",{RuleText(q.violation)},{ok[i] switch { true => 1, false => 0 }}\n");
+                sb.Append($",{RuleText(q.violation)},{ok[i] switch { true => 1, false => 0 }}");
+                if (timed)
+                {
+                    var m = _motionProfile[i];
+                    sb.Append(',').Append(F6(m.Time, ci)).Append(',').Append(F6(m.Speed, ci))
+                      .Append(',').Append(F6(m.IncomingSpeedCap, ci)).Append(',').Append(m.Flags);
+                    bool unknown = (m.Flags & RobotMotionPoint.JointUnchecked) != 0;
+                    foreach (double v in m.JointVelocity) sb.Append(',').Append(unknown ? "" : F6(v, ci));
+                    foreach (double a in m.JointAccelerationAtPoint) sb.Append(',').Append(unknown ? "" : F6(a, ci));
+                    sb.Append(',').Append(unknown ? "" : F6(m.JointSpeed, ci))
+                      .Append(',').Append(unknown ? "" : F6(m.JointAcceleration, ci))
+                      .Append(',').Append(unknown ? "" : F6(m.JointJerk, ci));
+                }
+                sb.Append('\n');
             }
             System.IO.File.WriteAllText(path, sb.ToString(), new System.Text.UTF8Encoding(true));
         }
